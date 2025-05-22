@@ -1,8 +1,0 @@
-params:
-  _target_: models.LSTM
-  input_dim: null
-  hidden_dim: 128
-  num_layers: 3
-  output_dim: null
-  bias: True
-  dropout: 0.0

@@ -1,5 +1,5 @@
 params:
-  _target_: CommunicationJacobians.models.neuralode.NeuralODE
+  _target_: JacobianODE.models.neuralode.NeuralODE
   input_dim: null
   dt: null
   mlp_kwargs: 

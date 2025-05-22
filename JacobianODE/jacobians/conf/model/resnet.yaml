@@ -1,8 +1,0 @@
-params:
-  _target_: CommunicationJacobians.models.resnet.MLPResNet
-  input_dim: null
-  output_dim: null
-  hidden_dim: [256, 1024, 2048, 4096]
-  num_layers: 4
-  activation: 'silu'
-  dropout: 0.0

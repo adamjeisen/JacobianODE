@@ -1,16 +1,11 @@
 data_type: dysts
 
 flow:
-  # _target_: CommunicationJacobians.dysts_sim.flows.RNNOscillator
-  # _target_: CommunicationJacobians.dysts_sim.flows.Lorenz96
-  # _target_: CommunicationJacobians.dysts_sim.flows.Lorenz96Small
-  # _target_: CommunicationJacobians.dysts_sim.flows.Lorenz96n32
-  # _target_: CommunicationJacobians.dysts_sim.flows.Lorenz96n64
-  _target_: CommunicationJacobians.dysts_sim.flows.Lorenz
-  # _target_: CommunicationJacobians.dysts_sim.flows.RNNChaotic
-  # _target_: CommunicationJacobians.dysts_sim.flows.VanDerPol
-  # _target_: CommunicationJacobians.dysts_sim.flows.RNNStableSmall
-  # _target_: CommunicationJacobians.dysts_sim.flows.LorotkaVoltarneodo
+  # _target_: JacobianODE.dysts_sim.flows.Lorenz96Small
+  # _target_: JacobianODE.dysts_sim.flows.Lorenz96n32
+  # _target_: JacobianODE.dysts_sim.flows.Lorenz96n64
+  _target_: JacobianODE.dysts_sim.flows.Lorenz
+  # _target_: JacobianODE.dysts_sim.flows.VanDerPol
   random_state: 42
   dt: null
   # comm_strengths:

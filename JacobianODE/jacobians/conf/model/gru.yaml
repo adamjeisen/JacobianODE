@@ -1,8 +1,0 @@
-params:
-  # _partial_: True
-  _target_: CommunicationJacobians.models.gru.GRU
-  input_dim: null
-  output_dim: null
-  hidden_dim: 512
-  num_layers: 4
-  dropout: 0.5

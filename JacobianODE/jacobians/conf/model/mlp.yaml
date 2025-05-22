@@ -1,5 +1,5 @@
 params:
-  _target_: CommunicationJacobians.models.mlp.MLP
+  _target_: JacobianODE.models.mlp.MLP
   input_dim: null
   hidden_dim: [256, 1024, 2048, 2048] # *****
   num_layers: 4

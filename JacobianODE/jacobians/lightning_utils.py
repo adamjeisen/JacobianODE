@@ -6,7 +6,12 @@ def make_run_info(cfg):
     elif cfg.data.data_type == 'wmtask':
         data_cls = 'WMTask'
 
-    name = tuple([f"{key}_{value}" for key, value in cfg.model.params.items() if value is not None and key not in ['_target_', '_partial_', 'embedder_kwargs', 'input_dim', 'output_dim']])
+    # Create name tuple
+    name = tuple([
+        f"{key}_{value}" 
+        for key, value in cfg.model.params.items() 
+        if value is not None and key not in ['_target_', '_partial_', 'embedder_kwargs', 'input_dim', 'output_dim']
+    ])
     if 'deriv_params' in cfg.model and cfg.model.deriv_params is not None:
         name = name + tuple([f"{key}_{value}" for key, value in cfg.model.deriv_params.items() if value is not None and key not in ['_target_', '_partial_', 'embedder_kwargs', 'input_dim', 'output_dim']])
     name = name + tuple([f"{key}_{value}" for key, value in cfg.training.items() if key in ['batch_size', 'save_top_k']])

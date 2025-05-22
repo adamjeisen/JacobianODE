@@ -1,5 +1,0 @@
-params:
-  _target_: CommunicationJacobians.models.shplrnn.shPLRNN
-  latent_dim: null
-  hidden_dim: null
-  output_dim: null

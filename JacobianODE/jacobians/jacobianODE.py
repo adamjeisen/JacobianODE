@@ -13,7 +13,7 @@ from torchdiffeq import odeint
 # from torchdiffeq import odeint_adjoint as odeint
 from tqdm.auto import tqdm
 
-from .integration import Simpson, Trapezoid, GaussLegendre
+from ..torchquad import Simpson, Trapezoid, GaussLegendre
 from .torchcubicspline_pw import PiecewiseCubicSpline
 from .paths import c_line, c_prime_line
 

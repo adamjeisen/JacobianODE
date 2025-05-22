@@ -1,9 +1,0 @@
-params:
-  _target_: CommunicationJacobians.models.MLP
-  input_dim: null
-  hidden_dim: 100
-  num_layers: 2
-  output_dim: null
-  residuals: False
-  activation: 'relu'
-  dropout: 0

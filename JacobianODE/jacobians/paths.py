@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-import torchcubicspline
+from .torchcubicspline_pw import PiecewiseCubicSpline
 
 def floor(x, eps=1e-5):
     if isinstance(x, torch.Tensor):
@@ -21,8 +21,7 @@ def generate_spline(x, t_i=None, t_f=None, dt=None, time_vals=None):
     else:
         # IF TIME VALUES ARE PROVIDED, ASSUME ENTIRE TRAJECTORY WILL BE USED FOR SPLINE
         pts = x
-    coeffs = torchcubicspline.natural_cubic_spline_coeffs(time_vals, pts)
-    spline = torchcubicspline.NaturalCubicSpline(coeffs)
+    spline = PiecewiseCubicSpline(time_vals, pts, bc_type='natural')
     c = lambda t: spline.evaluate(t.squeeze(-1).type(x.dtype).to(x.device))
     c_prime = lambda t: spline.derivative(t.squeeze(-1).type(x.dtype).to(x.device))
     
