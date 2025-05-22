@@ -1,0 +1,40 @@
+flow:
+  _target_: CommunicationJacobians.dysts_sim.flows.RNNStableSmall
+  random_state: 42
+  dt: null
+
+trajectory_params:
+  n_periods: 10 
+  method: Radau
+  resample: True
+  pts_per_period: 100
+  return_times: True
+  standardize: False
+  noise: 0.0
+  # num_ics: 40
+  num_ics: 40
+  # new_ic_mode: 'reference'
+  new_ic_mode: 'random'
+  traj_offset_sd: 1
+  verbose: True
+
+postprocessing:
+  # obs_noise: 1e-2
+  obs_noise: 0
+  
+train_test_params:
+  # seq_length: 400
+  seq_length: 50
+  seq_spacing: 1
+  train_percent: 0.8333334
+  test_percent: 0
+  n_delays: 1
+  # split_by: time
+  split_by: 'trajectory'
+  dtype: torch.FloatTensor
+  verbose: True
+
+random_point_params:
+  use_trajectory: True
+  use_random_points: True
+  n_points: 50

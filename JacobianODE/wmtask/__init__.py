@@ -1,0 +1,1 @@
+from .wmtask import *

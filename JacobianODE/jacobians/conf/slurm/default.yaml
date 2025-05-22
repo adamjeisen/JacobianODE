@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - override /hydra/launcher: submitit_slurm
+
+hydra:
+  launcher:
+    cpus_per_task: 4
+    nodes: 1
+    mem_gb: 16
+    timeout_min: 180
+    gpus_per_node: 1
+    tasks_per_node: 1
+    partition: null

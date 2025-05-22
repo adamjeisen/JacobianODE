@@ -1,0 +1,34 @@
+defaults:
+  - _self_
+  - training: training
+  - data: wmtask
+  - model: mlp
+  - slurm: default
+  - override hydra/sweeper: list # use this to run hydra-list-sweeper
+
+
+logger: wandb
+
+hydra:
+  # mode: MULTIRUN
+  job:
+    chdir: True
+  sweeper:
+    # grid_params:
+    #   ++data.postprocessing.obs_noise: 0.05,0.1
+      # ++model.params.mlp_kwargs.hidden_dim: choice([[4096,4096,4096,4096]])
+    
+
+    list_params:
+
+      data: wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask
+      model: neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode
+      ++data.postprocessing.obs_noise: 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1
+      ++model.params.mlp_kwargs.residuals: True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True
+      ++training.lightning.loop_closure_weight: 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+      ++training.lightning.jac_penalty: 0, 1e-06, 1e-05, 0.0001, 0.001, 0.01, 0.1, 1, 10, 0, 1e-06, 1e-05, 0.0001, 0.001, 0.01, 0.1, 1, 10
+      ++training.lightning.direct: False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False, False
+      ++data.train_test_params.seq_length: 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11
+      ++training.lightning.obs_noise_scale: 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05
+      ++training.lightning.final_obs_noise_scale: 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03, 0.03
+      ++training.lightning.teacher_forcing_annealing: True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True

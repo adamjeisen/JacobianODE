@@ -1,0 +1,204 @@
+batch_size: 16
+use_deriv_net: False
+run_number: 0
+
+lightning:
+  _target_: null
+  # direct: False
+  direct: True
+  # loss_func: horizon_aware
+  loss_func: mse
+  # loss_func: soft_dtw
+  alpha_hal: 0.1
+  l2_penalty: 0
+  l1_penalty: 0.0
+  # obs_noise_scale: 5e-2
+  obs_noise_scale: 0
+  final_obs_noise_scale: 0
+  y0_noise_scale: 0
+  # obs_noise_scale: 1e-1
+  # noise_annealing: True
+  noise_annealing: False
+  log_interval: 100
+  alpha_teacher_forcing: 1
+  # alpha_teacher_forcing: 0.5
+  alpha_teacher_forcing_reverse: 1
+  teacher_forcing_annealing: True
+  # teacher_forcing_annealing: False
+  gamma_teacher_forcing: 0.999
+  # gamma_teacher_forcing: 1
+  # gamma_teacher_forcing: 0.99
+  # gamma_teacher_forcing: 0
+  gamma_teacher_forcing_reverse: 1
+  #gamma_teacher_forcing_reverse: 0.999
+  teacher_forcing_update_interval: 5
+  teacher_forcing_steps: 1
+  # min_alpha_teacher_forcing: 0.5
+  min_alpha_teacher_forcing: 0
+  min_alpha_teacher_forcing_reverse: 0.5
+  alpha_validation: 0
+  alpha_validation_reverse: 1
+  # obs_noise_scale_validation: 5e-2
+  obs_noise_scale_validation: 0
+  loss_func_validation: mse
+  # loss_func_validation: soft_dtw
+  traj_init_steps_validation: 15
+  inner_N_validation: 20
+  data_type: null
+  # reverse_weight: 1e-2
+  jacobianODEint_kwargs:
+    # -----------------
+    # FAST MODE
+    # -----------------
+    traj_init_steps: null
+    # traj_init_steps: 10
+    inner_path: 'line'
+    # inner_N: 2
+    # inner_N : 5
+    # inner_N: 2
+    inner_N: 20
+    # inner_N: 2
+    interp_pts: 4
+    # interp_pts: 2
+    # scale_interp_pts: True
+    # fast_mode: True
+    # fast_mode_base_ind: null
+  # min_traj_init_steps: 2
+  # min_traj_init_steps: 5
+  min_traj_init_steps: 15
+  # min_traj_init_steps: 25
+  # min_traj_init_steps: 30
+  # min_traj_init_steps: 5
+  # min_traj_init_steps: 20
+  # max_traj_init_steps: null
+  # max_traj_init_steps: 15
+  # max_traj_init_steps: 20
+  # max_traj_init_steps: null
+
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: 'norm'
+  optimizer: 'AdamW'
+  optimizer_kwargs:
+    # lr: 1e-5
+    # lr: 1e-3
+    # lr: 1e-2
+    # lr: 1
+    lr: 1e-4
+    # betas: [0.9, 0.98]
+    # weight_decay: 1e-4
+    weight_decay: 1e-4
+  use_scheduler: True
+  # use_scheduler: False
+  min_lr: 1e-6
+  # min_lr: 1e-8
+  k_scale: 1
+  # jac_penalty: 1e-5
+  # jac_penalty: 1e-3
+  jac_penalty: 0.0
+  jac_norm_ord: 'fro'
+  # jac_norm_ord: 1
+  reverse_training: False
+  reverse_validation: False
+  # reverse_weight: 1
+  # reverse_weight: 1e-1
+  reverse_weight: 0.0
+  # final_reverse_weight: 1e-1
+  final_reverse_weight: null
+  # reverse_criterion: lles
+  reverse_criterion: null
+  lles_max_T: 10
+  lles_n_neighbors: 3
+  loop_closure_training: True
+  mix_trajectories: True
+  # loop_closure_interp_pts: 2
+  # loop_closure_interp_pts: 10
+  # loop_closure_interp_pts: 20
+  # loop_closure_interp_pts: 18
+  loop_closure_interp_pts: 20
+  # max_loop_closure_interp_pts: 10
+  max_loop_closure_interp_pts: null
+  loop_closure_int_method: 'Trapezoid'
+  # loop_closure_int_method: 'odeint'
+  n_loops: null # set default to traj batches
+  # n_loop_pts: null # set default to traj length
+  # n_loops: 80 # set default to traj batches
+  n_loop_pts: 20
+  # loop_closure_weight: 1
+  # loop_closure_weight: 1.0
+  # final_loop_closure_weight: null
+  obs_noise_scale_loop: 0
+  lipschitz_alpha: 1e-4
+  # lipschitz_alpha: 0.0
+  # lipschitz_alpha: 1
+  lipschitz_weight: 0.0
+  use_uncertainty: False
+  trajectory_training: True
+  random_walk_training: False
+  random_walk_weight: 1.0
+  min_random_walk_steps: 5
+  max_random_walk_steps: null
+  rescaling_sigma: 1
+  # deriv_trajectory_weight: 0
+  deriv_trajectory_weight: 1
+  base_integration_weight: 0
+  final_base_integration_weight: null
+  seq_integration_weight: 0
+  # seq_integration_weight: 1
+  final_seq_integration_weight: null
+  path_consistency_weight: 0
+  # path_consistency_weight: 1
+  final_path_consistency_weight: null
+  # loop_closure_weight: 10
+  # loop_closure_weight: 1e-1
+  # loop_closure_weight: 1e-3
+  loop_closure_weight: 0.0
+  # loop_closure_weight: 0.0001
+  # loop_closure_weight: 10
+  # loop_closure_weight: 1
+  # loop_closure_weight: 1e2
+  # loop_closure_weight: 0
+  min_loop_closure_loss: 0.0
+  # final_loop_closure_weight: 1e-1
+  final_loop_closure_weight: null
+  node_jacobians_weight: 0
+  # use_base_deriv_pt: True
+  use_base_deriv_pt: False
+  hessian_weight: 0
+  # forward_backward_weight: 1e-1
+  forward_backward_weight: 0
+  # eq: null
+
+logger_save_dirs: null
+
+logger:
+  _target_: pytorch_lightning.loggers.WandbLogger
+  save_dir: null
+  log_model: True
+  
+trainer_params:
+  # limit_train_batches: 1.0
+  # limit_train_batches: 500
+  limit_train_batches: 500
+  # limit_train_batches: 6.0
+  limit_val_batches: 100
+  # limit_val_batches: 3.0
+  max_epochs: 1000
+  accumulate_grad_batches: 4
+  # accumulate_grad_batches: 32
+  # accumulate_grad_batches: 1
+  # accumulate_grad_batches: 16
+  # accumulate_grad_batches: 64
+  # strategy: 'ddp_find_unused_parameters_true'
+
+early_stopping:
+  early_stopping_patience: 2
+  # early_stopping_mode: 'min'
+  early_stopping_mode: 'percent_thresh'
+  percent_thresh: 0.01
+  monitor: 'mean val loss'
+  mode: 'min'
+
+model_checkpoint:
+  save_top_k: 1
+  monitor: 'mean val loss'
+  mode: 'min'

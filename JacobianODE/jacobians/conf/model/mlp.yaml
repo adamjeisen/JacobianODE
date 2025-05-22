@@ -1,0 +1,43 @@
+params:
+  _target_: CommunicationJacobians.models.mlp.MLP
+  input_dim: null
+  hidden_dim: [256, 1024, 2048, 2048] # *****
+  num_layers: 4
+
+  output_dim: null
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+  # activation: 'relu'
+  # activation: 'elu'
+  use_pre_layer_norm: False
+  use_pre_batch_norm: False
+  use_mean_and_scale: False
+  # final_layer_scale_factor: 1.0 # 1.0 sets it to scaling w/ (std^2)
+  final_layer_scale_factor: null
+  use_lipschitz: False
+
+deriv_params: null
+# deriv_params:
+# #   id_val: '8g6vanvm'
+#   _target_: CommunicationJacobians.models.neuralode.NeuralODE
+#   input_dim: null
+#   dt: null
+#   mlp_kwargs: 
+#     # hidden_dim: [30]
+#     # num_layers: 1
+#     # hidden_dim: [256, 1024, 2048, 4096] 
+#     # hidden_dim: [32, 32, 32, 32]
+#     hidden_dim: [100, 100, 100, 100]
+#     # hidden_dim: [512, 512, 512, 512]
+#     # hidden_dim: [256, 1024, 2048, 2048]
+#     # hidden_dim: [128, 256, 256, 512]
+#     # hidden_dim: [128, 128, 128, 128]
+#     # hidden_dim: [256, 512, 1024, 1024]
+#     # hidden_dim: [256, 1024, 2048, 2048]
+#     num_layers: 4
+#     residuals: False
+#     dropout: 0.0
+#     activation: 'silu'
+#     use_pre_layer_norm: False
+#     use_mean_and_scale: False

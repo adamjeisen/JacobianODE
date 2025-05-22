@@ -1,0 +1,48 @@
+data_type: wmtask
+
+flow:
+  random_state: 42
+  project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False" # *** 
+  name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_40__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1" # ***\
+  id: jk3a19r1
+
+trajectory_params:
+  dataloader_to_use: "all"
+  traj_window: 'delay2'
+  # model_to_load: 'init'
+  model_to_load: 'final'
+  # model_to_load: 10
+
+postprocessing:
+  # obs_noise: 1e-2
+  obs_noise: 1e-1
+  # obs_noise: 5e-2
+  # obs_noise: 0
+  filter_data: False
+  low_pass: 10
+  high_pass: null
+  normalize: False
+
+  
+train_test_params:
+  # seq_length: 49
+  seq_length: 25
+  seq_spacing: 1
+  # seq_spacing: 50
+  # train_percent: 0.8333334
+  train_percent: 0.7
+  test_percent: 0.1
+  # test_percent: 0
+  # split_by: time
+  split_by: 'trajectory'
+  dtype: torch.FloatTensor
+  verbose: True
+  delay_embedding_params:
+    # observed_indices: [0]
+    observed_indices: 'all'
+    # n_delays: 6
+    n_delays: 1
+    delay_spacing: 1
+
+reverse_seq_length: 25
+reverse_seq_length_validation: 25

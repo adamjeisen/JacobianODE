@@ -1,0 +1,1 @@
+from .torchquad import Simpson, Trapezoid, GaussLegendre

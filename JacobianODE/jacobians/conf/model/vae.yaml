@@ -1,0 +1,9 @@
+params:
+  _target_: CommunicationJacobians.models.vae.VAE
+  input_dim: null
+  output_dim: null
+  hidden_dims: [64, 32]
+  latent_dim: 2
+  dropout: 0
+  activation: 'relu'
+  beta: 1e-3

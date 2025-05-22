@@ -1,0 +1,10 @@
+params:
+  _target_: CommunicationJacobians.models.unet.UNet
+  input_dim: null
+  output_dim: null
+  # hidden_dim: [64, 128, 256, 512, 1024, 2048, 4096]
+  # num_layers: 7
+  hidden_dim: [64, 128, 256, 1024]
+  num_layers: 4
+  dropout: 0.0
+  activation: 'silu'

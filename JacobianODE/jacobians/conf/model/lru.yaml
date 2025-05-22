@@ -1,0 +1,9 @@
+params:
+  # _partial_: True
+  _target_: CommunicationJacobians.models.lru.LRU
+  input_dim: null
+  output_dim: null
+  # d_model: 32
+  d_model: 128
+  num_layers: 3
+  dropout: 0

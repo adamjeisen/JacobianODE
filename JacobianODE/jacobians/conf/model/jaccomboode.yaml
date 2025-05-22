@@ -1,0 +1,14 @@
+params:
+  _target_: CommunicationJacobians.models.jaccomboode.JacComboODE
+  input_dim: null
+  dt: null
+  mlp_kwargs:
+    hidden_dim: [512, 512, 512, 512]
+    num_layers: 4
+    # hidden_dim: [256, 512, 1024, 2048, 4096, 8192] # ****** very big boy
+    # num_layers: 6
+    residuals: False
+    dropout: 0.0
+    activation: 'silu'
+    use_pre_layer_norm: False
+    use_pre_batch_norm: False

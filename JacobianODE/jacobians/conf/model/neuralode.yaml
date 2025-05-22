@@ -1,0 +1,18 @@
+params:
+  _target_: CommunicationJacobians.models.neuralode.NeuralODE
+  input_dim: null
+  dt: null
+  mlp_kwargs: 
+    # hidden_dim: [256, 1024, 2048, 2048] # *****
+    hidden_dim: [2048,2048,2048,2048]
+    num_layers: 4
+    residuals: False
+    dropout: 0.0
+    activation: 'silu'
+    # activation: 'sin'
+    use_pre_layer_norm: False
+    use_mean_and_scale: False
+
+# deriv_params: null
+deriv_params: 
+  self: true

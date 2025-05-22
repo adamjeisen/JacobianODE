@@ -1,0 +1,8 @@
+defaults:
+  - wmtask_params: default
+  - slurm: default
+  - _self_
+
+hydra:
+  job:
+    chdir: True
