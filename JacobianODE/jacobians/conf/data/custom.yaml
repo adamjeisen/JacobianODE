@@ -4,4 +4,8 @@ defaults:
 
 data_type: custom
 
-dim: 249
+dataset_loader:
+  _target_: null
+
+flow:
+  dim: 249

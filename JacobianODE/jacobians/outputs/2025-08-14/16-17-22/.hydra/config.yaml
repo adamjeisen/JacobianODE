@@ -1,0 +1,126 @@
+logger: wandb
+training:
+  batch_size: 16
+  run_number: 0
+  lightning:
+    _target_: null
+    direct: true
+    loss_func: mse
+    alpha_hal: 0.1
+    l2_penalty: 0
+    l1_penalty: 0.0
+    obs_noise_scale: 0
+    final_obs_noise_scale: 0
+    y0_noise_scale: 0
+    noise_annealing: false
+    log_interval: 100
+    alpha_teacher_forcing: 1
+    teacher_forcing_annealing: true
+    gamma_teacher_forcing: 0.999
+    teacher_forcing_update_interval: 5
+    teacher_forcing_steps: 1
+    min_alpha_teacher_forcing: 0
+    alpha_validation: 0
+    obs_noise_scale_validation: 0
+    loss_func_validation: mse
+    traj_init_steps_validation: 15
+    inner_N_validation: 20
+    data_type: null
+    jacobianODEint_kwargs:
+      traj_init_steps: 15
+      inner_path: line
+      inner_N: 20
+      interp_pts: 4
+    gradient_clip_val: 1.0
+    gradient_clip_algorithm: norm
+    optimizer: AdamW
+    optimizer_kwargs:
+      lr: 0.0001
+      weight_decay: 0.0001
+    use_scheduler: true
+    min_lr: 1.0e-06
+    k_scale: 1
+    jac_penalty: 0.0
+    jac_norm_ord: fro
+    loop_closure_training: true
+    mix_trajectories: true
+    loop_closure_interp_pts: 20
+    max_loop_closure_interp_pts: null
+    loop_closure_int_method: Trapezoid
+    n_loops: null
+    n_loop_pts: 20
+    obs_noise_scale_loop: 0
+    trajectory_training: true
+    loop_closure_weight: 0.0
+    final_loop_closure_weight: null
+    use_base_deriv_pt: false
+  logger_save_dirs: null
+  logger:
+    _target_: pytorch_lightning.loggers.WandbLogger
+    save_dir: null
+    log_model: true
+  trainer_params:
+    limit_train_batches: 500
+    limit_val_batches: 100
+    max_epochs: 1000
+    accumulate_grad_batches: 4
+  early_stopping:
+    early_stopping_patience: 2
+    early_stopping_mode: percent_thresh
+    percent_thresh: 0.01
+    monitor: mean val loss
+    mode: min
+  model_checkpoint:
+    save_top_k: 1
+    monitor: mean val loss
+    mode: min
+data:
+  flow:
+    random_state: 42
+    _target_: JacobianODE.dysts_sim.flows.Lorenz
+    dt: null
+  postprocessing:
+    obs_noise: 0.05
+    filter_data: false
+    low_pass: 10
+    high_pass: null
+    normalize: false
+  train_test_params:
+    seq_length: 25
+    seq_spacing: 1
+    split_by: trajectory
+    train_percent: 0.7
+    test_percent: 0.1
+    dtype: torch.FloatTensor
+    verbose: true
+    delay_embedding_params:
+      observed_indices: all
+      n_delays: 1
+      delay_spacing: 1
+  data_type: dysts
+  trajectory_params:
+    n_periods: 12
+    method: Radau
+    resample: true
+    pts_per_period: 100
+    return_times: true
+    standardize: false
+    noise: 0.0
+    num_ics: 32
+    new_ic_mode: random
+    traj_offset_sd: 0.2
+    verbose: true
+model:
+  params:
+    _target_: JacobianODE.models.mlp.MLP
+    input_dim: null
+    hidden_dim:
+    - 256
+    - 1024
+    - 2048
+    - 2048
+    num_layers: 4
+    output_dim: null
+    residuals: false
+    dropout: 0.0
+    activation: silu

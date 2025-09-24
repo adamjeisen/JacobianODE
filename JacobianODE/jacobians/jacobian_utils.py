@@ -7,22 +7,85 @@ from datetime import datetime
 from hydra.utils import instantiate
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
-import numpy as np
-import pickle
+import hydra
 import inspect
+import numpy as np
 from omegaconf import OmegaConf
 import os
 import pandas as pd
+import pathlib
+import pickle
 import pytz
-import time
 import torch
 from torch import utils
 import wandb
 
-from .data_utils import create_random_point_dataloader, filter_data, generate_train_and_test_sets
+from .data_utils import filter_data, generate_train_and_test_sets
 from .lightning_base import LitBase, PercentEarlyStopping
 from .lightning_utils import make_run_info, reverse_wandb_config
-from ..wmtask.wmdata_utils import *
+
+def in_ipython():
+    try:
+        get_ipython
+        return True
+    except NameError:
+        return False
+
+def get_config_path():
+    """Get the config path as a relative path for Hydra."""
+    # Get the package directory
+    package_dir = pathlib.Path(__file__).parent
+    config_dir = package_dir / "conf"
+    
+    # Get the current working directory
+    current_dir = pathlib.Path.cwd()
+    
+    # Calculate the relative path from current directory to config directory
+    try:
+        relative_path = config_dir.relative_to(current_dir)
+        return str(relative_path)
+    except ValueError:
+        # If we can't make it relative, calculate the path differently
+        # Count how many levels up we need to go
+        current_parts = current_dir.parts
+        config_parts = config_dir.parts
+        
+        # Find common prefix
+        common_prefix_len = 0
+        for i, (current_part, config_part) in enumerate(zip(current_parts, config_parts)):
+            if current_part == config_part:
+                common_prefix_len = i + 1
+            else:
+                break
+        
+        # Build relative path
+        up_levels = len(current_parts) - common_prefix_len
+        relative_parts = [".."] * up_levels + list(config_parts[common_prefix_len:])
+        return "/".join(relative_parts)
+
+def load_config(config_name="config", overrides=None, custom_dataset_loader=None, custom_dataset_loader_kwargs=None):
+    """Load a JacobianODE config with optional overrides."""
+    if overrides is None:
+        overrides = []
+    
+    if custom_dataset_loader is not None:
+        if "data=custom" not in overrides:
+            overrides.append("data=custom")
+
+        overrides.append(f"data.dataset_loader._target_={custom_dataset_loader}")
+
+        if custom_dataset_loader_kwargs is not None:
+            for key, value in custom_dataset_loader_kwargs.items():
+                if value is not None:
+                    overrides.append(f"+data.dataset_loader.{key}={value}")
+                else:
+                    overrides.append(f"+data.dataset_loader.{key}=null")
+    
+    # Use the package-relative path
+    config_path = get_config_path()
+    
+    with hydra.initialize(version_base="1.3", config_path=config_path):
+        return hydra.compose(config_name=config_name, overrides=overrides)
 
 def initialize_config(cfg):
     """Initialize and complete the configuration setup for the model training.
@@ -59,13 +122,8 @@ def initialize_config(cfg):
             dim = eq._load_data()['embedding_dimension']
         else:
             dim = len(cfg.data.train_test_params.delay_embedding_params.observed_indices)*cfg.data.train_test_params.delay_embedding_params.n_delays
-    elif cfg.data.data_type == 'wmtask':
-        # assuming the above string is cfg.data.flow.name, parse out the sum of N1 and N2
-        N1 = int(cfg.data.flow.name.split('__N1_')[1].split('__')[0])
-        N2 = int(cfg.data.flow.name.split('__N2_')[1].split('__')[0])
-        dim = N1 + N2
     elif cfg.data.data_type == 'custom':
-        dim = cfg.data.custom.dim
+        dim = cfg.data.flow.dim
     else:
         raise ValueError(f"Data type {cfg.data.data_type} not supported")
     
@@ -85,8 +143,8 @@ def initialize_config(cfg):
 def make_trajectories(cfg, save_dir=None, verbose=False):
     """Generate trajectories for training based on the configuration.
     
-    Creates trajectories either from dynamical systems (dysts) or working memory task (wmtask)
-    based on the data type specified in the config.
+    Creates trajectories either from dynamical systems (dysts), working memory task (wmtask),
+    or custom data sources based on the data type specified in the config.
     
     Args:
         cfg (OmegaConf): Configuration object containing trajectory parameters
@@ -102,11 +160,11 @@ def make_trajectories(cfg, save_dir=None, verbose=False):
     # Make trajectories
     if cfg.data.data_type == 'dysts':
         eq, sol, dt = make_dysts_trajectories(cfg, save_dir=save_dir, verbose=verbose)
-    elif cfg.data.data_type == 'wmtask':
-        eq, sol, dt = make_wmtask_trajectories(cfg, verbose=verbose)
     elif cfg.data.data_type == 'custom':
-        ## TODO: add custom data type
-        pass
+        eq = None
+        sol, dt = instantiate(cfg.data.dataset_loader)
+    else:
+        raise ValueError(f"Unknown data type: {cfg.data.data_type}")
     return eq, sol, dt
 
 def make_dysts_trajectories(cfg, save_dir=None, verbose=False, save_file=True):
@@ -153,76 +211,6 @@ def make_dysts_trajectories(cfg, save_dir=None, verbose=False, save_file=True):
         dt = sol['dt']
         if save_file:
             pickle.dump({'eq': eq, 'sol': sol, 'dt': dt}, open(filename, 'wb'))
-    return eq, sol, dt
-
-def make_wmtask_trajectories(cfg, verbose=False):
-    """Generate trajectories for working memory task models.
-    
-    Creates trajectories from a working memory task model, including handling of different
-    task phases (fixation, stimuli, delays, etc.).
-    
-    Args:
-        cfg (OmegaConf): Configuration object containing working memory task parameters
-        verbose (bool, optional): Whether to print progress information. Defaults to False.
-        
-    Returns:
-        tuple: (eq, sol, dt) where:
-            - eq: The working memory task equation object
-            - sol: Dictionary containing trajectory solutions and task parameters
-            - dt: Time step size
-    """
-    model, params = load_wmtask_model(cfg.data.flow.project, cfg.data.flow.name, cfg.data.trajectory_params.model_to_load)
-    all_dataloader, train_dataloader, val_dataloader, test_dataloader = generate_wmtask_data(params)
-    if cfg.data.trajectory_params.dataloader_to_use == 'all':
-        dataloader = all_dataloader
-    elif cfg.data.trajectory_params.dataloader_to_use == 'train':
-        dataloader = train_dataloader
-    elif cfg.data.trajectory_params.dataloader_to_use == 'val':
-        dataloader = val_dataloader
-    elif cfg.data.trajectory_params.dataloader_to_use == 'test':
-        dataloader = test_dataloader
-    hiddens = generate_model_trajectories(model, dataloader, params, verbose=verbose)
-    eq = WMTaskEq(model, params)
-
-    dt = params['dt']
-
-    if 'response_time' in params.keys():
-        response_time = params['response_time']
-        if response_time is None:
-            response_time = dt
-    else:
-        params['response_time'] = dt
-        response_time = params['response_time']
-    
-    fixation_time = params['fixation_time']
-    stimuli_time = params['stimuli_time']
-    delay1_time = params['delay1_time']
-    cue_time = params['cue_time']
-    delay2_time = params['delay2_time']
-
-    if cfg.data.trajectory_params.traj_window == 'delay2':
-        start_ind, end_ind = [int((fixation_time + stimuli_time + delay1_time + cue_time)/dt), int((fixation_time + stimuli_time + delay1_time + cue_time + delay2_time + response_time)/dt) - 1]
-    elif cfg.data.trajectory_params.traj_window == 'full':
-        start_ind, end_ind = [0, hiddens.shape[-2]]
-
-    sol = dict(
-        values=hiddens[..., start_ind:end_ind, :],
-        dt=dt,
-        time=np.arange(0, hiddens.shape[-2]) * dt,
-        tau=params['tau'],
-        params=params,
-        fixation_time = fixation_time,
-        stimuli_time = stimuli_time,
-        delay1_time = delay1_time,
-        cue_time = cue_time,
-        delay2_time = delay2_time,
-        response_time = response_time,
-        all_dataloader=all_dataloader,
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,
-        test_dataloader=test_dataloader
-    )
-
     return eq, sol, dt
 
 def postprocess_data(cfg, raw_values, raw_values_to_use_for_noise=None, scale_noise=True):
@@ -488,13 +476,6 @@ def train_model(cfg, lit_model, train_dataloaders, val_dataloaders, name, projec
         )
     
     # check if interactive environment
-    def in_ipython():
-        try:
-            get_ipython
-            return True
-        except NameError:
-            return False
-
     if in_ipython():
         strategy = 'ddp_notebook'
     else:
