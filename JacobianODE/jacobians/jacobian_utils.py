@@ -190,6 +190,7 @@ def make_dysts_trajectories(cfg, save_dir=None, verbose=False, save_file=True):
     # ----------------------------------------
     if save_dir is None:
         save_dir = cfg.training.logger.save_dir
+
     os.makedirs(save_dir, exist_ok=True)
     data_save_dir = os.path.join(save_dir, 'dysts_data')
     if save_file:
@@ -537,7 +538,6 @@ def load_run(project, run_id=None, run=None, save_dir=None, no_noise=False, gene
         print(f"Run created at {est_dt} EST")
         print(f"Is after Jan 31 2025 2pm EST? {est_dt > target_dt}")
 
-    # save_dir = "/home/millerlab-gpu/data/CommunicationJacobians/lightning"
     if est_dt > target_dt:
         if verbose:
             print("Date is after Jan 31 2025 2pm EST")
@@ -651,7 +651,6 @@ def load_checkpoint(run, cfg, lit_model, save_dir=None, epoch=None, loss_key='me
         loss_key (str, optional): Key to use for finding best checkpoint. Defaults to 'mean_val_loss'.
         verbose (bool, optional): Whether to print progress information. Defaults to False.
     """
-    # save_dir = "/home/millerlab-gpu/data/CommunicationJacobians/lightning"
 
     if verbose:
         print(f"Loading checkpoint from {save_dir}")

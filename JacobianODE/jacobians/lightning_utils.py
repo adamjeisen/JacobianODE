@@ -34,7 +34,7 @@ def reverse_wandb_config(config):
         random_state=config['random_state'],
     )
     if data_type == 'dysts':
-        flow_params['_target_'] = 'CommunicationJacobians.dysts_sim.flows.' + config['data_cls']
+        flow_params['_target_'] = 'ControlJacobians.dysts_sim.flows.' + config['data_cls']
         flow_params['dt'] = config['dt']
         trajectory_params = dict(
             n_periods=config['n_periods'],
@@ -164,10 +164,10 @@ def reverse_wandb_config(config):
         )
         model_params['model_kwargs'] = {key[6:]: val for key, val in config.items() if key.startswith('model_') and key != 'model_cls' and key != 'model_type' and key != 'model_obs_noise_scale'}
 
-    model_params['_target_'] = 'CommunicationJacobians.models.' + config['model_cls'].lower() + '.' + config['model_cls']
+    model_params['_target_'] = 'ControlJacobians.models.' + config['model_cls'].lower() + '.' + config['model_cls']
     
     lightning_params = dict(
-        _target_='CommunicationJacobians.models.' + config['model_cls'].lower() + '.' + config['lightning_cls'],
+        _target_='ControlJacobians.models.' + config['model_cls'].lower() + '.' + config['lightning_cls'],
         direct=config['direct'],
         mode=config['mode'],
         int_method=config['int_method'],
