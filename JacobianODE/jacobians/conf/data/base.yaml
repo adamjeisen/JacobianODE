@@ -14,6 +14,7 @@ train_test_params:
   split_by: 'trajectory'
   train_percent: 0.7
   test_percent: 0.1
+  # val_percent = 1 - train_percent - test_percent
   dtype: torch.FloatTensor
   verbose: True
   delay_embedding_params:

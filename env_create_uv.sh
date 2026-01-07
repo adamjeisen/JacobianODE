@@ -19,4 +19,4 @@ echo "Environment created successfully!"
 echo "To start Jupyter in Cursor/VSCode, click the kernel selecter in the top right corner."
 echo "Then select the 'Select Another Kernel...' --> 'Jupyter Kernel...' --> 'JacobianODE'"
 echo "In the 'Jupyter Kernel...' selector, you may need to click the refresh button in the top right corner to see the new kernel."
-echo "To activate the environment, from inside this directory, run: source .venv/bin/activate"
+echo "To activate the environment, from inside this directory, run: source .venv/bin/activate"s
