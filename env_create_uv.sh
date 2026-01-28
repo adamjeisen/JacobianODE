@@ -3,8 +3,8 @@ set -e
 
 echo "Creating Python environment with uv..."
 
-# Create virtual environment with Python 3.11
-uv venv --python 3.11
+# Create virtual environment with Python 3.12
+uv venv --python 3.12
 
 echo "Installing the project in editable mode..."
 # Install the project in editable mode
@@ -19,4 +19,7 @@ echo "Environment created successfully!"
 echo "To start Jupyter in Cursor/VSCode, click the kernel selecter in the top right corner."
 echo "Then select the 'Select Another Kernel...' --> 'Jupyter Kernel...' --> 'JacobianODE'"
 echo "In the 'Jupyter Kernel...' selector, you may need to click the refresh button in the top right corner to see the new kernel."
-echo "To activate the environment, from inside this directory, run: source .venv/bin/activate"s
+echo "To activate the environment, from inside this directory, run: source .venv/bin/activate"
+
+# Changelog:
+# - Changed Python version from 3.11 to 3.12

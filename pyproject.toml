@@ -12,7 +12,7 @@ description = "A package for Jacobian-based ODE analysis"
 authors = [
   {name = "Adam J. Eisen", email = "eisenaj@mit.edu" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.0.0",
     "torchvision",
