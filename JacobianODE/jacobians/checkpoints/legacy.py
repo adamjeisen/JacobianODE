@@ -1,32 +1,211 @@
+"""Legacy run handling for JacobianODE.
+
+This module handles loading runs created before the new configuration format
+was introduced (before January 31, 2025 2pm EST).
+"""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import os
+from typing import Any, Dict, Optional
+
+import pandas as pd
+import torch
+from hydra.utils import instantiate
+
+from ..data.dataloaders import create_dataloaders
+from ..data.processing import postprocess_data
+from ..data.trajectory import make_trajectories
+from ..lightning_base import LitBase
 from omegaconf import OmegaConf
 
-def make_run_info(cfg):
-    if cfg.data.data_type == 'dysts':
-        data_cls = cfg.data.flow._target_.split('.')[-1]
-    elif cfg.data.data_type == 'wmtask':
-        data_cls = 'WMTask'
+logger = logging.getLogger(__name__)
 
-    # Create name tuple
-    name = tuple([
-        f"{key}_{value}" 
-        for key, value in cfg.model.params.items() 
-        if value is not None and key not in ['_target_', '_partial_', 'embedder_kwargs', 'input_dim', 'output_dim']
-    ])
-    if 'deriv_params' in cfg.model and cfg.model.deriv_params is not None:
-        name = name + tuple([f"{key}_{value}" for key, value in cfg.model.deriv_params.items() if value is not None and key not in ['_target_', '_partial_', 'embedder_kwargs', 'input_dim', 'output_dim']])
-    name = name + tuple([f"{key}_{value}" for key, value in cfg.training.items() if key in ['batch_size', 'save_top_k']])
-    name = name + tuple([f"{key}_{value:.4f}" if key in ['obs_noise_scale', 'obs_noise_scale_validation'] else f"{key}_{value}" for key, value in cfg.training.lightning.items() if value is not None and key not in ['_target_', 'eq']])
-    name = (cfg.model.params._target_.split('.')[-1],) + name
-    name = name + tuple([f"{key}_{value:.4f}" if key in ['obs_noise'] else f"{key}_{value}" for key, value in cfg.data.postprocessing.items()])
-    name = name + tuple([f"{key}_{value}" for key, value in cfg.data.train_test_params.items() if key in ("n_delays")])
-    name = name + tuple([f"{key}_{value}" for key, value in cfg.data.train_test_params.items() if key in ("seq_length")])
-    name = name + tuple([f"{key}_{value}" for key, value in cfg.data.trajectory_params.items() if key in ("n_periods", "pts_per_period", "standardize", "noise", "num_ics")])
-    name = "__".join(name)
+# Mapping of run IDs to their optimal epoch numbers for legacy runs
+# These runs have issues with their validation loss history and need manual overrides
+LEGACY_RUN_EPOCH_OVERRIDES: Dict[str, int] = {
+    "oz9rj2ml": 6,
+    "8rg44zl8": 4,
+    "cf8jaatp": 8,
+}
 
-    project = (data_cls,'JacobianODE')
-    project = "__".join(project)
 
-    return name, project
+def reverse_wandb_run(
+    run: Any,
+    return_data: bool = False,
+    checkpoint: Optional[str] = None,
+    save_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reverse engineer a W&B run to recreate its configuration and model.
+
+    Used primarily for loading legacy runs, this function reconstructs the training
+    setup from a W&B run.
+
+    Args:
+        run: W&B run object to reverse engineer.
+        return_data: Whether to generate trajectory data. Defaults to False.
+        checkpoint: Specific checkpoint to load. Defaults to None.
+        save_dir: Directory containing saved data. Defaults to None.
+
+    Returns:
+        Dictionary containing all components of the reconstructed run:
+            - cfg: Configuration object
+            - lit_model: PyTorch Lightning model
+            - eq: Equation/model object
+            - dt: Time step size
+            - values: Processed trajectory values
+            - values_orig: Original trajectory values
+            - train_dataloader: Training data loader
+            - val_dataloader: Validation data loader
+            - test_dataloader: Test data loader
+            - trajs: Dictionary containing trajectory information
+
+    Example:
+        >>> ret = reverse_wandb_run(run, return_data=True)
+        >>> lit_model = ret['lit_model']
+        >>> cfg = ret['cfg']
+    """
+    if save_dir is None:
+        save_dir = run.config["save_dir"]
+
+    checkpoint_dir = os.path.join(save_dir, run.project, run.id, "checkpoints")
+    checkpoint_files = os.listdir(checkpoint_dir)
+
+    if checkpoint is None:
+        checkpoint = _find_best_checkpoint(run, checkpoint_files)
+
+    # Reverse engineer configuration
+    cfg_rev = reverse_wandb_config(run.config)
+    cfg_rev.training.lightning.eq = cfg_rev.data.flow
+
+    # Set seeds
+    import numpy as np
+
+    np.random.seed(cfg_rev.data.flow.random_state)
+    torch.random.manual_seed(cfg_rev.data.flow.random_state)
+
+    if return_data:
+        eq, sol, dt = make_trajectories(cfg_rev, save_dir=save_dir)
+        values_orig = sol["values"]
+        values = postprocess_data(cfg_rev, sol["values"])
+        train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
+            cfg_rev, values
+        )
+    else:
+        cfg_temp = cfg_rev.copy()
+        if cfg_rev.data.data_type == "dysts":
+            cfg_temp.data.trajectory_params.num_ics = 1
+            cfg_temp.data.trajectory_params.n_periods = 1
+
+        eq, _, dt = make_trajectories(cfg_temp, save_dir=save_dir)
+        values_orig = None
+        values = None
+        train_dataloader = None
+        val_dataloader = None
+        test_dataloader = None
+        trajs = None
+
+    # Create model
+    jac_model = instantiate(cfg_rev.model.params)
+
+    if "use_deriv_net" in cfg_rev.training and cfg_rev.training.use_deriv_net:
+        deriv_model = instantiate(cfg_rev.model.deriv_params)
+    else:
+        deriv_model = None
+
+    # Clean up lightning config to only include valid parameters
+    litbase_init_args = list(inspect.signature(LitBase.__init__).parameters.keys())
+    keys_to_remove = [
+        key
+        for key in cfg_rev.training.lightning.keys()
+        if key not in litbase_init_args
+    ]
+    for key in keys_to_remove:
+        if key != "_target_":
+            del cfg_rev.training.lightning[key]
+
+    lit_model = instantiate(
+        cfg_rev.training.lightning,
+        model=jac_model,
+        deriv_model=deriv_model,
+        dt=dt,
+        save_dir=run.config["save_dir"],
+    )
+
+    # Load checkpoint
+    checkpoint_path = os.path.join(checkpoint_dir, checkpoint)
+    if torch.cuda.is_available():
+        lit_model.load_state_dict(
+            torch.load(checkpoint_path, weights_only=True)["state_dict"]
+        )
+    else:
+        lit_model.load_state_dict(
+            torch.load(checkpoint_path, weights_only=True, map_location="cpu")[
+                "state_dict"
+            ]
+        )
+
+    lit_model.data_type = cfg_rev.data.data_type
+
+    return {
+        "cfg": cfg_rev,
+        "lit_model": lit_model,
+        "eq": eq,
+        "dt": dt,
+        "values": values,
+        "values_orig": values_orig,
+        "train_dataloader": train_dataloader,
+        "val_dataloader": val_dataloader,
+        "test_dataloader": test_dataloader,
+        "trajs": trajs,
+    }
+
+
+def _find_best_checkpoint(run: Any, checkpoint_files: list) -> str:
+    """Find the best checkpoint based on validation loss or manual overrides."""
+    columns = run.history().columns
+    history_df = run.scan_history()
+
+    if "random_points val_loss" in columns:
+        history_df = pd.DataFrame(
+            [
+                {"val_loss": row["random_points val_loss"], "epoch": row["epoch"]}
+                for row in history_df
+                if "random_points val_loss" in row
+                and row["random_points val_loss"] is not None
+            ]
+        )
+    elif "trajectory val_loss" in columns:
+        history_df = pd.DataFrame(
+            [
+                {"val_loss": row["trajectory val_loss"], "epoch": row["epoch"]}
+                for row in history_df
+                if "trajectory val_loss" in row
+                and row["trajectory val_loss"] is not None
+            ]
+        )
+    else:
+        raise ValueError("No val_loss found in history_df")
+
+    # Remove invalid values
+    history_df = history_df[history_df["val_loss"] != "NaN"]
+    history_df = history_df[history_df["val_loss"] != "Infinity"]
+
+    # Check for manual epoch overrides for problematic runs
+    if run.id in LEGACY_RUN_EPOCH_OVERRIDES:
+        opt_epoch = LEGACY_RUN_EPOCH_OVERRIDES[run.id]
+        logger.info(f"Using manual epoch override {opt_epoch} for run {run.id}")
+    else:
+        opt_epoch = history_df.epoch.loc[history_df.val_loss.idxmin()]
+
+    checkpoint = [
+        f for f in checkpoint_files if f.split("=")[1].split("-")[0] == str(opt_epoch)
+    ][0]
+
+    return checkpoint
+
 
 def reverse_wandb_config(config):
     data_type = config['data_type'] if 'data_type' in config else 'dysts'
@@ -139,7 +318,7 @@ def reverse_wandb_config(config):
             residuals=config['residuals'],
             activation=config['activation']
         )
-    
+
     if config['model_cls'] == 'JacNet':
         model_params = dict(
             input_dim=config['input_dim'],
@@ -165,7 +344,7 @@ def reverse_wandb_config(config):
         model_params['model_kwargs'] = {key[6:]: val for key, val in config.items() if key.startswith('model_') and key != 'model_cls' and key != 'model_type' and key != 'model_obs_noise_scale'}
 
     model_params['_target_'] = 'ControlJacobians.models.' + config['model_cls'].lower() + '.' + config['model_cls']
-    
+
     lightning_params = dict(
         _target_='ControlJacobians.models.' + config['model_cls'].lower() + '.' + config['lightning_cls'],
         direct=config['direct'],
@@ -259,5 +438,5 @@ def reverse_wandb_config(config):
             'trainer_params': trainer_params
         }
     }
-    
+
     return OmegaConf.create(ret_dict)

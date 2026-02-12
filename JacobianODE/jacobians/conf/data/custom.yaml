@@ -1,11 +1,48 @@
+# Custom data configuration for JacobianODE
+#
+# Use this configuration to train on your own data in the format:
+#   (trials x time x dimensions)
+#
+# Example usage:
+#   # Load from numpy file:
+#   python run_jacobians.py data=custom \
+#       data.dataset_loader._target_=JacobianODE.jacobians.custom_data.load_from_numpy \
+#       +data.dataset_loader.file_path=/path/to/your/data.npy \
+#       +data.dataset_loader.dt=0.01 \
+#       data.flow.dim=YOUR_DATA_DIM
+#
+#   # Load from pickle file:
+#   python run_jacobians.py data=custom \
+#       data.dataset_loader._target_=JacobianODE.jacobians.custom_data.load_from_pickle \
+#       +data.dataset_loader.file_path=/path/to/your/data.pkl \
+#       +data.dataset_loader.dt=0.01 \
+#       data.flow.dim=YOUR_DATA_DIM
+
 defaults:
   - base@_here_
   - _self_
 
 data_type: custom
+name: custom  # REQUIRED: A descriptive name for your dataset (used in wandb logging)
 
+# Dataset loader configuration
+# The _target_ should point to a callable that returns (sol, dt)
+# where sol is a dict with 'values' key containing data of shape (trials, time, dims)
 dataset_loader:
-  _target_: null
+  _target_: JacobianODE.jacobians.custom_data.load_from_numpy
+  # file_path: null  # Path to your data file (set via command line or override)
+  # dt: null         # Time step between observations (set via command line or override)
+  # data_key: null   # Optional: key to extract from npz/pickle dict
 
+# Flow parameters for custom data
+# dim: Must be set to match your data's dimension (last axis)
 flow:
-  dim: 249
+  dim: null  # REQUIRED: Set this to match your data dimensionality
+  random_state: 42
+
+# Override postprocessing defaults for custom data
+# You may want to adjust these based on your data
+postprocessing:
+  obs_noise: 0.0  # Default to no added noise for custom data
+  filter_data: false
+  normalize: false

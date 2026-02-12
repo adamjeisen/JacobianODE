@@ -1,25 +1,26 @@
+# Base configuration for all data types
+# Data should be in format: (n_trials, n_timepoints, n_dimensions)
+
 flow:
   random_state: 42
 
 postprocessing:
   obs_noise: 0
-  filter_data: False
+  filter_data: false
   low_pass: 10
   high_pass: null
-  normalize: False
+  normalize: false
 
 train_test_params:
-  seq_length: 25
-  seq_spacing: 1
-  split_by: 'trajectory'
+  seq_length: 25       # Length of sequences for training
+  seq_spacing: 1       # Spacing between sequence start points
+  split_by: 'trajectory'  # 'trajectory' or 'time'
   train_percent: 0.7
   test_percent: 0.1
   # val_percent = 1 - train_percent - test_percent
   dtype: torch.FloatTensor
-  verbose: True
+  verbose: true
   delay_embedding_params:
-    observed_indices: 'all'
-    n_delays: 1
-    delay_spacing: 1
-
-
+    observed_indices: 'all'  # Which dimensions to observe ('all' or list of indices)
+    n_delays: 1              # Number of delays for delay embedding
+    delay_spacing: 1         # Time steps between delays

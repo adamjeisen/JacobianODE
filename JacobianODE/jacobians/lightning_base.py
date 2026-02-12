@@ -23,45 +23,6 @@ METRIC_DICT = {
     'smape': smape,
 }
 
-def horizon_aware_loss(predictions, targets, dt=1, alpha=0.1):
-    """Compute an exponentially weighted horizon-aware loss.
-
-    This loss function weights prediction errors based on their temporal distance,
-    with earlier time steps having higher weights. The weighting follows an
-    exponential decay with rate alpha.
-
-    Args:
-        predictions (torch.Tensor): Predicted trajectory of shape (batch, time, dim)
-        targets (torch.Tensor): Ground truth trajectory of shape (batch, time, dim)
-        dt (float): Time step size (default: 1)
-        alpha (float): Decay rate for weighting (default: 0.1)
-                     Higher values mean more weight on earlier time steps.
-                     For example, alpha=0.1 means by the 10th time step,
-                     the weight is e^-1 ≈ 0.368
-
-    Returns:
-        torch.Tensor: Scalar loss value, mean of weighted MSE across all batches
-    """
-    # Compute element-wise loss (e.g., MSE)
-    loss_per_timestep = F.mse_loss(predictions, targets, reduction='none')  # (batch, time, dim)
-
-    # Reduce over dimensions
-    loss_per_timestep = loss_per_timestep.mean(dim=-1)  # (batch, time)
-
-    # Compute exponential weights
-    timesteps = torch.arange(targets.shape[-2], dtype=torch.float32, device=targets.device)
-    # alpha represents the decay rate in units of dt^-1
-    # thus alpha = 0.1 means that by the 10th time step, the weight is e^-1 = 0.36787944117144233
-    weights = torch.exp(-alpha * timesteps)  # (time,)
-    
-    # Normalize weights to sum to 1
-    weights = weights / weights.sum()
-
-    # Apply weights
-    weighted_loss = (loss_per_timestep * weights).sum(dim=-1)  # (batches,)
-
-    return weighted_loss.mean()  # Scalar loss
-
 def make_loops(pts, n_loops, n_loop_pts=0):
     """Generate loop trajectories by randomly sampling and concatenating points.
 
@@ -112,9 +73,19 @@ class TeacherForcingLRScheduler(torch.optim.lr_scheduler._LRScheduler):
         new_lr = self.min_lr + self.scale_factor(alpha) * (self.start_lr - self.min_lr)
         return [new_lr for _ in self.base_lrs]
 
-def loop_closure(batch, jac_func, dt=1, n_loops=None, n_loop_pts=None, loop_path='line',
-                int_method='Trapezoid', loop_closure_interp_pts=2, mix_trajectories=True,
-                alpha=1, return_loop_pts=False):
+def loop_closure(
+        batch, 
+        jac_func, 
+        dt=1, 
+        n_loops=None, 
+        n_loop_pts=None, 
+        loop_path='line',
+        int_method='Trapezoid', 
+        loop_closure_interp_pts=2, 
+        mix_trajectories=True,
+        alpha=1, 
+        return_loop_pts=False
+    ):
     """Compute loop closure integrals for validation of path independence.
 
     This function generates loop trajectories and computes their integrals using
@@ -195,12 +166,7 @@ class LitBase(L.LightningModule):
         save_dir (Optional[str]): Directory to save model checkpoints
         loss_func (str): Loss function type ('mse' or 'hal' for horizon-aware loss) (default: 'mse')
         alpha_hal (float): Alpha parameter for horizon-aware loss (default: 0.1)
-        l2_penalty (float): L2 regularization weight (default: 0.0)
-        l1_penalty (float): L1 regularization weight (default: 0.0)
         obs_noise_scale (float): Scale of observation noise to add during training (default: 0.0)
-        final_obs_noise_scale (float): Final scale of observation noise after annealing (default: 0.0)
-        y0_noise_scale (float): Scale of noise to add to initial conditions (default: 0.0)
-        noise_annealing (bool): Whether to anneal observation noise (default: True)
         log_interval (int): Interval for logging training metrics (default: 1)
         jac_loss_interval (int): Interval for computing Jacobian loss (default: 1)
         alpha_teacher_forcing (float): Initial teacher forcing coefficient (default: 1)
@@ -210,10 +176,6 @@ class LitBase(L.LightningModule):
         teacher_forcing_steps (int): Number of steps to use teacher forcing (default: 1)
         min_alpha_teacher_forcing (float): Minimum teacher forcing coefficient (default: 0)
         alpha_validation (float): Teacher forcing coefficient for validation (default: 0)
-        obs_noise_scale_validation (float): Observation noise scale for validation (default: 1e-2)
-        loss_func_validation (Optional[str]): Loss function for validation (default: None)
-        traj_init_steps_validation (Optional[int]): Initial steps for validation trajectories (default: None)
-        inner_N_validation (Optional[int]): Number of integration steps for validation (default: None)
         data_type (Optional[str]): Type of data being used (default: None)
         optimizer (str): Optimizer to use ('AdamW' or 'Adam') (default: 'AdamW')
         optimizer_kwargs (dict): Keyword arguments for optimizer (default: {'lr': 1e-4})
@@ -227,17 +189,14 @@ class LitBase(L.LightningModule):
         k_scale (Optional[float]): Scaling factor for scheduler (default: None)
         jac_penalty (float): Weight for Jacobian regularization (default: 0.0)
         jac_norm_ord (str): Order of norm for Jacobian regularization (default: 'fro')
-        loop_closure_training (bool): Whether to use loop closure training (default: False)
+        loop_closure_training (bool): Whether to use loop closure training (default: True)
         mix_trajectories (bool): Whether to mix trajectories during training (default: True)
-        loop_closure_interp_pts (int): Number of interpolation points for loop closure (default: 10)
-        max_loop_closure_interp_pts (int): Maximum interpolation points for loop closure (default: 10)
+        loop_closure_interp_pts (int): Number of interpolation points for loop closure (default: 20)
         loop_closure_int_method (str): Integration method for loop closure (default: 'Trapezoid')
         n_loops (Optional[int]): Number of loops for loop closure (default: None)
         n_loop_pts (Optional[int]): Number of points per loop (default: None)
         loop_path (str): Path type for loop closure ('line' or 'spline') (default: 'line')
         loop_closure_weight (float): Weight for loop closure loss (default: 1.0)
-        final_loop_closure_weight (Optional[float]): Final weight for loop closure loss (default: None)
-        obs_noise_scale_loop (Optional[float]): Observation noise scale for loop closure (default: None)
         trajectory_training (bool): Whether to use trajectory training (default: True)
         use_base_deriv_pt (bool): Whether to use base derivative point (default: False)
         base_pt_init (Optional[torch.Tensor]): Initial base point (default: None)
@@ -258,12 +217,7 @@ class LitBase(L.LightningModule):
                     save_dir=None, 
                     loss_func='mse',
                     alpha_hal=0.1,
-                    l2_penalty=0.0,
-                    l1_penalty=0.0,
                     obs_noise_scale=0.0,
-                    final_obs_noise_scale=0.0,
-                    y0_noise_scale=0.0,
-                    noise_annealing=True,
                     log_interval=1,
                     jac_loss_interval=1,
                     alpha_teacher_forcing=1,
@@ -273,10 +227,6 @@ class LitBase(L.LightningModule):
                     teacher_forcing_steps=1,
                     min_alpha_teacher_forcing=0,
                     alpha_validation=0,
-                    obs_noise_scale_validation=1e-2,
-                    loss_func_validation=None,
-                    traj_init_steps_validation=None,
-                    inner_N_validation=None,
                     data_type=None,
                     optimizer='AdamW',
                     optimizer_kwargs={'lr': 1e-4},
@@ -288,17 +238,14 @@ class LitBase(L.LightningModule):
                     k_scale=None,
                     jac_penalty=0.0,
                     jac_norm_ord='fro',
-                    loop_closure_training=False,
+                    loop_closure_training=True,
                     mix_trajectories=True,  
-                    loop_closure_interp_pts=10,
-                    max_loop_closure_interp_pts=10,
+                    loop_closure_interp_pts=20,
                     loop_closure_int_method='Trapezoid',
                     n_loops=None,
                     n_loop_pts=None,
                     loop_path='line',
                     loop_closure_weight=1.0,
-                    final_loop_closure_weight=None,
-                    obs_noise_scale_loop=None,
                     trajectory_training=True,
                     use_base_deriv_pt=False,
                     base_pt_init=None,
@@ -323,17 +270,10 @@ class LitBase(L.LightningModule):
         self.alpha_hal = alpha_hal
         if loss_func == 'mse':
             self.criterion = nn.MSELoss()
-        elif loss_func == 'horizon_aware':
-            self.criterion = self.horizon_aware_criterion
         else: # not implemented
             raise ValueError(f"Loss function {loss_func} not implemented")
  
-        self.l2_penalty = l2_penalty
-        self.l1_penalty = l1_penalty
         self.obs_noise_scale = obs_noise_scale
-        self.final_obs_noise_scale = final_obs_noise_scale
-        self.y0_noise_scale = y0_noise_scale
-        self.noise_annealing = noise_annealing
         self.log_interval = log_interval
         self.jac_loss_interval = jac_loss_interval
 
@@ -345,21 +285,6 @@ class LitBase(L.LightningModule):
 
         self.min_alpha_teacher_forcing = min_alpha_teacher_forcing
         self.alpha_validation = alpha_validation
-        self.obs_noise_scale_validation = obs_noise_scale_validation
-
-        if loss_func_validation is None:
-            self.criterion_validation = self.criterion
-        else:
-            if loss_func_validation == 'mse':
-                self.criterion_validation = nn.MSELoss()
-            elif loss_func_validation == 'horizon_aware':
-                self.criterion_validation = self.horizon_aware_criterion
-            else:
-                raise ValueError(f"Loss function {loss_func_validation} not implemented")
-        
-        self.traj_init_steps_validation = traj_init_steps_validation
-        self.inner_N_validation = inner_N_validation
-        
 
         self.data_type = data_type
 
@@ -377,20 +302,11 @@ class LitBase(L.LightningModule):
         self.jac_norm_ord = jac_norm_ord
         self.loop_closure_training = loop_closure_training
         self.loop_closure_interp_pts = loop_closure_interp_pts
-        self.max_loop_closure_interp_pts = max_loop_closure_interp_pts
-        if self.max_loop_closure_interp_pts is None:
-            self.max_loop_closure_interp_pts = self.loop_closure_interp_pts
         self.loop_closure_int_method = loop_closure_int_method
         self.n_loops = n_loops
         self.n_loop_pts = n_loop_pts
         self.loop_path = loop_path
         self.loop_closure_weight = loop_closure_weight
-        self.final_loop_closure_weight = final_loop_closure_weight
-        if final_loop_closure_weight is None:
-            self.final_loop_closure_weight = loop_closure_weight
-        else:
-            self.final_loop_closure_weight = final_loop_closure_weight
-        self.obs_noise_scale_loop = obs_noise_scale_loop
         self.mix_trajectories = mix_trajectories
         self.trajectory_training = trajectory_training
 
@@ -416,7 +332,6 @@ class LitBase(L.LightningModule):
             self.base_pt = None
             self.base_deriv_pt = None
             self.base_deriv_func = None
-        self.l1_penalty = l1_penalty
 
         self.n_delays = n_delays
         self.obs_dim = obs_dim
@@ -454,18 +369,6 @@ class LitBase(L.LightningModule):
         """
         return self.model(x)
 
-    def horizon_aware_criterion(self, x, y):
-        """Compute horizon-aware loss between predictions and targets.
-
-        Args:
-            x (torch.Tensor): Predictions
-            y (torch.Tensor): Targets
-
-        Returns:
-            torch.Tensor: Horizon-aware loss value
-        """
-        return horizon_aware_loss(x, y, alpha=self.alpha_hal)
-    
     def trajectory_model_step(
                     self, 
                     batch, 
@@ -474,7 +377,6 @@ class LitBase(L.LightningModule):
                     all_metrics=False, 
                     direct=None, 
                     obs_noise_scale=None, 
-                    noise_annealing=None,
                     alpha_teacher_forcing=None,
                     teacher_forcing_steps=None,
                     jacobianODEint_kwargs=None,
@@ -490,7 +392,6 @@ class LitBase(L.LightningModule):
             all_metrics (bool): Whether to compute all metrics
             direct (Optional[bool]): Whether to use direct prediction
             obs_noise_scale (Optional[float]): Scale of observation noise
-            noise_annealing (Optional[bool]): Whether to anneal noise
             alpha_teacher_forcing (Optional[float]): Teacher forcing coefficient
             teacher_forcing_steps (Optional[int]): Number of teacher forcing steps
             jacobianODEint_kwargs (Optional[dict]): Integration parameters
@@ -504,8 +405,6 @@ class LitBase(L.LightningModule):
             direct = self.direct
         if obs_noise_scale is None:
             obs_noise_scale = self.obs_noise_scale
-        if noise_annealing is None:
-            noise_annealing = self.noise_annealing
         if alpha_teacher_forcing is None:
             alpha_teacher_forcing = self.alpha_teacher_forcing
         if teacher_forcing_steps is None:
@@ -518,10 +417,6 @@ class LitBase(L.LightningModule):
         
         alpha = alpha_teacher_forcing
 
-        if noise_annealing:
-            pct_anneal = (alpha - self.min_alpha_teacher_forcing)/(1 - self.min_alpha_teacher_forcing)
-            obs_noise_scale = pct_anneal*(self.obs_noise_scale - self.final_obs_noise_scale) + self.final_obs_noise_scale
-
         batch = batch.type(self.dtype)
         label = batch.detach().clone() # Detach to prevent gradient flow through label
         batch = batch + (torch.randn(*batch.shape)*obs_noise_scale).type(batch.dtype).to(batch.device)
@@ -530,9 +425,6 @@ class LitBase(L.LightningModule):
         if 'traj_init_steps' not in jacobianODEint_kwargs:
             jacobianODEint_kwargs['traj_init_steps'] = 2
         
-        if self.y0_noise_scale > 0:
-            batch[..., :jacobianODEint_kwargs['traj_init_steps'], :] = batch[..., :jacobianODEint_kwargs['traj_init_steps'], :] + (torch.randn(*batch[..., :jacobianODEint_kwargs['traj_init_steps'], :].shape)*self.y0_noise_scale).type(batch.dtype).to(batch.device)
-
         if direct:
             if self.use_base_deriv_pt:
                 batch = torch.cat([self.base_pt.repeat(batch.shape[0], 1, 1), batch], dim=1)
@@ -598,8 +490,6 @@ class LitBase(L.LightningModule):
             batch, 
             batch_idx=0, 
             dataloader_idx=0,
-            obs_noise_scale_loop=None, 
-            noise_annealing=None,
             mix_trajectories=True,
             n_loops=None,
             n_loop_pts=None,
@@ -613,8 +503,6 @@ class LitBase(L.LightningModule):
             batch (torch.Tensor): Input batch
             batch_idx (int): Index of current batch
             dataloader_idx (int): Index of current dataloader
-            obs_noise_scale_loop (Optional[float]): Scale of observation noise
-            noise_annealing (Optional[bool]): Whether to anneal noise
             mix_trajectories (bool): Whether to mix trajectories
             n_loops (Optional[int]): Number of loops
             n_loop_pts (Optional[int]): Points per loop
@@ -625,10 +513,6 @@ class LitBase(L.LightningModule):
         Returns:
             dict: Dictionary containing loss values and metrics
         """
-        if obs_noise_scale_loop is None:
-            obs_noise_scale_loop = self.obs_noise_scale_loop
-        if noise_annealing is None:
-            noise_annealing = self.noise_annealing
         if mix_trajectories is None:
             mix_trajectories = self.mix_trajectories
         if n_loops is None:
@@ -639,15 +523,8 @@ class LitBase(L.LightningModule):
             loop_path = self.loop_path
         if loop_closure_int_method is None:
             loop_closure_int_method = self.loop_closure_int_method
-        if noise_annealing:
-            alpha = (self.alpha_teacher_forcing - self.min_alpha_teacher_forcing)/(1 - self.min_alpha_teacher_forcing)
-            obs_noise_scale_loop = (alpha - self.min_alpha_teacher_forcing)/(1 - self.min_alpha_teacher_forcing)*obs_noise_scale_loop
-
         if loop_closure_interp_pts is None:
-            loop_closure_interp_pts = np.random.randint(self.loop_closure_interp_pts, self.max_loop_closure_interp_pts + 1)
-
-        if obs_noise_scale_loop > 0:
-            batch = batch +(torch.randn(*batch.shape)*obs_noise_scale_loop).type(batch.dtype).to(batch.device)
+            loop_closure_interp_pts = self.loop_closure_interp_pts
 
         loop_int = loop_closure(batch, self.compute_jacobians, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method=loop_closure_int_method)
         # loop_int, err_bound = loop_closure_with_est_error(batch, self.compute_jacobians, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method=loop_closure_int_method, return_err_bound=True)
@@ -741,9 +618,8 @@ class LitBase(L.LightningModule):
                 train_rets['loop_closure'] = self.loop_closure_model_step(batch, batch_idx, dataloader_idx)
 
         total_loss = 0
-        alpha = (self.alpha_teacher_forcing - self.min_alpha_teacher_forcing)/(1 - self.min_alpha_teacher_forcing)
         trajectory_weight = 1
-        loop_closure_weight = (1 - alpha)*self.final_loop_closure_weight + alpha*self.loop_closure_weight
+        loop_closure_weight = self.loop_closure_weight
        
         for pred_type, ret_dict in train_rets.items():
             if torch.isnan(ret_dict['loss']):
@@ -761,8 +637,6 @@ class LitBase(L.LightningModule):
         if jac_norm is not None:
             total_loss += self.jac_penalty*jac_norm
         l1_loss = torch.sum(torch.abs(torch.cat([p.view(-1) for p in self.get_main_params()], dim=0)))
-        if self.l1_penalty > 0:
-            total_loss += self.l1_penalty*l1_loss
         
         if ((batch_idx + 1) % self.log_interval) == 0:
             self.log_training_metrics(
@@ -829,15 +703,9 @@ class LitBase(L.LightningModule):
             return
 
         # dataloader_name = self.val_dataloader_names[dataloader_idx]
-        jacobianODEint_kwargs = self.jacobianODEint_kwargs.copy()
-        jacobianODEint_kwargs['traj_init_steps'] = self.traj_init_steps_validation
-        jacobianODEint_kwargs['inner_N'] = self.inner_N_validation
         model_step_kwargs = {
             'alpha_teacher_forcing': self.alpha_validation, 
-            'obs_noise_scale': self.obs_noise_scale_validation,
-            'criterion': self.criterion_validation,
-            'noise_annealing': False,
-            'jacobianODEint_kwargs': jacobianODEint_kwargs,
+            'obs_noise_scale': 0,
         }
 
         val_rets = {}
@@ -910,20 +778,21 @@ class LitBase(L.LightningModule):
             prog_bar (bool): Whether to show in progress bar
         """
         # Log losses and basic metrics
-        alpha = (self.alpha_teacher_forcing - self.min_alpha_teacher_forcing)/(1 - self.min_alpha_teacher_forcing)
-        trajectory_weight = 1
-        loop_closure_weight = (1 - alpha)*self.final_loop_closure_weight + alpha*self.loop_closure_weight
+        # trajectory_weight = 1
+        # loop_closure_weight = self.loop_closure_weight
         
         for pred_type, ret_dict in train_rets.items():
             loss, metric_vals = ret_dict['loss'], ret_dict['metric_vals']
             self.log(f"{pred_type} train_loss", loss, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
             for metric, val in metric_vals.items():
+                if pred_type != 'trajectory':
+                    continue
                 # self.log(f"{pred_type} train {metric}", val, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
                 loss_weight = 1
-                if 'trajectory' in pred_type:
-                    loss_weight *= trajectory_weight
-                if 'loop_closure' in pred_type:
-                    loss_weight *= loop_closure_weight
+                # if 'trajectory' in pred_type:
+                #     loss_weight *= trajectory_weight
+                # if 'loop_closure' in pred_type:
+                #     loss_weight *= loop_closure_weight
                 self.log(f"{pred_type} train {metric}", val*loss_weight, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
                 
         self.log(f"total train loss", total_loss, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
@@ -934,21 +803,9 @@ class LitBase(L.LightningModule):
         if self.teacher_forcing_annealing:
             self.log(f"alpha teacher forcing", self.alpha_teacher_forcing, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
 
-        # # Log gradient statistics
-        # for name, param in self.named_parameters():
-        #     if param.grad is not None:
-        #         grad_norm = param.grad.norm()
-        #         self.log(f"gradients/{name}_norm", grad_norm, on_step=True, on_epoch=True, sync_dist=sync_dist)
-        #         self.log(f"gradients/{name}_mean", param.grad.mean(), on_step=True, on_epoch=True, sync_dist=sync_dist)
-        #         self.log(f"gradients/{name}_std", param.grad.std(), on_step=True, on_epoch=True, sync_dist=sync_dist)
-        #         self.log(f"gradients/{name}_max", param.grad.max(), on_step=True, on_epoch=True, sync_dist=sync_dist)
-        #         self.log(f"gradients/{name}_min", param.grad.min(), on_step=True, on_epoch=True, sync_dist=sync_dist)
-
         # Log Jacobian metrics
         if self.eq is not None and jacs_pred is not None:
             jacs_true = self.get_true_jacs(batch)
-            if jacs_pred is None:
-                jacs_pred = self.compute_jacobians(batch)
             jacs_pred_cpu = jacs_pred.detach().cpu().numpy()
             if isinstance(jacs_true, torch.Tensor):
                 jacs_true_cpu = jacs_true.detach().cpu().numpy()
@@ -975,6 +832,8 @@ class LitBase(L.LightningModule):
             loss, metric_vals = ret_dict['loss'], ret_dict['metric_vals']
             self.log(f"{pred_type} val_loss", loss, sync_dist=sync_dist, add_dataloader_idx=False)
             for metric, val in metric_vals.items():
+                if pred_type != 'trajectory':
+                    continue
                 self.log(f"{pred_type} val {metric}", val, sync_dist=sync_dist, add_dataloader_idx=False)
         
         # log mean loss across all predictions

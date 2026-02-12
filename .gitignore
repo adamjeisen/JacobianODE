@@ -1,3 +1,10 @@
+# My folders
+multirun/
+outputs/
+_jupyter/multirun/
+_jupyter/outputs/
+_jupyter/checkpoints/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
