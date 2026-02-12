@@ -3,21 +3,26 @@ run_number: 0
 
 lightning:
   _target_: null
-  # direct: False
-  direct: True
-  # loss_func: horizon_aware
-  loss_func: mse
-  # loss_func: soft_dtw
-  alpha_hal: 0.1
-  l2_penalty: 0
-  l1_penalty: 0.0
-  # obs_noise_scale: 5e-2
-  obs_noise_scale: 0
-  final_obs_noise_scale: 0
-  y0_noise_scale: 0
 
-  noise_annealing: False
-  log_interval: 100
+  # -----------------
+  # OPTIMIZATION
+  # -----------------
+  optimizer: 'AdamW'
+  optimizer_kwargs:
+    lr: 1e-4
+    weight_decay: 1e-4
+  use_scheduler: True
+  # use_scheduler: False
+  min_lr: 1e-6 # minimum learning rate for use with scheduler
+  # ADVANCED HYPERPARAMETERS
+  k_scale: 1 # controls the slope of the learning rate scheduler
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: 'norm'
+
+  # -----------------
+  # TEACHER FORCING
+  # -----------------
+  # ADVANCED HYPERPARAMETERS
   alpha_teacher_forcing: 1
   teacher_forcing_annealing: True
   gamma_teacher_forcing: 0.999
@@ -25,12 +30,35 @@ lightning:
   teacher_forcing_steps: 1
   min_alpha_teacher_forcing: 0
   alpha_validation: 0
-  obs_noise_scale_validation: 0
-  loss_func_validation: mse
-  # loss_func_validation: soft_dtw
-  traj_init_steps_validation: 15
-  inner_N_validation: 20
-  data_type: null
+
+  # -----------------
+  # TRAINING NOISE
+  # -----------------
+  # obs_noise_scale: 5e-2
+  obs_noise_scale: 0
+  
+  # -----------------
+  # JACOBIAN REGULARIZATION
+  # -----------------
+  jac_penalty: 0.0
+  jac_norm_ord: 'fro'
+  
+  # -----------------
+  # LOOP CLOSURE TRAINING
+  # -----------------
+  loop_closure_training: True # whether to train on loop closure integrals
+  loop_closure_weight: 0.0
+  n_loop_pts: 20 # number of points per loop
+  # ADVANCED HYPERPARAMETERS
+  mix_trajectories: True # whether to mix trajectories during training
+  loop_closure_interp_pts: 20 # number of interpolation points in between end points for each line segment
+  loop_closure_int_method: 'Trapezoid'
+  n_loops: null # set default to traj batches
+
+  # -----------------
+  # JACOBIAN ODE
+  # -----------------
+  # ADVANCED HYPERPARAMETERS
   jacobianODEint_kwargs:
     # -----------------
     # FAST MODE
@@ -40,33 +68,14 @@ lightning:
     inner_N: 20
     interp_pts: 4
 
-  gradient_clip_val: 1.0
-  gradient_clip_algorithm: 'norm'
-  optimizer: 'AdamW'
-  optimizer_kwargs:
-    lr: 1e-4
-    weight_decay: 1e-4
-  use_scheduler: True
-  # use_scheduler: False
-  min_lr: 1e-6
-  k_scale: 1
-  jac_penalty: 0.0
-  jac_norm_ord: 'fro'
-  # jac_norm_ord: 1
-  loop_closure_training: True
-  mix_trajectories: True
-  loop_closure_interp_pts: 20
-  max_loop_closure_interp_pts: null
-  loop_closure_int_method: 'Trapezoid'
-  n_loops: null # set default to traj batches
-  n_loop_pts: 20
-  obs_noise_scale_loop: 0
+  log_interval: 100
   trajectory_training: True
-  loop_closure_weight: 0.0
-  final_loop_closure_weight: null
   use_base_deriv_pt: False
-  # eq: null
-
+  # direct: False
+  direct: True
+  loss_func: mse
+  data_type: null
+  
 logger_save_dirs: null
 
 logger:
@@ -76,17 +85,10 @@ logger:
   
 trainer_params:
   # limit_train_batches: 1.0
-  # limit_train_batches: 500
   limit_train_batches: 500
-  # limit_train_batches: 6.0
   limit_val_batches: 100
-  # limit_val_batches: 3.0
   max_epochs: 1000
   accumulate_grad_batches: 4
-  # accumulate_grad_batches: 32
-  # accumulate_grad_batches: 1
-  # accumulate_grad_batches: 16
-  # accumulate_grad_batches: 64
   # strategy: 'ddp_find_unused_parameters_true'
 
 early_stopping:

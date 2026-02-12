@@ -1,59 +1,80 @@
-import hydra
+"""Main training script for JacobianODE.
+
+This script provides the entry point for training Jacobian-based ODE models
+using Hydra for configuration management.
+"""
+
+from __future__ import annotations
+
 import logging
+
+import hydra
 import torch
-import numpy as np
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
-from .jacobian_utils import in_ipython, initialize_config, make_trajectories, postprocess_data, normalize_data, create_dataloaders, setup_wandb, make_model, log_training_info, train_model
+# Import from new modular structure
+from .core import in_ipython, initialize_config, seed_everything
+from .data import make_trajectories, postprocess_data, normalize_data, create_dataloaders
+from .training import make_model, train_model, log_training_info, setup_wandb
 
-log = logging.getLogger('JacobianLogger')
+# Set up logging
+log = logging.getLogger("JacobianLogger")
+
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
-def train_jacobians(cfg):
-    # check if ipython
-    # if in_ipython():
-    #     log = None
-    log.info("Running in ipython")
+def train_jacobians(cfg: DictConfig) -> None:
+    """Train a JacobianODE model.
 
+    This function orchestrates the complete training pipeline:
+    1. Initial setup (GPU, logging, config)
+    2. Data generation and preprocessing
+    3. DataLoader creation
+    4. W&B setup
+    5. Model creation
+    6. Training
+
+    Args:
+        cfg: Hydra configuration object containing all training parameters.
+    """
     # ----------------------------------------
     # INITIAL SETUP
     # ----------------------------------------
-    # initial setup
-    torch.set_float32_matmul_precision('high')
-    num_gpus = torch.cuda.device_count()
-    if log is not None:
-        log.info(f"Number of available GPUs: {num_gpus}")
-        log.info(OmegaConf.to_yaml(cfg))
-    else:
-        print("Number of available GPUs: ", torch.cuda.device_count())
-        print(OmegaConf.to_yaml(cfg))
+    log.info("Starting JacobianODE training")
 
-    # Initialize configuration
+    torch.set_float32_matmul_precision("high")
+    num_gpus = torch.cuda.device_count()
+
+    log.info(f"Number of available GPUs: {num_gpus}")
+    log.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
+
+    # Initialize configuration (non-mutating)
     cfg = initialize_config(cfg)
 
     # ----------------------------------------
     # GENERATE DATA
     # ----------------------------------------
-    np.random.seed(cfg.data.flow.random_state)
-    torch.random.manual_seed(cfg.data.flow.random_state)
+    # Set seeds for reproducibility
+    seed_everything(cfg.data.flow.random_state + cfg.training.run_number)
+
     eq, sol, dt = make_trajectories(cfg)
+    values_raw = sol["values"]
 
-    values_raw = sol['values']
-
-    # select which solution to use for noise
-    if cfg.data.data_type == 'wmtask' and cfg.data.trajectory_params.model_to_load != 'final':
-            temp_cfg = cfg.copy()
-            temp_cfg.data.trajectory_params.model_to_load = 'final'
-            _, sol_noise, _ = make_trajectories(temp_cfg)
-            raw_values_noise = sol_noise['values']
-    else:
-        raw_values_noise = None
+    # Select which solution to use for noise scaling
+    raw_values_noise = None
+    if (
+        cfg.data.data_type == "wmtask"
+        and cfg.data.trajectory_params.model_to_load != "final"
+    ):
+        temp_cfg = cfg.copy()
+        temp_cfg.data.trajectory_params.model_to_load = "final"
+        _, sol_noise, _ = make_trajectories(temp_cfg)
+        raw_values_noise = sol_noise["values"]
 
     # ----------------------------------------
     # POSTPROCESS DATA
     # ----------------------------------------
-    # Postprocess data
     values = postprocess_data(cfg, values_raw, raw_values_to_use_for_noise=raw_values_noise)
+
     if cfg.data.postprocessing.normalize:
         values, mu, sigma = normalize_data(values)
     else:
@@ -63,31 +84,35 @@ def train_jacobians(cfg):
     # ----------------------------------------
     # CREATE DATALOADERS
     # ----------------------------------------
-    train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(cfg, values)
+    train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
+        cfg, values
+    )
 
     # ----------------------------------------
     # SET UP WANDB
     # ----------------------------------------
-    if cfg.wandb_entity is None:
-        prompt_entity = True
-    else:
-        prompt_entity = False
-    name, project, entity = setup_wandb(cfg, trajs, raw_values_to_use_for_noise=raw_values_noise, prompt_entity=prompt_entity)
+    prompt_entity = cfg.wandb_entity is None
+    name, project, entity = setup_wandb(
+        cfg,
+        trajs,
+        raw_values_to_use_for_noise=raw_values_noise,
+        prompt_entity=prompt_entity,
+    )
 
     # ----------------------------------------
     # MAKE MODEL
     # ----------------------------------------
-    
-    # Make model
-    if 'NeuralODE' in cfg.model.params._target_:
+    if "NeuralODE" in cfg.model.params._target_:
         cfg.model.params.dt = float(dt)
 
     if cfg.training.lightning.use_base_deriv_pt:
-        x0 = trajs['train_trajs'].sequence.mean(dim=(0, 1))
+        x0 = trajs["train_trajs"].sequence.mean(dim=(0, 1))
     else:
         x0 = None
 
-    torch.random.manual_seed(cfg.data.flow.random_state + cfg.training.run_number)
+    # Re-seed with run_number offset for model initialization
+    seed_everything(cfg.data.flow.random_state + cfg.training.run_number)
+
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
         lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, verbose=True)
     else:
@@ -100,6 +125,7 @@ def train_jacobians(cfg):
     # TRAIN MODEL
     # ----------------------------------------
     train_model(cfg, lit_model, train_dataloader, val_dataloader, name, project, entity=entity)
+
 
 if __name__ == "__main__":
     train_jacobians()

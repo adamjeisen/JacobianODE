@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from scipy.linalg import expm, logm
-from .data_utils import compute_lyaps
+from .analysis import compute_lyaps
 from tqdm.auto import tqdm
 def matrix_product(A, I=None):
     if I is None:

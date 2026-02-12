@@ -14,8 +14,7 @@ from torchdiffeq import odeint
 from tqdm.auto import tqdm
 
 from ..torchquad import Simpson, Trapezoid, GaussLegendre
-from .torchcubicspline_pw import PiecewiseCubicSpline
-from .paths import c_line, c_prime_line
+from .paths import PiecewiseCubicSpline, c_line, c_prime_line
 
 def generate_pw_spline(traj, time_vals=None, dt=None):
     """Generate piecewise cubic spline interpolation of a trajectory.
@@ -461,7 +460,7 @@ class JacobianODEint:
             traj,
             traj_init_steps=2,
             steps_per_dt=1, 
-            interp_pts=2, 
+            interp_pts=4, 
             scale_interp_pts=True,
             time_shift=False,
             alpha_teacher_forcing=0, 
@@ -485,7 +484,7 @@ class JacobianODEint:
             traj (torch.Tensor): Initial trajectory
             traj_init_steps (int, optional): Number of initial steps to use. Defaults to 2.
             steps_per_dt (int, optional): Number of integration steps per dt. Defaults to 1.
-            interp_pts (int, optional): Number of interpolation points. Defaults to 2.
+            interp_pts (int, optional): Number of interpolation points. Defaults to 4.
             scale_interp_pts (bool, optional): Whether to scale interpolation points. Defaults to True.
             time_shift (bool, optional): Whether to shift time window. Defaults to False.
             alpha_teacher_forcing (float, optional): Teacher forcing strength. Defaults to 0.
@@ -537,6 +536,8 @@ class JacobianODEint:
             step_counter += 1
             # n_true_pts = 2 + i_sim
             n_true_pts = x_out.shape[-2]
+
+            # ******* TODO ******* REMOVE THIS I THINK IT'S NOT NEEDED
             # put interp_pts between each true point
             if not fast_mode:
                 # N (outer N) doesn't matter in fast mode

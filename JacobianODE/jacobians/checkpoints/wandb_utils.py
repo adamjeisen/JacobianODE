@@ -10,8 +10,9 @@ import time
 from tqdm.auto import tqdm
 import wandb
 from requests.exceptions import HTTPError
-from .data_utils import compute_lyaps, estimate_weighted_jacobians, generate_train_and_test_sets, weighted_jacobian_lstsq
-from .jacobian_utils import load_run, load_checkpoint
+from ..analysis import compute_lyaps, estimate_weighted_jacobians, weighted_jacobian_lstsq
+from ..data.splitting import generate_train_and_test_sets
+from .loader import load_run, load_checkpoint
 
 
 def collect_runs(model_name, cutoff_date, projects, obs_noises, network_info, loop_closure_weights, jac_penalties, seq_length=None, model_to_load=None, direct=None, run_number=0, use_base_deriv_pt=None, residuals=None, teacher_forcing_annealing=None, api=None, use_iterator=True):
