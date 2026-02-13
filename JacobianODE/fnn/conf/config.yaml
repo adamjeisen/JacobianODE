@@ -1,0 +1,6 @@
+defaults:
+  - _self_
+  - training: training
+  - model: mlp_ae
+
+logger: wandb

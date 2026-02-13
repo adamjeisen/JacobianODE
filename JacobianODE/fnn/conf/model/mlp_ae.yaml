@@ -1,0 +1,6 @@
+params:
+  _target_: JacobianODE.fnn.networks.MLPAutoencoder
+  n_latent: 3
+  time_window: 10
+  n_features: 1
+  network_shape: [32, 64]

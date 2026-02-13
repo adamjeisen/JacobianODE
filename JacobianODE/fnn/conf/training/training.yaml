@@ -1,0 +1,31 @@
+batch_size: 100
+
+lightning:
+  _target_: JacobianODE.fnn.lightning.LitFNNAutoencoder
+  optimizer: 'Adam'
+  optimizer_kwargs:
+    lr: 1.0e-3
+  tau: 0
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: 'norm'
+  log_interval: 1
+
+regularizer:
+  _target_: JacobianODE.fnn.regularizers.FNN
+  strength: 1.0
+  k: 1
+
+logger:
+  _target_: pytorch_lightning.loggers.WandbLogger
+  save_dir: null
+  log_model: True
+
+trainer_params:
+  max_epochs: 200
+  limit_train_batches: 1.0
+  limit_val_batches: 1.0
+
+early_stopping:
+  patience: 5
+  monitor: 'val_loss'
+  mode: 'min'
