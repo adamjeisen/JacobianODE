@@ -208,6 +208,41 @@ class TestModels:
         embedding = model.fit_transform(data)
         assert embedding.shape[1] == 3
 
+    def test_cache_normalization(self):
+        """cache_normalization=True stores train stats and reuses them."""
+        np.random.seed(0)
+        train_data = np.random.randn(200) * 3 + 5  # mean=5, std~3
+        test_data = np.random.randn(200) * 10 - 20  # very different distribution
+
+        # Without caching: transform uses test data's own mean/std
+        model_no_cache = MLPEmbedding(
+            n_latent=2, time_window=5, cache_normalization=False,
+        )
+        model_no_cache.fit(train_data, train_steps=3, batch_size=32, verbose=0)
+        emb_no_cache = model_no_cache.transform(test_data)
+
+        # With caching: transform uses train data's mean/std
+        model_cached = MLPEmbedding(
+            n_latent=2, time_window=5, cache_normalization=True,
+        )
+        model_cached.fit(train_data, train_steps=3, batch_size=32, verbose=0)
+        emb_cached = model_cached.transform(test_data)
+
+        # The two should differ because normalization uses different stats
+        assert not np.allclose(emb_no_cache, emb_cached, atol=1e-3), \
+            "Cached and uncached embeddings should differ on shifted test data"
+
+        # Verify cached stats match training data
+        np.testing.assert_allclose(
+            model_cached._train_mean, np.mean(train_data), atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            model_cached._train_std, np.std(train_data), atol=1e-10,
+        )
+
+        # Without caching, no stats should be stored
+        assert model_no_cache._train_mean is None
+
     def test_fit_transform_shortcut(self):
         """fit_transform returns correctly shaped output."""
         data = np.random.randn(100)

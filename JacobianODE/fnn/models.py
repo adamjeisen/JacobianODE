@@ -45,6 +45,11 @@ class TimeSeriesEmbedding:
         Number of channels in the time series.
     random_state : int, optional
         Random seed.
+    cache_normalization : bool
+        If True, cache the training-set mean and std during fit() and
+        reuse them in transform(). If False (default), each call to
+        transform() standardizes using the new data's own statistics,
+        matching the original FNN library behavior.
     """
 
     def __init__(
@@ -53,12 +58,44 @@ class TimeSeriesEmbedding:
         time_window: int = 10,
         n_features: int = 1,
         random_state: Optional[int] = None,
+        cache_normalization: bool = False,
         **kwargs,
     ):
         self.n_latent = n_latent
         self.time_window = time_window
         self.n_features = n_features
         self.random_state = random_state
+        self.cache_normalization = cache_normalization
+        self._train_mean = None
+        self._train_std = None
+
+    def _standardize(self, X: np.ndarray, fit: bool = False) -> np.ndarray:
+        """Standardize a time series, optionally caching statistics.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            (T,) or (T, D) time series.
+        fit : bool
+            If True (during fit), compute and cache mean/std.
+            If False (during transform), reuse cached values when
+            cache_normalization is enabled.
+
+        Returns
+        -------
+        np.ndarray
+            Standardized time series.
+        """
+        if fit and self.cache_normalization:
+            self._train_mean = np.mean(X, axis=0, keepdims=True)
+            self._train_std = np.std(X, axis=0, keepdims=True)
+            self._train_std[self._train_std == 0] = 1
+            return (X - self._train_mean) / self._train_std
+
+        if not fit and self.cache_normalization and self._train_mean is not None:
+            return (X - self._train_mean) / self._train_std
+
+        return standardize_ts(X)
 
     def fit(self, X, y=None):
         raise NotImplementedError
@@ -104,7 +141,7 @@ class ETDEmbedding(TimeSeriesEmbedding):
             )
 
     def fit(self, X, y=None, subsample=None):
-        Xs = standardize_ts(X)
+        Xs = self._standardize(X, fit=True)
         X_train = hankel_matrix(Xs, self.time_window)
         if subsample:
             _, X_train = resample_dataset(
@@ -113,7 +150,7 @@ class ETDEmbedding(TimeSeriesEmbedding):
         self.model.fit(np.reshape(X_train, (X_train.shape[0], -1)))
 
     def transform(self, X, y=None):
-        X_test = hankel_matrix(standardize_ts(X), self.time_window)
+        X_test = hankel_matrix(self._standardize(X), self.time_window)
         X_test = np.reshape(X_test, (X_test.shape[0], -1))
         return self.model.transform(X_test)
 
@@ -137,7 +174,7 @@ class ConstantLagEmbedding(TimeSeriesEmbedding):
     def transform(self, X, y=None):
         tau = self.time_window * self.lag_time
         X_test = hankel_matrix(
-            standardize_ts(X), q=tau, p=len(X) - tau,
+            self._standardize(X), q=tau, p=len(X) - tau,
         )
         X_test = X_test[:, ::self.lag_time, :]
         return np.squeeze(X_test)
@@ -186,7 +223,7 @@ class AMIEmbedding(ConstantLagEmbedding):
         return argrelextrema(x, np.less)
 
     def fit(self, X, y=None, verbose=False, bins=None, timescale=None):
-        Xs = standardize_ts(X)
+        Xs = self._standardize(X, fit=True)
         if not self.lag_cutoff:
             self.lag_cutoff = int(np.floor(len(Xs) / 2))
         lagged_mi_vals = self._mutual_information_lagged(Xs, self.lag_cutoff, bins)
@@ -216,7 +253,7 @@ class TICAEmbedding(TimeSeriesEmbedding):
             raise ValueError("Time delay parameter must be >= 0.")
 
     def fit(self, X, y=None, subsample=None):
-        Xs = standardize_ts(X)
+        Xs = self._standardize(X, fit=True)
         X_train = hankel_matrix(Xs, self.time_window)
         if subsample:
             _, X_train = resample_dataset(
@@ -229,7 +266,7 @@ class TICAEmbedding(TimeSeriesEmbedding):
             self.model.fit(flat)
 
     def transform(self, X, y=None):
-        X_test = hankel_matrix(standardize_ts(X), self.time_window)
+        X_test = hankel_matrix(self._standardize(X), self.time_window)
         flat = np.reshape(X_test, (X_test.shape[0], -1))
         if self.time_lag > 0:
             return self.model.transform([flat])[0]
@@ -294,7 +331,7 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
             FNN or DeCov regularizer to apply to latent codes.
         """
         # Prepare data
-        Xs = standardize_ts(X)
+        Xs = self._standardize(X, fit=True)
         X0 = hankel_matrix(Xs, self.time_window + tau)
         X_train = X0[:, :self.time_window]
         Y_train = X0[:, -self.time_window:]
@@ -390,7 +427,7 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
         np.ndarray
             (n_windows, n_latent) embedding.
         """
-        X_test = hankel_matrix(standardize_ts(X), self.time_window)
+        X_test = hankel_matrix(self._standardize(X), self.time_window)
         X_t = torch.as_tensor(X_test, dtype=torch.float32, device=self.device)
 
         self.model.eval()
