@@ -21,6 +21,8 @@ import torch.nn.functional as F
 import wandb
 from hydra.utils import instantiate
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+
+from JacobianODE.jacobians.lightning_base import PercentEarlyStopping
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
@@ -68,7 +70,7 @@ def prepare_data(
     Parameters
     ----------
     time_series : np.ndarray
-        (T,) or (T, D) time series.
+        (T,), (T, D), or (N, T, D) time series.
     time_window : int
         Window length for the Hankel matrix.
     tau : int
@@ -82,11 +84,21 @@ def prepare_data(
     -------
     X, Y : np.ndarray
         Input and target windows, each (n_samples, time_window, n_features).
+        For 3D input, trials are flattened into the batch dimension.
     """
     Xs = standardize_ts(time_series)
     X0 = hankel_matrix(Xs, time_window + tau)
-    X = X0[:, :time_window]
-    Y = X0[:, -time_window:]
+
+    # 4D from 3D input: (N, n_windows, tw+tau, D) -> flatten trials into batch
+    if X0.ndim == 4:
+        X = X0[:, :, :time_window]
+        Y = X0[:, :, -time_window:]
+        N, n_win = X.shape[:2]
+        X = X.reshape(N * n_win, *X.shape[2:])
+        Y = Y.reshape(N * n_win, *Y.shape[2:])
+    else:
+        X = X0[:, :time_window]
+        Y = X0[:, -time_window:]
 
     if subsample is not None and subsample < len(X):
         np.random.seed(random_state)
@@ -214,6 +226,10 @@ class LitFNNAutoencoder(L.LightningModule):
 
     def encode(self, x):
         return self.model.encode(x)
+
+    def count_parameters(self):
+        """Return the number of trainable parameters in the model."""
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
 
     def _compute_loss(self, batch):
         x, y = batch
@@ -387,11 +403,20 @@ def train_fnn_model(
         mode=cfg.training.early_stopping.mode,
     )
 
-    early_stopping_callback = EarlyStopping(
-        monitor=cfg.training.early_stopping.monitor,
-        patience=cfg.training.early_stopping.patience,
-        mode=cfg.training.early_stopping.mode,
-    )
+    es_mode = cfg.training.early_stopping.get("early_stopping_mode", "percent_thresh")
+    if es_mode == "percent_thresh":
+        early_stopping_callback = PercentEarlyStopping(
+            monitor=cfg.training.early_stopping.monitor,
+            patience=cfg.training.early_stopping.patience,
+            mode=cfg.training.early_stopping.mode,
+            percent_thresh=cfg.training.early_stopping.get("percent_thresh", 0.01),
+        )
+    else:
+        early_stopping_callback = EarlyStopping(
+            monitor=cfg.training.early_stopping.monitor,
+            patience=cfg.training.early_stopping.patience,
+            mode=cfg.training.early_stopping.mode,
+        )
 
     # DDP strategy
     try:

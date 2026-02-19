@@ -136,7 +136,7 @@ class tICA(BaseEstimator, TransformerMixin):
 
         vals, vecs = scipy.linalg.eigh(
             lhs, b=rhs,
-            eigvals=(self.n_features - self.n_components, self.n_features - 1)
+            subset_by_index=(self.n_features - self.n_components, self.n_features - 1)
         )
         ind = np.argsort(vals)[::-1]
         vals = vals[ind]

@@ -75,7 +75,7 @@ class TimeSeriesEmbedding:
         Parameters
         ----------
         X : np.ndarray
-            (T,) or (T, D) time series.
+            (T,), (T, D), or (N, T, D) time series.
         fit : bool
             If True (during fit), compute and cache mean/std.
             If False (during transform), reuse cached values when
@@ -87,8 +87,13 @@ class TimeSeriesEmbedding:
             Standardized time series.
         """
         if fit and self.cache_normalization:
-            self._train_mean = np.mean(X, axis=0, keepdims=True)
-            self._train_std = np.std(X, axis=0, keepdims=True)
+            if X.ndim == 3:
+                # 3D: compute global stats across all trials and time
+                self._train_mean = np.mean(X, axis=(0, 1), keepdims=True)  # (1, 1, D)
+                self._train_std = np.std(X, axis=(0, 1), keepdims=True)    # (1, 1, D)
+            else:
+                self._train_mean = np.mean(X, axis=0, keepdims=True)
+                self._train_std = np.std(X, axis=0, keepdims=True)
             self._train_std[self._train_std == 0] = 1
             return (X - self._train_mean) / self._train_std
 
@@ -292,19 +297,32 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
         self.train_history = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    def _build_model(self):
+        """Rebuild the autoencoder network. Subclasses must override."""
+        raise NotImplementedError
+
+    def count_parameters(self):
+        """Return the number of trainable parameters in the model."""
+        return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
     def fit(
         self,
         X,
         y=None,
         subsample=None,
         tau: int = 0,
-        learning_rate: float = 1e-3,
-        batch_size: int = 100,
+        # learning_rate: float = 1e-3,
+        learning_rate: float = 1e-4,
+        # batch_size: int = 100,
+        batch_size: int = 64,
         train_steps: int = 200,
         loss: str = "mse",
         verbose: int = 0,
         optimizer: str = "adam",
         early_stopping: bool = False,
+        early_stopping_mode: str = "percent_thresh",
+        early_stopping_patience: int = 2,
+        percent_thresh: float = 0.01,
         latent_regularizer=None,
     ):
         """Fit the autoencoder on a time series.
@@ -312,7 +330,7 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
         Parameters
         ----------
         X : np.ndarray
-            (T,) or (T, D) time series.
+            (T,), (T, D), or (N, T, D) time series.
         tau : int
             Prediction horizon offset. 0 = pure autoencoder.
         learning_rate : float
@@ -327,14 +345,36 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
             'adam' or 'nadam'.
         early_stopping : bool
             Stop if loss plateaus.
+        early_stopping_mode : str
+            'percent_thresh' (default) uses percent improvement threshold;
+            'absolute' uses the original absolute-improvement check.
+        early_stopping_patience : int
+            Number of consecutive epochs below threshold before stopping.
+        percent_thresh : float
+            Minimum fractional improvement required per epoch (default 0.01 = 1%).
         latent_regularizer : nn.Module, optional
             FNN or DeCov regularizer to apply to latent codes.
         """
+        # Auto-detect n_features from input data
+        n_features = 1 if X.ndim == 1 else X.shape[-1]
+        if n_features != self.n_features:
+            self.n_features = n_features
+            self._build_model()
+
         # Prepare data
         Xs = self._standardize(X, fit=True)
         X0 = hankel_matrix(Xs, self.time_window + tau)
-        X_train = X0[:, :self.time_window]
-        Y_train = X0[:, -self.time_window:]
+
+        # 4D from 3D input: (N, n_windows, tw+tau, D)
+        if X0.ndim == 4:
+            X_train = X0[:, :, :self.time_window]
+            Y_train = X0[:, :, -self.time_window:]
+            N, n_win = X_train.shape[:2]
+            X_train = X_train.reshape(N * n_win, *X_train.shape[2:])
+            Y_train = Y_train.reshape(N * n_win, *Y_train.shape[2:])
+        else:
+            X_train = X0[:, :self.time_window]
+            Y_train = X0[:, -self.time_window:]
 
         if subsample:
             indices, _ = resample_dataset(
@@ -401,15 +441,26 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
 
             # Early stopping
             if early_stopping:
-                if avg_loss < best_loss:
-                    best_loss = avg_loss
-                    patience_counter = 0
+                if early_stopping_mode == "percent_thresh":
+                    if best_loss < float("inf") and best_loss > 0:
+                        improvement = (best_loss - avg_loss) / best_loss
+                        if improvement < percent_thresh:
+                            patience_counter += 1
+                        else:
+                            patience_counter = 0
+                    if avg_loss < best_loss:
+                        best_loss = avg_loss
                 else:
-                    patience_counter += 1
-                    if patience_counter >= 3:
-                        if verbose >= 1:
-                            print(f"Early stopping at epoch {epoch+1}")
-                        break
+                    if avg_loss < best_loss:
+                        best_loss = avg_loss
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+
+                if patience_counter >= early_stopping_patience:
+                    if verbose >= 1:
+                        print(f"Early stopping at epoch {epoch+1}")
+                    break
 
         self.train_history = history
         self.model.eval()
@@ -420,21 +471,70 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
         Parameters
         ----------
         X : np.ndarray
-            (T,) or (T, D) time series.
+            (T,), (T, D), or (N, T, D) time series.
 
         Returns
         -------
         np.ndarray
-            (n_windows, n_latent) embedding.
+            (n_windows, n_latent) or (N, n_windows, n_latent) embedding.
         """
         X_test = hankel_matrix(self._standardize(X), self.time_window)
+
+        # 4D from 3D input: (N, n_windows, tw, D)
+        trial_shape = None
+        if X_test.ndim == 4:
+            N, n_win = X_test.shape[:2]
+            trial_shape = (N, n_win)
+            X_test = X_test.reshape(N * n_win, *X_test.shape[2:])
+
         X_t = torch.as_tensor(X_test, dtype=torch.float32, device=self.device)
 
         self.model.eval()
         with torch.no_grad():
             latent = self.model.encode(X_t)
 
-        return latent.cpu().numpy()
+        result = latent.cpu().numpy()
+        if trial_shape is not None:
+            result = result.reshape(*trial_shape, result.shape[-1])
+        return result
+
+    def reconstruct(self, X, y=None):
+        """Reconstruct a time series through the autoencoder.
+
+        Parameters
+        ----------
+        X : np.ndarray
+            (T,), (T, D), or (N, T, D) time series.
+
+        Returns
+        -------
+        tuple of np.ndarray
+            (X_windows, recon) where both have shape
+            (n_windows, time_window, n_features) or
+            (N, n_windows, time_window, n_features) for 3D input.
+        """
+        X_test = hankel_matrix(self._standardize(X), self.time_window)
+
+        # 4D from 3D input: (N, n_windows, tw, D)
+        trial_shape = None
+        if X_test.ndim == 4:
+            N, n_win = X_test.shape[:2]
+            trial_shape = (N, n_win)
+            X_flat = X_test.reshape(N * n_win, *X_test.shape[2:])
+        else:
+            X_flat = X_test
+
+        X_t = torch.as_tensor(X_flat, dtype=torch.float32, device=self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            recon = self.model(X_t)
+
+        recon_np = recon.cpu().numpy()
+        if trial_shape is not None:
+            X_test = X_test  # already (N, n_windows, tw, D)
+            recon_np = recon_np.reshape(*trial_shape, *recon_np.shape[1:])
+        return X_test, recon_np
 
 
 class MLPEmbedding(NeuralNetworkEmbedding):
@@ -460,11 +560,14 @@ class MLPEmbedding(NeuralNetworkEmbedding):
             network_shape = [10, 10]
         self._network_shape = network_shape
         self._latent_regularizer = latent_regularizer
+        self._build_model()
+
+    def _build_model(self):
         self.model = MLPAutoencoder(
             self.n_latent,
             self.time_window,
             n_features=self.n_features,
-            network_shape=network_shape,
+            network_shape=self._network_shape,
         )
 
     def fit(self, X, y=None, **kwargs):
@@ -496,11 +599,14 @@ class LSTMEmbedding(NeuralNetworkEmbedding):
             network_shape = []
         self._network_shape = network_shape
         self._latent_regularizer = latent_regularizer
+        self._build_model()
+
+    def _build_model(self):
         self.model = LSTMAutoencoder(
             self.n_latent,
             self.time_window,
             n_features=self.n_features,
-            network_shape=network_shape,
+            network_shape=self._network_shape,
         )
 
     def fit(self, X, y=None, **kwargs):

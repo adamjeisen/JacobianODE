@@ -26,6 +26,8 @@ trainer_params:
   limit_val_batches: 1.0
 
 early_stopping:
-  patience: 5
+  early_stopping_mode: 'percent_thresh'
+  patience: 2
+  percent_thresh: 0.01
   monitor: 'val_loss'
   mode: 'min'

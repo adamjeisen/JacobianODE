@@ -27,4 +27,4 @@ from .models import (
     AMIEmbedding,
     TICAEmbedding,
 )
-from .utils import hankel_matrix, standardize_ts
+from .utils import hankel_matrix, standardize_ts, compute_variances, compute_s_dim

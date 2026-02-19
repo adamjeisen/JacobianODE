@@ -40,7 +40,7 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     n_batch, n_latent = code_batch.shape
     device = code_batch.device
 
-    # Thresholds from Kennel et al. 1992
+    # Thresholds from Kennel et al. 1992 / Gilpin (NeurIPS 2020) TF implementation
     rtol = 20.0
     atol = 2.0
 
@@ -97,26 +97,19 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     # this is equivalent to $\tilde{D}'^2_{abm}$ in the paper where i = a, j = b, k = m
     neighbor_new_dists = torch.gather(all_dists[1:], 2, inds[:-1])
 
-    # Eq. 4 of Kennel et al.: ratio of distance change
-    # scaled_dist: (n_latent - 1, batch_size, k+1)
-    # this is equivalent to $\sqrt{S_{abm}}$ in the paper where i = a, j = b, k = m
-    # it measures how much the distance between neighbors in dimension d changes when going to dimension d+1
-    # NOTE: in Gilpin et al., the supplementary compares $S_{abm}$ to $R_{tol}$. However, in the Gilpin's fnn
-    # repo, and in the original Kennel et al. paper, they compare $\sqrt{S_{abm}}$ to $R_{tol}$. I believe that this
-    # is a typo in the paper, and that $S_{abm}$ should be squared in its definition.
+    # Eq. 4 of Kennel et al.: ratio of distance change, matching the Gilpin TF implementation
+    # scaled_dist: (n_latent - 1, batch_size, k+1), sqrt of the normalized distance ratio
     scaled_dist = torch.sqrt(
-        (neighbor_new_dists - neighbor_dists_d[:-1])
-        / neighbor_dists_d[:-1]
+        torch.clamp(
+            (neighbor_new_dists - neighbor_dists_d[:-1]) / neighbor_dists_d[:-1],
+            min=0.0,
+        )
     )
 
     # Kennel condition #1: distance ratio exceeds threshold
     is_false_change = scaled_dist > rtol
-    # Kennel condition #2: absolute distance exceeds threshold
-    # TODO: CHECK IF neighbor_new_dists SHOULD BE SQUARE ROOTED TO MATCH THE PAPER
+    # Kennel condition #2: absolute distance exceeds attractor scale threshold
     is_large_jump = neighbor_new_dists > atol * all_ra[:-1, None, None]
-    # NOTE: in the paper, it is written that one compares $\tilde{D}^2_{abm}$ to $A_{tol} R_m$. However, in the Gilpin's fnn
-    # repo, and in the original Kennel et al. paper, they compare $\tilde{D}'^2_{abm}$ to $A_{tol} R_m$. I believe that this
-    # is again a typo in the paper, and that $\tilde{D}'^2_{abm}$ should be used in its definition.
 
     is_false_neighbor = torch.logical_or(is_false_change, is_large_jump)
     total_false_neighbors = is_false_neighbor.to(torch.int32)[..., 1:(k + 1)]
@@ -128,16 +121,12 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     reg_weights = torch.nn.functional.pad(reg_weights, (1, 0))  # pad zero for dim 0
     # now reg_weights has shape (n_latent,)
 
-    # Average batch activity per latent dimension
-    # activations_batch_averaged has shape (n_latent,)
-    # and corresponds to the average activity of the batch in each latent dimension
-    # it corresponds to $\bar{h}_m$ in the paper
+    # RMS activity per latent dimension, matching Gilpin TF implementation
     activations_batch_averaged = torch.sqrt(
         torch.mean(code_batch ** 2, dim=0)
     ).to(torch.float64)
 
     # Weighted L1 activity regularization
-    # TODO: CHECK IF activations_batch_averaged SHOULD BE SQUARED TO MATCH THE PAPER
     loss = torch.sum(reg_weights * activations_batch_averaged)
 
     return loss.float()

@@ -323,3 +323,95 @@ class TestLorenzValidation:
         stds = np.std(embedding, axis=0)
         assert all(s > 0.01 for s in stds), \
             f"LSTM embedding collapsed: stds = {stds}"
+
+
+# ---------------------------------------------------------------------------
+# 3D (trials x time x dims) data tests
+# ---------------------------------------------------------------------------
+
+class TestTrialData:
+    """Tests for native 3D (N, T, D) trial-structured data support."""
+
+    @pytest.fixture
+    def trial_data(self):
+        """Generate synthetic (N, T, D) trial data."""
+        np.random.seed(42)
+        N, T, D = 4, 100, 3
+        return np.random.randn(N, T, D)
+
+    def test_standardize_ts_3d(self, trial_data):
+        """standardize_ts with 3D input gives per-trial zero mean / unit std."""
+        normed = standardize_ts(trial_data)
+        assert normed.shape == trial_data.shape
+        # Each trial should independently have zero mean and unit std
+        for i in range(trial_data.shape[0]):
+            np.testing.assert_allclose(
+                normed[i].mean(axis=0), 0.0, atol=1e-10,
+            )
+            np.testing.assert_allclose(
+                normed[i].std(axis=0), 1.0, atol=1e-10,
+            )
+
+    def test_hankel_matrix_3d(self, trial_data):
+        """hankel_matrix with 3D input produces correct 4D shape."""
+        N, T, D = trial_data.shape
+        q = 5
+        hm = hankel_matrix(trial_data, q)
+        assert hm.ndim == 4
+        assert hm.shape[0] == N
+        assert hm.shape[2] == q
+        assert hm.shape[3] == D
+
+    def test_mlp_fit_transform_3d(self, trial_data):
+        """MLPEmbedding fit/transform with 3D input produces correct shapes."""
+        N, T, D = trial_data.shape
+        tw, n_latent = 5, 2
+        model = MLPEmbedding(n_latent=n_latent, time_window=tw)
+        model.fit(trial_data, train_steps=3, batch_size=32, verbose=0)
+        embedding = model.transform(trial_data)
+
+        n_windows = hankel_matrix(trial_data, tw).shape[1]
+        assert embedding.shape == (N, n_windows, n_latent)
+
+    def test_mlp_reconstruct_3d(self, trial_data):
+        """MLPEmbedding reconstruct with 3D input produces correct shapes."""
+        N, T, D = trial_data.shape
+        tw = 5
+        model = MLPEmbedding(n_latent=2, time_window=tw)
+        model.fit(trial_data, train_steps=3, batch_size=32, verbose=0)
+        X_windows, recon = model.reconstruct(trial_data)
+
+        n_windows = hankel_matrix(trial_data, tw).shape[1]
+        assert X_windows.shape == (N, n_windows, tw, D)
+        assert recon.shape == (N, n_windows, tw, D)
+
+    def test_lstm_fit_transform_3d(self, trial_data):
+        """LSTMEmbedding fit/transform with 3D input produces correct shapes."""
+        N, T, D = trial_data.shape
+        tw, n_latent = 5, 2
+        model = LSTMEmbedding(n_latent=n_latent, time_window=tw)
+        model.fit(trial_data, train_steps=3, batch_size=32, verbose=0)
+        embedding = model.transform(trial_data)
+
+        n_windows = hankel_matrix(trial_data, tw).shape[1]
+        assert embedding.shape == (N, n_windows, n_latent)
+
+    def test_fnn_regularizer_with_3d(self, trial_data):
+        """FNN regularizer works correctly with 3D trial data."""
+        reg = FNN(strength=0.5)
+        model = MLPEmbedding(n_latent=3, time_window=5, latent_regularizer=reg)
+        model.fit(trial_data, train_steps=5, batch_size=32, verbose=0)
+        embedding = model.transform(trial_data)
+        assert embedding.ndim == 3
+        assert embedding.shape[0] == trial_data.shape[0]
+        assert embedding.shape[2] == 3
+
+    def test_cache_normalization_3d(self, trial_data):
+        """cache_normalization with 3D input stores (1, 1, D) shaped stats."""
+        model = MLPEmbedding(
+            n_latent=2, time_window=5, cache_normalization=True,
+        )
+        model.fit(trial_data, train_steps=3, batch_size=32, verbose=0)
+
+        assert model._train_mean.shape == (1, 1, trial_data.shape[2])
+        assert model._train_std.shape == (1, 1, trial_data.shape[2])

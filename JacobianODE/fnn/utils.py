@@ -142,16 +142,21 @@ def train_test(dataset, sample_size, time_window, std=1.0, split=0.5):
 
 def standardize_ts(a, scale=1.0):
     """
-    Standardize a T x D time series along its first dimension.
+    Standardize a time series along its time dimension.
     For dimensions with zero variance, divide by one instead of zero.
 
     Parameters
     ----------
     a : ndarray
-        Time series, shape (T,) or (T, D).
+        Time series, shape (T,), (T, D), or (N, T, D).
     scale : float
         Additional scaling factor.
     """
+    if a.ndim == 3:
+        stds = np.std(a, axis=1, keepdims=True)   # (N, 1, D)
+        stds[stds == 0] = 1
+        return (a - np.mean(a, axis=1, keepdims=True)) / (scale * stds)
+
     stds = np.std(a, axis=0, keepdims=True)
     stds[stds == 0] = 1
     return (a - np.mean(a, axis=0, keepdims=True)) / (scale * stds)
@@ -244,3 +249,31 @@ def darker(clr, f=1 / 3):
     """Darken an RGB color tuple."""
     gaps = [f * val for val in clr]
     return [val - gap for gap, val in zip(gaps, clr)]
+
+def compute_variances(data, normalize=True):
+    """Calculate the variance of a time series."""
+    # data has shape (n_samples, n_features)
+    # Center the data
+    mean_centered = data - np.mean(data, axis=0)
+    # Compute Covariance Matrix
+    cov_matrix = np.cov(mean_centered, rowvar=False)
+    # Compute Eigenvalues (these represent the variance along principal axes)
+    eigenvalues, _ = np.linalg.eig(cov_matrix)
+    # Sort strictly descending (as per formula A12: SORT(Var(y))) [cite: 572]
+    sorted_variances = np.sort(eigenvalues)[::-1]
+    # "Normalized variance Var(hm)/Var(h0)" [cite: 222]
+    # We normalize by the largest variance (index 0)
+    if normalize:
+        normalized_variances = sorted_variances / sorted_variances[0]
+        return normalized_variances
+    else:
+        return sorted_variances
+
+def compute_s_dim(var_true, var_est):
+    """Compute dimension similarity score S_dim (Eq. A12).
+    
+    S_dim = 1 - ||SORT(Var(y)) - SORT(Var(y_hat))|| / ||Var(y)||
+    """
+    v_true = np.sort(var_true)[::-1]
+    v_est = np.sort(var_est)[::-1]
+    return 1.0 - np.linalg.norm(v_true - v_est) / np.linalg.norm(v_true)

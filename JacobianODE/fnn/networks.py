@@ -175,6 +175,7 @@ class LSTMAutoencoder(nn.Module):
         # --- Decoder ---
         self.decoder_noise = GaussianNoise(0.5)
         self.decoder_initial = nn.LSTM(n_latent, n_latent, batch_first=True)
+        self.decoder_initial_bn = nn.BatchNorm1d(n_latent)
 
         self.decoder_lstms = nn.ModuleList()
         in_size = n_latent
@@ -232,6 +233,9 @@ class LSTMAutoencoder(nn.Module):
         h = z.unsqueeze(1).repeat(1, self.time_window, 1)
 
         h, _ = self.decoder_initial(h)
+        # BN + ELU after first decoder LSTM, matching paper: [GN-LSTM(10)-BN-ELU-Output]
+        h = self.decoder_initial_bn(h.transpose(1, 2)).transpose(1, 2)
+        h = F.elu(h)
 
         # Decoder intermediate LSTMs (go_backwards=True: flip input, run, flip output)
         for lstm in self.decoder_lstms:
