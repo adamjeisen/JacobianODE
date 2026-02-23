@@ -182,7 +182,12 @@ class TransformerSequenceEncoder(nn.Module):
         h = self.input_proj(x)  # (B, T, d_model)
         if self.pos_enc is not None:
             h = self.pos_enc(h)
-        h = self.transformer(h)  # (B, T, d_model)
+        # Causal mask: position i can only attend to positions <= i
+        T = h.size(1)
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(
+            T, device=h.device, dtype=h.dtype
+        )
+        h = self.transformer(h, mask=causal_mask)  # (B, T, d_model)
         return self.to_latent(h)  # (B, T, D')
 
 
@@ -586,10 +591,11 @@ class SequenceAutoencoder(nn.Module):
         Must map (B, T, D') -> (B, T, D).
     """
 
-    def __init__(self, encoder: nn.Module, decoder: StepDecoder):
+    def __init__(self, encoder: nn.Module, decoder: StepDecoder, context_margin: int = 0):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.context_margin = context_margin
 
     @property
     def n_latent(self) -> int:
@@ -618,6 +624,7 @@ def build_transformer(
     use_positional_encoding: bool = True,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
     """Build a Transformer-based SequenceAutoencoder."""
@@ -628,7 +635,7 @@ def build_transformer(
         **encoder_kwargs,
     )
     decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
-    return SequenceAutoencoder(encoder, decoder)
+    return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
 def build_ssm(
@@ -637,6 +644,7 @@ def build_ssm(
     use_positional_encoding: bool = True,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
     """Build an SSM-based SequenceAutoencoder."""
@@ -647,7 +655,7 @@ def build_ssm(
         **encoder_kwargs,
     )
     decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
-    return SequenceAutoencoder(encoder, decoder)
+    return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
 def build_tcn(
@@ -655,6 +663,7 @@ def build_tcn(
     n_latent: int,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
     """Build a TCN-based SequenceAutoencoder."""
@@ -664,7 +673,7 @@ def build_tcn(
         **encoder_kwargs,
     )
     decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
-    return SequenceAutoencoder(encoder, decoder)
+    return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
 def build_tcn_spatial(
@@ -672,6 +681,7 @@ def build_tcn_spatial(
     n_latent: int,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
     """Build a TCN+Spatial SequenceAutoencoder."""
@@ -681,4 +691,4 @@ def build_tcn_spatial(
         **encoder_kwargs,
     )
     decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
-    return SequenceAutoencoder(encoder, decoder)
+    return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)

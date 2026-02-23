@@ -52,6 +52,7 @@ class LitLatentJacobianODE(LitBase):
         encoder,
         prediction_steps=10,
         encoder_warmup_epochs=0,
+        jac_window_stride=None,
         true_lyapunov_exponents=None,
         **kwargs,
     ):
@@ -59,6 +60,9 @@ class LitLatentJacobianODE(LitBase):
         self.encoder = encoder
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
+        # Stride for JacobianODE sub-windows within each encoded batch.
+        # Defaults to prediction_steps (non-overlapping).
+        self.jac_window_stride = jac_window_stride if jac_window_stride is not None else prediction_steps
 
         # Store precomputed true Lyapunov exponents for logging.
         # In partially observed settings, true Jacobians can't be computed
@@ -89,6 +93,9 @@ class LitLatentJacobianODE(LitBase):
         torch.Tensor
             Latent trajectory of shape ``(B, T', D_latent)``.
             For window-based encoders ``T' = T - w + 1``.
+            For sequence-based encoders with ``context_margin > 0``,
+            the first ``context_margin`` timesteps are dropped from the
+            latent output (they lack sufficient causal context).
         """
         if hasattr(self.encoder, 'time_window'):
             # Window-based encoder: unfold into sliding windows
@@ -104,6 +111,10 @@ class LitLatentJacobianODE(LitBase):
         else:
             # Sequence-based encoder: process full sequence
             z = self.encoder.encode(batch)
+            # Drop initial embeddings that lack sufficient causal context
+            margin = getattr(self.encoder, 'context_margin', 0)
+            if margin > 0:
+                z = z[:, margin:, :]
         return z
 
     def decode_trajectory(self, z):
@@ -242,11 +253,15 @@ class LitLatentJacobianODE(LitBase):
                 targets.append(torch.stack(windows))  # (prediction_steps, w, D_obs)
             return torch.stack(targets)  # (N, prediction_steps, w, D_obs)
         else:
+            # For sequence-based encoders, latent index t corresponds to
+            # observation index t + context_margin (since the first
+            # context_margin latents were dropped in encode_trajectory).
+            margin = getattr(self.encoder, 'context_margin', 0)
             targets = []
             for idx in range(start_indices.shape[0]):
                 b = idx // n_windows_actual
                 s = start_indices[idx].item()
-                obs_start = s + traj_init_steps
+                obs_start = s + traj_init_steps + margin
                 obs_end = obs_start + prediction_steps
                 targets.append(batch[b, obs_start:obs_end, :])
             return torch.stack(targets)  # (N, prediction_steps, D_obs)
@@ -307,12 +322,13 @@ class LitLatentJacobianODE(LitBase):
                 f"Increase observation sequence length or reduce prediction_steps."
             )
 
-        # Extract strided, non-overlapping sub-windows from each trajectory
-        n_windows = max(1, (T_prime - jac_window_len) // self.prediction_steps + 1)
+        # Extract strided sub-windows from each trajectory
+        stride = self.jac_window_stride
+        n_windows = max(1, (T_prime - jac_window_len) // stride + 1)
         all_starts = []
         for b in range(B):
             for w_idx in range(n_windows):
-                start = w_idx * self.prediction_steps
+                start = w_idx * stride
                 if start + jac_window_len <= T_prime:
                     all_starts.append(start)
                     # Repeat z_full[b] — we'll gather below
@@ -582,6 +598,29 @@ class LitLatentJacobianODE(LitBase):
         except Exception:
             pass  # Don't fail training/validation on diagnostic errors
 
+    def _log_latent_utilization(self, batch, prefix, **log_kwargs):
+        """Log per-dimension variance and active dimension count.
+
+        Parameters
+        ----------
+        batch : torch.Tensor
+            Raw observations ``(B, T, D_obs)``.
+        prefix : str
+            Logging prefix, e.g. ``"train"`` or ``"val"``.
+        """
+        try:
+            with torch.no_grad():
+                z = self.encode_trajectory(batch)
+                # Per-dimension variance across batch and time
+                z_var = z.var(dim=(0, 1))  # (D_latent,)
+                for i, v in enumerate(z_var):
+                    self.log(f"{prefix} latent_var_dim_{i}", v.item(), **log_kwargs)
+                # Number of "active" dimensions (variance > threshold)
+                n_active = (z_var > 1e-4).sum().item()
+                self.log(f"{prefix} n_active_latent_dims", n_active, **log_kwargs)
+        except Exception:
+            pass
+
     def log_training_metrics(self, train_rets, total_loss, jac_norm, l1_loss,
                               batch, jacs_pred, batch_idx, on_step=False,
                               on_epoch=True, sync_dist=True, prog_bar=True):
@@ -610,6 +649,7 @@ class LitLatentJacobianODE(LitBase):
             self.log("alpha teacher forcing", self.alpha_teacher_forcing, **log_kwargs)
 
         self._log_lyapunov_comparison(batch, "train", **log_kwargs)
+        self._log_latent_utilization(batch, "train", **log_kwargs)
 
     def log_validation_metrics(self, val_rets, batch, sync_dist=True, val_loop_closure=None):
         """Log validation metrics.
@@ -639,6 +679,7 @@ class LitLatentJacobianODE(LitBase):
             )
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)
+        self._log_latent_utilization(batch, "val", sync_dist=sync_dist)
 
     def get_pred_jacs(self, batch):
         """Override to compute Jacobians in latent space."""

@@ -1,6 +1,15 @@
 batch_size: 16
 run_number: 0
 
+# -----------------
+# SLIDING WINDOW BATCHING
+# -----------------
+# For sequence-based encoders: raw trajectories (K x T_tot x D) are
+# batched into sliding windows of length batch_window_length, spaced
+# by batch_stride steps.  Set to null to disable (use full trajectories).
+batch_window_length: null
+batch_stride: null
+
 lightning:
   _target_: null
 
