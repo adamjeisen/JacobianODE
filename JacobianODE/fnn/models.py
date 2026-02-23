@@ -127,10 +127,14 @@ class ETDEmbedding(TimeSeriesEmbedding):
         Use SparsePCA.
     kernel : str or callable, optional
         Kernel for KernelPCA.
+    tau : int
+        Time-point separation (delay) between successive columns in the
+        Hankel window.  Defaults to 1 (consecutive time points).
     """
 
-    def __init__(self, *args, sparse: bool = False, kernel=None, **kwargs):
+    def __init__(self, *args, sparse: bool = False, kernel=None, tau: int = 1, **kwargs):
         super().__init__(*args, **kwargs)
+        self.tau = tau
         if kernel:
             self.model = KernelPCA(
                 n_components=self.n_latent, kernel=kernel,
@@ -147,7 +151,11 @@ class ETDEmbedding(TimeSeriesEmbedding):
 
     def fit(self, X, y=None, subsample=None):
         Xs = self._standardize(X, fit=True)
-        X_train = hankel_matrix(Xs, self.time_window)
+        X_train = hankel_matrix(Xs, self.time_window, tau=self.tau)
+        # 4D from 3D input: collapse (N, n_windows) → (N*n_windows)
+        if X_train.ndim == 4:
+            N, n_win = X_train.shape[:2]
+            X_train = X_train.reshape(N * n_win, *X_train.shape[2:])
         if subsample:
             _, X_train = resample_dataset(
                 X_train, subsample, random_state=self.random_state,
@@ -155,9 +163,18 @@ class ETDEmbedding(TimeSeriesEmbedding):
         self.model.fit(np.reshape(X_train, (X_train.shape[0], -1)))
 
     def transform(self, X, y=None):
-        X_test = hankel_matrix(self._standardize(X), self.time_window)
+        X_test = hankel_matrix(self._standardize(X), self.time_window, tau=self.tau)
+        # 4D from 3D input: collapse and restore trial dimension
+        trial_shape = None
+        if X_test.ndim == 4:
+            N, n_win = X_test.shape[:2]
+            trial_shape = (N, n_win)
+            X_test = X_test.reshape(N * n_win, *X_test.shape[2:])
         X_test = np.reshape(X_test, (X_test.shape[0], -1))
-        return self.model.transform(X_test)
+        result = self.model.transform(X_test)
+        if trial_shape is not None:
+            result = result.reshape(*trial_shape, result.shape[-1])
+        return result
 
 
 class ConstantLagEmbedding(TimeSeriesEmbedding):
@@ -409,6 +426,8 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
             # Shuffle
             perm = torch.randperm(n_samples, device=self.device)
             epoch_loss = 0.0
+            epoch_recon_loss = 0.0
+            epoch_reg_loss = 0.0
             n_batches = 0
 
             for i in range(0, n_samples, batch_size):
@@ -431,13 +450,20 @@ class NeuralNetworkEmbedding(TimeSeriesEmbedding):
                 opt.step()
 
                 epoch_loss += total_loss.item()
+                epoch_recon_loss += recon_loss.item()
+                epoch_reg_loss += reg_loss.item()
                 n_batches += 1
 
             avg_loss = epoch_loss / max(n_batches, 1)
+            avg_recon_loss = epoch_recon_loss / max(n_batches, 1)
+            avg_reg_loss = epoch_reg_loss / max(n_batches, 1)
             history["loss"].append(avg_loss)
 
             if verbose >= 1 and (epoch % max(1, train_steps // 20) == 0 or epoch == train_steps - 1):
-                print(f"Epoch {epoch+1}/{train_steps} - loss: {avg_loss:.6f}")
+                msg = f"Epoch {epoch+1}/{train_steps} - loss: {avg_loss:.6f}"
+                if latent_regularizer is not None:
+                    msg += f" (recon: {avg_recon_loss:.6f}, reg: {avg_reg_loss:.6f})"
+                print(msg)
 
             # Early stopping
             if early_stopping:

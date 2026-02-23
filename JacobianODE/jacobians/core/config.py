@@ -150,9 +150,15 @@ def initialize_config(
     cfg = copy.deepcopy(cfg)
 
     # Set the lightning module target based on model
-    model_module_components = cfg.model.params._target_.split(".")
-    model_module_components[-1] = "Lit" + model_module_components[-1]
-    cfg.training.lightning._target_ = ".".join(model_module_components)
+    if "encoder" in cfg.model:
+        # Latent model: use LitLatentJacobianODE
+        cfg.training.lightning._target_ = (
+            "JacobianODE.models.latent_jacobian.LitLatentJacobianODE"
+        )
+    else:
+        model_module_components = cfg.model.params._target_.split(".")
+        model_module_components[-1] = "Lit" + model_module_components[-1]
+        cfg.training.lightning._target_ = ".".join(model_module_components)
     cfg.training.lightning.data_type = cfg.data.data_type
 
     # Collect the dimension of the data
@@ -181,16 +187,22 @@ def initialize_config(
     else:
         raise ValueError(f"Data type {cfg.data.data_type} not supported")
 
-    # Set the input dimension
-    if "input_dim" in cfg.model.params:
-        cfg.model.params.input_dim = dim
-
-    # Set the output dimension
-    if "NeuralODE" not in cfg.model.params._target_:
-        if cfg.training.lightning.direct:
-            cfg.model.params.output_dim = dim**2
-        else:  # not direct jacobian estimation
-            cfg.model.params.output_dim = dim
+    # Set model dimensions
+    if "encoder" in cfg.model:
+        # Latent model: Jacobian MLP operates on n_latent, not data dim
+        n_latent = cfg.model.encoder.n_latent
+        if "input_dim" in cfg.model.params:
+            cfg.model.params.input_dim = n_latent
+        cfg.model.params.output_dim = n_latent ** 2
+    else:
+        # Standard model: operates on data dim
+        if "input_dim" in cfg.model.params:
+            cfg.model.params.input_dim = dim
+        if "NeuralODE" not in cfg.model.params._target_:
+            if cfg.training.lightning.direct:
+                cfg.model.params.output_dim = dim**2
+            else:  # not direct jacobian estimation
+                cfg.model.params.output_dim = dim
 
     logger.debug(f"Initialized config with dim={dim}")
     return cfg

@@ -1,0 +1,19 @@
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_latent, set at runtime
+  hidden_dim: [256, 512, 512]
+  num_layers: 3
+  output_dim: null   # = n_latent * n_latent, set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.networks.MLPAutoencoder
+  n_latent: 10
+  time_window: 50
+  n_features: 1
+  network_shape: [128, 128]
+
+prediction_steps: 10  # how many latent steps to predict forward
+                      # JacobianODE window = traj_init_steps (15) + prediction_steps (10) = 25

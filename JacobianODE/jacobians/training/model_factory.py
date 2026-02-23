@@ -50,6 +50,16 @@ def make_model(
     # Instantiate the Jacobian model from config
     jac_model = instantiate(cfg.model.params)
 
+    # Build extra kwargs for the Lightning model
+    extra_kwargs = {}
+
+    # If the config has an encoder section, instantiate it
+    if "encoder" in cfg.model:
+        encoder = instantiate(cfg.model.encoder)
+        extra_kwargs["encoder"] = encoder
+        if "prediction_steps" in cfg.model:
+            extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
+
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(
         cfg.training.lightning,
@@ -59,6 +69,7 @@ def make_model(
         base_pt_init=x0,
         mu=mu,
         sigma=sigma,
+        **extra_kwargs,
     )
 
     # Attach the equation object for Jacobian computation during validation

@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 # Loading and featurizing data
 # ---------------------------------------------------------------------------
 
-def hankel_matrix(data, q, p=None):
+def hankel_matrix(data, q, p=None, tau=1):
     """
     Find the Hankel matrix dimensionwise for multiple multidimensional
     time series.
@@ -30,6 +30,9 @@ def hankel_matrix(data, q, p=None):
         The width of the matrix (the number of features / time window).
     p : int, optional
         The height of the matrix (the number of samples).
+    tau : int
+        Time-point separation (delay) between successive columns in each
+        window.  Defaults to 1 (consecutive time points).
 
     Returns
     -------
@@ -37,14 +40,14 @@ def hankel_matrix(data, q, p=None):
         Hankel-windowed data.
     """
     if len(data.shape) == 3:
-        return np.stack([_hankel_matrix(item, q, p) for item in data])
+        return np.stack([_hankel_matrix(item, q, p, tau=tau) for item in data])
 
     if len(data.shape) == 1:
         data = data[:, None]
-    return _hankel_matrix(data, q, p)
+    return _hankel_matrix(data, q, p, tau=tau)
 
 
-def _hankel_matrix(data, q, p=None):
+def _hankel_matrix(data, q, p=None, tau=1):
     """
     Calculate the hankel matrix of a multivariate timeseries.
 
@@ -53,19 +56,32 @@ def _hankel_matrix(data, q, p=None):
     data : ndarray
         T x D multidimensional time series.
     q : int
-        Window width.
+        Window width (number of delay coordinates per window).
     p : int, optional
         Number of samples.
+    tau : int
+        Time-point separation between successive columns in each window.
+        Defaults to 1 (consecutive time points).
     """
     if len(data.shape) == 1:
         data = data[:, None]
 
+    # Effective span of each window in raw time steps
+    span = (q - 1) * tau + 1
     if not p:
-        p = len(data) - q
+        p = len(data) - span
+    if p <= 0:
+        raise ValueError(
+            f"Time series length {len(data)} is too short for "
+            f"time_window={q} and tau={tau} (requires > {span} time steps)."
+        )
+
     all_hmats = list()
     for row in data.T:
-        first, last = row[-(p + q): -p], row[-p - 1:]
+        first, last = row[-(p + span): -p], row[-p - 1:]
         out = hankel(first, last)
+        # Subsample rows to get every tau-th time offset within each window
+        out = out[::tau, :]
         all_hmats.append(out)
     out = np.dstack(all_hmats)
     return np.transpose(out, (1, 0, 2))[:-1]

@@ -58,13 +58,8 @@ def seed_everything(
     # NumPy
     np.random.seed(seed)
 
-    # PyTorch CPU
+    # PyTorch (CPU + all CUDA devices, without initializing CUDA)
     torch.manual_seed(seed)
-
-    # PyTorch CUDA (all GPUs)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
     # Worker seed for DataLoader reproducibility
     if workers:

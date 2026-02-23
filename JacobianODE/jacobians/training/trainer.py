@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any, List, Optional, Union
 
+import torch
 import lightning as L
 import wandb
 from hydra.utils import instantiate
@@ -95,11 +96,19 @@ def train_model(
             mode=cfg.training.early_stopping.mode,
         )
 
-    # Check if interactive environment
-    if in_ipython():
+    # Choose DDP strategy based on environment and number of GPUs.
+    # DDP requires forking, which fails if CUDA is already initialized
+    # (common in notebooks). Single-GPU doesn't benefit from DDP anyway.
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if n_gpus <= 1:
+        strategy = "auto"
+        devices = "auto"
+    elif in_ipython():
         strategy = "ddp_notebook"
+        devices = "auto"
     else:
         strategy = "ddp"
+        devices = "auto"
 
     # Extract gradient clipping parameters from the lightning model
     gradient_clip_val = lit_model.gradient_clip_val
@@ -113,7 +122,7 @@ def train_model(
         gradient_clip_val=gradient_clip_val,
         gradient_clip_algorithm=gradient_clip_algorithm,
         **cfg.training.trainer_params,
-        devices="auto",
+        devices=devices,
         strategy=strategy,
     )
 

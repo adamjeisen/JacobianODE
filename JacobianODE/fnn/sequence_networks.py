@@ -1,10 +1,13 @@
 """
-Sequence-to-next-step encoder architectures for time series embedding.
+Sequence autoencoder architectures for time series embedding.
 
 Instead of requiring a pre-computed delay embedding, these architectures
-take a full (T, D) sequence of partial observations and encode it into an
-N-dimensional latent space.  The latent is then decoded to predict the
-next time step of the observed signal.
+take a full (T, D) sequence of partial observations and produce
+per-timestep latent vectors: (B, T, D) -> (B, T, D').
+
+This is a learned, flexible alternative to fixed delay embeddings — the
+sequence encoder uses causal context to construct a richer per-timestep
+representation.  The decoder is a simple pointwise MLP (D' -> D).
 
 Architectures
 -------------
@@ -13,8 +16,7 @@ Architectures
 - TCNEncoder         (causal dilated temporal convolutions)
 - TCNSpatialEncoder  (TCN mixed with spatial convolutions over D)
 
-All encoders expose an ``encode(x) -> (B, N)`` interface so that the
-existing FNN / DeCov regularizers can be applied directly to the latent.
+All encoders expose an ``encode(x) -> (B, T, D')`` interface.
 """
 
 from __future__ import annotations
@@ -64,18 +66,20 @@ class LearnedPositionalEncoding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Shared lightweight MLP decoder  (N -> D next step)
+# Pointwise MLP decoder  (D' -> D per timestep)
 # ---------------------------------------------------------------------------
 
-class NextStepDecoder(nn.Module):
-    """Decode a latent vector into the next observed time step.
+class StepDecoder(nn.Module):
+    """Decode per-timestep latent vectors back to observation space.
+
+    A simple MLP applied independently to each timestep.
 
     Parameters
     ----------
     n_latent : int
-        Latent dimensionality (N).
+        Latent dimensionality (D').
     n_output : int
-        Output dimensionality (D, the partial observation dim).
+        Output feature dimension (D).
     hidden_dim : int
         Hidden layer width.
     n_layers : int
@@ -90,6 +94,7 @@ class NextStepDecoder(nn.Module):
         n_layers: int = 2,
     ):
         super().__init__()
+        self.n_output = n_output
         layers: list[nn.Module] = []
         in_dim = n_latent
         for _ in range(n_layers):
@@ -100,7 +105,7 @@ class NextStepDecoder(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, N) -> (B, D)."""
+        """z: (B, T, D') -> (B, T, D)  or  (B, D') -> (B, D)."""
         return self.net(z)
 
 
@@ -109,7 +114,7 @@ class NextStepDecoder(nn.Module):
 # ===================================================================
 
 class TransformerSequenceEncoder(nn.Module):
-    """Transformer encoder that maps (B, T, D) -> (B, N).
+    """Transformer encoder that maps (B, T, D) -> (B, T, D').
 
     Parameters
     ----------
@@ -173,14 +178,12 @@ class TransformerSequenceEncoder(nn.Module):
         self.to_latent = nn.Linear(d_model, n_latent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, D) -> (B, N)."""
+        """x: (B, T, D) -> (B, T, D')."""
         h = self.input_proj(x)  # (B, T, d_model)
         if self.pos_enc is not None:
             h = self.pos_enc(h)
         h = self.transformer(h)  # (B, T, d_model)
-        # Global average pooling over time
-        h = h.mean(dim=1)  # (B, d_model)
-        return self.to_latent(h)  # (B, N)
+        return self.to_latent(h)  # (B, T, D')
 
 
 # ===================================================================
@@ -219,7 +222,11 @@ class DiagonalSSMLayer(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        """u: (B, T, d_model) -> (B, T, d_model)."""
+        """u: (B, T, d_model) -> (B, T, d_model).
+
+        Uses a parallel associative scan over the time dimension for
+        O(log T) parallel depth instead of O(T) sequential steps.
+        """
         B_size, T, _ = u.shape
 
         dt = torch.exp(self.log_dt)  # (d_model,)
@@ -229,21 +236,42 @@ class DiagonalSSMLayer(nn.Module):
         A_bar = torch.exp(A * dt.unsqueeze(1))  # (d_model, d_state)
         B_bar = self.B * dt.unsqueeze(1)  # (d_model, d_state)
 
-        # Sequential scan
-        x = torch.zeros(B_size, self.d_model, self.d_state, device=u.device)
-        ys = []
-        for t in range(T):
-            x = A_bar.unsqueeze(0) * x + B_bar.unsqueeze(0) * u[:, t, :].unsqueeze(2)
-            y_t = (self.C.unsqueeze(0) * x).sum(dim=-1) + self.D.unsqueeze(0) * u[:, t, :]
-            ys.append(y_t)
+        # Expand to (B, T, d_model, d_state)
+        # a[t] = A_bar (constant across t and batch)
+        # b[t] = B_bar * u[:, t, :] (input-dependent)
+        a = A_bar.unsqueeze(0).unsqueeze(0).expand(B_size, T, -1, -1)
+        b = B_bar.unsqueeze(0).unsqueeze(0) * u.unsqueeze(-1)  # (B, T, d_model, d_state)
 
-        y = torch.stack(ys, dim=1)  # (B, T, d_model)
+        # Parallel inclusive scan: x[t] = a[t]*x[t-1] + b[t], x[-1]=0
+        # Flatten d_model*d_state for the scan, then reshape back
+        D_flat = self.d_model * self.d_state
+        a_flat = a.reshape(B_size, T, D_flat)
+        b_flat = b.reshape(B_size, T, D_flat)
+
+        # Inclusive parallel scan via repeated doubling
+        x = b_flat.clone()
+        a_cum = a_flat.clone()
+        k = 1
+        while k < T:
+            x_shifted = F.pad(x[:, :-k], (0, 0, k, 0))
+            a_shifted = F.pad(a_cum[:, :-k], (0, 0, k, 0), value=1.0)
+            x = a_cum * x_shifted + x
+            a_cum = a_cum * a_shifted
+            k *= 2
+
+        # x: (B, T, d_model*d_state) -> (B, T, d_model, d_state)
+        x = x.reshape(B_size, T, self.d_model, self.d_state)
+
+        # Output: y[t] = C . x[t] + D * u[t]
+        y = (self.C.unsqueeze(0).unsqueeze(0) * x).sum(dim=-1)  # (B, T, d_model)
+        y = y + self.D.unsqueeze(0).unsqueeze(0) * u
+
         y = self.dropout(y)
         return self.norm(y + u)  # residual + layer norm
 
 
 class SSMSequenceEncoder(nn.Module):
-    """Stack of diagonal SSM layers: (B, T, D) -> (B, N).
+    """Stack of diagonal SSM layers: (B, T, D) -> (B, T, D').
 
     Parameters
     ----------
@@ -296,15 +324,13 @@ class SSMSequenceEncoder(nn.Module):
         self.to_latent = nn.Linear(d_model, n_latent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, D) -> (B, N)."""
+        """x: (B, T, D) -> (B, T, D')."""
         h = self.input_proj(x)
         if self.pos_enc is not None:
             h = self.pos_enc(h)
         for layer in self.layers:
             h = layer(h)
-        # Use last time step (causal)
-        h = h[:, -1, :]
-        return self.to_latent(h)
+        return self.to_latent(h)  # (B, T, D')
 
 
 # ===================================================================
@@ -368,7 +394,7 @@ class TCNBlock(nn.Module):
 
 
 class TCNSequenceEncoder(nn.Module):
-    """Temporal Convolutional Network: (B, T, D) -> (B, N).
+    """Temporal Convolutional Network: (B, T, D) -> (B, T, D').
 
     Uses exponentially increasing dilation factors to cover the full
     receptive field.
@@ -412,11 +438,11 @@ class TCNSequenceEncoder(nn.Module):
         self.to_latent = nn.Linear(n_channels, n_latent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, D) -> (B, N)."""
+        """x: (B, T, D) -> (B, T, D')."""
         h = x.transpose(1, 2)  # (B, D, T)
         h = self.tcn(h)  # (B, n_channels, T)
-        h = h[:, :, -1]  # last time step (causal)
-        return self.to_latent(h)
+        h = h.transpose(1, 2)  # (B, T, n_channels)
+        return self.to_latent(h)  # (B, T, D')
 
 
 # ===================================================================
@@ -530,7 +556,7 @@ class TCNSpatialSequenceEncoder(nn.Module):
         self.to_latent = nn.Linear(n_channels, n_latent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, D) -> (B, N)."""
+        """x: (B, T, D) -> (B, T, D')."""
         h = self.input_proj(x)  # (B, T, n_channels)
 
         for t_block, s_block in zip(self.temporal_blocks, self.spatial_blocks):
@@ -539,8 +565,7 @@ class TCNSpatialSequenceEncoder(nn.Module):
             # Spatial conv
             h = s_block(h, self.n_input)  # (B, T, n_channels)
 
-        h = h[:, -1, :]  # last time step
-        return self.to_latent(h)
+        return self.to_latent(h)  # (B, T, D')
 
 
 # ===================================================================
@@ -548,7 +573,7 @@ class TCNSpatialSequenceEncoder(nn.Module):
 # ===================================================================
 
 class SequenceAutoencoder(nn.Module):
-    """Wraps any sequence encoder + next-step decoder.
+    """Wraps any sequence encoder + pointwise step decoder.
 
     Provides the ``encode`` / ``decode`` / ``forward`` interface expected
     by the FNN regulariser and training loop.
@@ -556,12 +581,12 @@ class SequenceAutoencoder(nn.Module):
     Parameters
     ----------
     encoder : nn.Module
-        Must map (B, T, D) -> (B, N).
-    decoder : NextStepDecoder
-        Must map (B, N) -> (B, D).
+        Must map (B, T, D) -> (B, T, D').
+    decoder : StepDecoder
+        Must map (B, T, D') -> (B, T, D).
     """
 
-    def __init__(self, encoder: nn.Module, decoder: NextStepDecoder):
+    def __init__(self, encoder: nn.Module, decoder: StepDecoder):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -571,15 +596,15 @@ class SequenceAutoencoder(nn.Module):
         return self.encoder.n_latent
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, T, D) -> (B, N)."""
+        """(B, T, D) -> (B, T, D')."""
         return self.encoder(x)
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """(B, N) -> (B, D)."""
+        """(B, T, D') -> (B, T, D)  or  (B, D') -> (B, D)."""
         return self.decoder(z)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(B, T, D) -> (B, D)  next-step prediction."""
+        """(B, T, D) -> (B, T, D)  per-timestep reconstruction."""
         return self.decode(self.encode(x))
 
 
@@ -602,7 +627,7 @@ def build_transformer(
         use_positional_encoding=use_positional_encoding,
         **encoder_kwargs,
     )
-    decoder = NextStepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder)
 
 
@@ -621,7 +646,7 @@ def build_ssm(
         use_positional_encoding=use_positional_encoding,
         **encoder_kwargs,
     )
-    decoder = NextStepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder)
 
 
@@ -638,7 +663,7 @@ def build_tcn(
         n_latent=n_latent,
         **encoder_kwargs,
     )
-    decoder = NextStepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder)
 
 
@@ -655,5 +680,5 @@ def build_tcn_spatial(
         n_latent=n_latent,
         **encoder_kwargs,
     )
-    decoder = NextStepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder)

@@ -1,10 +1,11 @@
 """
-Sklearn-style API for sequence-to-next-step prediction models.
+Sklearn-style API for sequence autoencoder models.
 
 These models bypass the delay-embedding step entirely: they accept a raw
 (T, D) or (N, T, D) time series, window it into overlapping subsequences,
-and train a sequence encoder to predict the *next* time step from each
-window.  FNN / DeCov regularisation is applied to the N-dimensional latent.
+and train a per-timestep sequence encoder-decoder to reconstruct each
+input window.  FNN / DeCov regularisation is applied to the per-timestep
+latent (reshaped to (B*T, D') so the regularizer sees individual embeddings).
 
 Example
 -------
@@ -16,8 +17,8 @@ Example
 ...     latent_regularizer=FNN(0.01),
 ... )
 >>> model.fit(x_train, train_steps=300, verbose=1)
->>> latent = model.transform(x_test)         # (n_windows, 6)
->>> pred   = model.predict_next(x_test)       # (n_windows, 1)
+>>> latent = model.transform(x_test)         # (n_windows, 64, 6)
+>>> recon  = model.reconstruct(x_test)       # (n_windows, 64, 1)
 """
 
 from __future__ import annotations
@@ -42,8 +43,8 @@ from .utils import standardize_ts
 # Windowing utility
 # ---------------------------------------------------------------------------
 
-def sliding_windows(data: np.ndarray, window: int):
-    """Create sliding windows with next-step targets.
+def sliding_windows(data: np.ndarray, window: int) -> np.ndarray:
+    """Create sliding windows from a time series.
 
     Parameters
     ----------
@@ -54,26 +55,21 @@ def sliding_windows(data: np.ndarray, window: int):
     -------
     X : np.ndarray
         (n_windows, window, D) input windows.
-    Y : np.ndarray
-        (n_windows, D) next-step targets.
     """
     if data.ndim == 1:
         data = data[:, None]
 
     if data.ndim == 3:
         # (N, T, D) -> stack all trials
-        all_X, all_Y = [], []
+        all_X = []
         for trial in data:
-            x, y = sliding_windows(trial, window)
-            all_X.append(x)
-            all_Y.append(y)
-        return np.concatenate(all_X, axis=0), np.concatenate(all_Y, axis=0)
+            all_X.append(sliding_windows(trial, window))
+        return np.concatenate(all_X, axis=0)
 
     T, D = data.shape
-    n_windows = T - window
+    n_windows = T - window + 1
     X = np.stack([data[i : i + window] for i in range(n_windows)], axis=0)
-    Y = data[window:]  # (n_windows, D)
-    return X, Y
+    return X
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +152,8 @@ class SequenceEmbedding:
         early_stopping: bool = False,
         early_stopping_patience: int = 10,
         percent_thresh: float = 0.005,
+        use_amp: bool = True,
+        compile_model: bool = False,
     ):
         """Train the model on a time series.
 
@@ -181,6 +179,10 @@ class SequenceEmbedding:
             Epochs without improvement before stopping.
         percent_thresh : float
             Minimum fractional improvement per epoch.
+        use_amp : bool
+            Use automatic mixed precision (bf16/fp16) on CUDA.
+        compile_model : bool
+            Apply ``torch.compile`` to the model before training.
         """
         # Auto-detect features
         n_features = 1 if X.ndim == 1 else X.shape[-1]
@@ -190,12 +192,19 @@ class SequenceEmbedding:
         self.model = self._build_model()
 
         Xs = self._standardize(X, fit=True)
-        X_win, Y_next = sliding_windows(Xs, self.time_window)
+        X_win = sliding_windows(Xs, self.time_window)
 
         X_t = torch.as_tensor(X_win, dtype=torch.float32, device=self.device)
-        Y_t = torch.as_tensor(Y_next, dtype=torch.float32, device=self.device)
 
         self.model = self.model.to(self.device)
+
+        if compile_model:
+            self.model = torch.compile(self.model)
+
+        # Set up automatic mixed precision
+        amp_enabled = use_amp and self.device.type == "cuda"
+        amp_dtype = torch.bfloat16 if (amp_enabled and torch.cuda.is_bf16_supported()) else torch.float16
+        scaler = torch.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
 
         if optimizer == "adamw":
             opt = torch.optim.AdamW(
@@ -209,7 +218,7 @@ class SequenceEmbedding:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=train_steps)
 
         self.model.train()
-        history = {"loss": [], "pred_loss": [], "reg_loss": []}
+        history = {"loss": [], "recon_loss": [], "reg_loss": []}
         best_loss = float("inf")
         patience_counter = 0
 
@@ -228,22 +237,32 @@ class SequenceEmbedding:
             for i in range(0, n_samples, batch_size):
                 idx = perm[i : i + batch_size]
                 x_batch = X_t[idx]
-                y_batch = Y_t[idx]
 
                 opt.zero_grad()
 
-                pred = self.model(x_batch)  # (B, D)
-                pred_loss = torch.nn.functional.mse_loss(pred, y_batch)
+                with torch.autocast(
+                    device_type="cuda",
+                    dtype=amp_dtype,
+                    enabled=amp_enabled,
+                ):
+                    # Encode once, then decode — reconstruction loss
+                    latent = self.model.encode(x_batch)  # (B, T, D')
+                    recon = self.model.decode(latent)  # (B, T, D)
+                    pred_loss = torch.nn.functional.mse_loss(recon, x_batch)
 
-                reg_loss = torch.tensor(0.0, device=self.device)
-                if self.latent_regularizer is not None:
-                    latent = self.model.encode(x_batch)
-                    reg_loss = self.latent_regularizer(latent)
+                    reg_loss = torch.tensor(0.0, device=self.device)
+                    if self.latent_regularizer is not None:
+                        # Reshape (B, T, D') -> (B*T, D') so FNN sees per-timestep embeddings
+                        latent_flat = latent.reshape(-1, latent.shape[-1])
+                        reg_loss = self.latent_regularizer(latent_flat)
 
-                total_loss = pred_loss + reg_loss
-                total_loss.backward()
+                    total_loss = pred_loss + reg_loss
+
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
 
                 epoch_loss += total_loss.item()
                 epoch_pred += pred_loss.item()
@@ -253,16 +272,16 @@ class SequenceEmbedding:
             scheduler.step()
 
             avg_loss = epoch_loss / max(n_batches, 1)
-            avg_pred = epoch_pred / max(n_batches, 1)
+            avg_recon = epoch_pred / max(n_batches, 1)
             avg_reg = epoch_reg / max(n_batches, 1)
             history["loss"].append(avg_loss)
-            history["pred_loss"].append(avg_pred)
+            history["recon_loss"].append(avg_recon)
             history["reg_loss"].append(avg_reg)
 
             if verbose >= 1 and (
                 epoch % max(1, train_steps // 20) == 0 or epoch == train_steps - 1
             ):
-                msg = f"Epoch {epoch+1}/{train_steps} - loss: {avg_loss:.6f}  pred: {avg_pred:.6f}"
+                msg = f"Epoch {epoch+1}/{train_steps} - loss: {avg_loss:.6f}  recon: {avg_recon:.6f}"
                 if self.latent_regularizer is not None:
                     msg += f"  reg: {avg_reg:.6f}"
                 print(msg)
@@ -294,10 +313,10 @@ class SequenceEmbedding:
         Returns
         -------
         np.ndarray
-            (n_windows, N) latent embedding.
+            (n_windows, T, D') per-timestep latent embedding.
         """
         Xs = self._standardize(X)
-        X_win, _ = sliding_windows(Xs, self.time_window)
+        X_win = sliding_windows(Xs, self.time_window)
         X_t = torch.as_tensor(X_win, dtype=torch.float32, device=self.device)
 
         self.model.eval()
@@ -305,22 +324,36 @@ class SequenceEmbedding:
             latent = self.model.encode(X_t)
         return latent.cpu().numpy()
 
+    def reconstruct(self, X: np.ndarray) -> np.ndarray:
+        """Reconstruct input windows through the autoencoder.
+
+        Returns
+        -------
+        np.ndarray
+            (n_windows, time_window, D) reconstructed windows.
+        """
+        Xs = self._standardize(X)
+        X_win = sliding_windows(Xs, self.time_window)
+        X_t = torch.as_tensor(X_win, dtype=torch.float32, device=self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            recon = self.model(X_t)
+        return recon.cpu().numpy()
+
     def predict_next(self, X: np.ndarray) -> np.ndarray:
         """Predict the next step for each window.
+
+        Uses the last time step of the reconstructed window as the
+        next-step prediction.
 
         Returns
         -------
         np.ndarray
             (n_windows, D) next-step predictions.
         """
-        Xs = self._standardize(X)
-        X_win, _ = sliding_windows(Xs, self.time_window)
-        X_t = torch.as_tensor(X_win, dtype=torch.float32, device=self.device)
-
-        self.model.eval()
-        with torch.no_grad():
-            preds = self.model(X_t)
-        return preds.cpu().numpy()
+        recon = self.reconstruct(X)
+        return recon[:, -1, :]
 
     def predict_trajectory(
         self, X: np.ndarray, n_steps: int = 100
@@ -328,7 +361,8 @@ class SequenceEmbedding:
         """Autoregressively predict a trajectory.
 
         Uses the last ``time_window`` steps of X as the initial seed,
-        then rolls forward by appending predictions.
+        then rolls forward by using the last step of each reconstructed
+        window as the next input.
 
         Parameters
         ----------
@@ -355,7 +389,8 @@ class SequenceEmbedding:
                 x_t = torch.as_tensor(
                     window[None], dtype=torch.float32, device=self.device
                 )
-                next_step = self.model(x_t).cpu().numpy()[0]  # (D,)
+                recon = self.model(x_t).cpu().numpy()[0]  # (tw, D)
+                next_step = recon[-1]  # (D,)
                 preds.append(next_step)
                 window = np.concatenate(
                     [window[1:], next_step[None]], axis=0

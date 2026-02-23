@@ -12,10 +12,8 @@ FNN regularizer based on: Kennel, Brown, and Abarbanel.
 
 DeCov regularizer based on: Cogswell et al. ICLR 2016.
 """
-
 import torch
 import torch.nn as nn
-
 
 def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     """Activity regularizer based on the False-Nearest-Neighbor algorithm.
@@ -72,10 +70,11 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     # the first dimension is the number of embedding coordinates to use
     # the last dimension is the actual embedding coordinates (the standard deviation of each coordinate over the batch)
     stds = torch.std(batch_masked, dim=1, keepdim=True)  # (n_latent, 1, n_latent)
-    all_ra = torch.sqrt(
-        (1.0 / torch.arange(1, 1 + n_latent, dtype=torch.float32, device=device))
-        * (stds ** 2).sum(dim=2).squeeze(1)
-    )  # (n_latent,)
+    # all_ra = torch.sqrt(
+    #     (1.0 / torch.arange(1, 1 + n_latent, dtype=torch.float32, device=device))
+    #     * (stds ** 2).sum(dim=2).squeeze(1)
+    # )  # (n_latent,)
+    all_ra_squared = (1.0 / torch.arange(1, 1 + n_latent, dtype=torch.float32, device=device)) * (stds ** 2).sum(dim=2).squeeze(1)
     # all_ra[i] is the characteristic size of the attractor when using the first i dimensions
     # it is equivalent to $\sqrt{\mathcal{R}^2_i}$ in the paper
 
@@ -99,17 +98,23 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
 
     # Eq. 4 of Kennel et al.: ratio of distance change, matching the Gilpin TF implementation
     # scaled_dist: (n_latent - 1, batch_size, k+1), sqrt of the normalized distance ratio
-    scaled_dist = torch.sqrt(
-        torch.clamp(
-            (neighbor_new_dists - neighbor_dists_d[:-1]) / neighbor_dists_d[:-1],
-            min=0.0,
-        )
+    # scaled_dist = torch.sqrt(
+    #     torch.clamp(
+    #         (neighbor_new_dists - neighbor_dists_d[:-1]) / neighbor_dists_d[:-1],
+    #         min=0.0,
+    #     )
+    # )
+    scaled_dist_squared = torch.clamp(
+        (neighbor_new_dists - neighbor_dists_d[:-1]) / neighbor_dists_d[:-1],
+        min=0.0,
     )
 
     # Kennel condition #1: distance ratio exceeds threshold
-    is_false_change = scaled_dist > rtol
+    # is_false_change = scaled_dist > rtol
+    is_false_change = scaled_dist_squared > rtol**2
     # Kennel condition #2: absolute distance exceeds attractor scale threshold
-    is_large_jump = neighbor_new_dists > atol * all_ra[:-1, None, None]
+    # is_large_jump = neighbor_new_dists > atol * all_ra[:-1, None, None]
+    is_large_jump = neighbor_new_dists > atol**2 * all_ra_squared[:-1, None, None]
 
     is_false_neighbor = torch.logical_or(is_false_change, is_large_jump)
     total_false_neighbors = is_false_neighbor.to(torch.int32)[..., 1:(k + 1)]
@@ -122,12 +127,14 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     # now reg_weights has shape (n_latent,)
 
     # RMS activity per latent dimension, matching Gilpin TF implementation
-    activations_batch_averaged = torch.sqrt(
-        torch.mean(code_batch ** 2, dim=0)
-    ).to(torch.float64)
+    # activations_batch_averaged = torch.sqrt(
+    #     torch.mean(code_batch ** 2, dim=0)
+    # ).to(torch.float64)
+    activations_batch_averaged_squared = torch.mean(code_batch ** 2, dim=0)
 
     # Weighted L1 activity regularization
-    loss = torch.sum(reg_weights * activations_batch_averaged)
+    # loss = torch.sum(reg_weights * activations_batch_averaged)
+    loss = torch.sum(reg_weights * activations_batch_averaged_squared)
 
     return loss.float()
 
@@ -207,3 +214,143 @@ class DeCov(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.strength * loss_cov(x)
+
+class Amplification(nn.Module):
+    """Activity regularizer that penalizes noise amplification in delay embeddings.
+
+    Measures how much noise gets amplified in the embedding space by comparing
+    the variance of neighboring trajectories over time with the distance
+    between neighbors in the embedding space. Encourages embeddings where
+    nearby points remain close over time.
+
+    Parameters
+    ----------
+    strength : float
+        Relative strength of the regularizer.
+    n_neighbors : int
+        Number of nearest neighbors to consider.
+    max_T : int
+        Maximum number of time steps to look ahead.
+    normalize : bool
+        Whether to normalize the amplification by the sum of 1/eps_k.
+    epsilon : float
+        Small constant to avoid division by zero.
+    """
+
+    def __init__(self, strength: float, n_neighbors: int = 10, max_T: int = 5,
+                 normalize: bool = False, epsilon: float = 1e-8):
+        super().__init__()
+        self.strength = strength
+        self.n_neighbors = n_neighbors
+        self.max_T = max_T
+        self.normalize = normalize
+        self.epsilon = epsilon
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the amplification regularization loss.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            (batch_size, seq_len, embedding_dim) embedding sequences.
+
+        Returns
+        -------
+        loss : torch.Tensor
+            Scalar loss value.
+        """
+        return self.strength * loss_amplification(
+            x,
+            n_neighbors=self.n_neighbors,
+            max_T=self.max_T,
+            normalize=self.normalize,
+            epsilon=self.epsilon,
+        )
+
+
+def loss_amplification(
+    embedding: torch.Tensor,
+    data: torch.Tensor | None = None,
+    n_neighbors: int = 10,
+    max_T: int = 5,
+    normalize: bool = False,
+    epsilon: float = 1e-8,
+) -> torch.Tensor:
+    """Compute noise amplification (sigma) for a time-delay embedding.
+
+    Fully differentiable w.r.t. ``embedding`` (and ``data`` if provided).
+    Neighbor *selection* is performed under ``torch.no_grad`` (discrete
+    operation), but all subsequent distance and variance computations
+    maintain the computation graph.
+
+    Parameters
+    ----------
+    embedding : torch.Tensor
+        (..., T, latent_dim) embedding time series.  Leading batch/trial
+        dimensions are flattened automatically.
+    data : torch.Tensor, optional
+        (..., T, D) raw time series aligned with *embedding*.  If ``None``,
+        *embedding* is used as both the neighbor space and the data space.
+    n_neighbors : int
+        Number of nearest neighbors (including self).
+    max_T : int
+        Number of time steps to look ahead.
+    normalize : bool
+        Divide sigma by sum(1 / eps_k).
+    epsilon : float
+        Small constant to avoid division by zero.
+
+    Returns
+    -------
+    sigma : torch.Tensor
+        Scalar noise-amplification metric.
+    """
+    if data is None:
+        data = embedding
+
+    # Handle complex embeddings
+    if torch.is_complex(embedding):
+        embedding = torch.cat([embedding.real, embedding.imag], dim=-1)
+
+    # Build T-shifted data slices and truncated embedding  ──────────────
+    # data: (..., T_total, D),  embedding: (..., T_total, latent_dim)
+    data_ahead = torch.stack(
+        [data[..., t:-(max_T - t), :].reshape(-1, data.shape[-1])
+         for t in range(max_T)],
+        dim=0,
+    )  # (max_T, n_pts, D)
+
+    emb_flat = embedding[..., :-max_T, :].reshape(
+        -1, embedding.shape[-1]
+    )  # (n_pts, latent_dim)
+
+    # k-NN in embedding space (discrete selection, no grad) ─────────────
+    with torch.no_grad():
+        dists = torch.cdist(emb_flat, emb_flat)          # (n_pts, n_pts)
+        _, indices = torch.topk(
+            dists, n_neighbors, largest=False,
+        )                                                  # (n_pts, K)
+
+    # eps_k: mean pairwise squared distance among neighbors ─────────────
+    neighbors = emb_flat[indices]                          # (n_pts, K, latent_dim)
+    diff = neighbors.unsqueeze(2) - neighbors.unsqueeze(1) # (n_pts, K, K, latent_dim)
+    sq_pairwise = diff.pow(2).sum(dim=-1)                  # (n_pts, K, K)
+    K = n_neighbors
+    eps_k = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1))   # (n_pts,)
+
+    # E_k(T): neighbor-variance of data T steps ahead ──────────────────
+    E_k_list: list[torch.Tensor] = []
+    for t in range(max_T):
+        data_t_nbrs = data_ahead[t][indices]               # (n_pts, K, D)
+        mu = data_t_nbrs.mean(dim=1, keepdim=True)         # (n_pts, 1, D)
+        E_kT = (data_t_nbrs - mu).pow(2).mean(dim=1).sum(dim=-1)  # (n_pts,)
+        E_k_list.append(E_kT)
+    E_k = torch.stack(E_k_list, dim=0)                     # (max_T, n_pts)
+
+    # sigma ─────────────────────────────────────────────────────────────
+    sig = (E_k / (eps_k + epsilon)).mean()
+
+    if normalize:
+        sig = sig / (1.0 / (eps_k + epsilon)).sum()
+
+    return sig
