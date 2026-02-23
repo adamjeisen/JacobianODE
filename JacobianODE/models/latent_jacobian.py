@@ -599,7 +599,12 @@ class LitLatentJacobianODE(LitBase):
             pass  # Don't fail training/validation on diagnostic errors
 
     def _log_latent_utilization(self, batch, prefix, **log_kwargs):
-        """Log per-dimension variance and active dimension count.
+        """Log sum of normalized latent variances (utilization score).
+
+        The per-dimension variances are divided by the largest variance
+        and summed.  A value of ~1 means only one dimension is active;
+        a value approaching ``D_latent`` means all dimensions are
+        equally utilized.
 
         Parameters
         ----------
@@ -611,13 +616,13 @@ class LitLatentJacobianODE(LitBase):
         try:
             with torch.no_grad():
                 z = self.encode_trajectory(batch)
-                # Per-dimension variance across batch and time
                 z_var = z.var(dim=(0, 1))  # (D_latent,)
-                for i, v in enumerate(z_var):
-                    self.log(f"{prefix} latent_var_dim_{i}", v.item(), **log_kwargs)
-                # Number of "active" dimensions (variance > threshold)
-                n_active = (z_var > 1e-4).sum().item()
-                self.log(f"{prefix} n_active_latent_dims", n_active, **log_kwargs)
+                max_var = z_var.max()
+                if max_var > 0:
+                    utilization = (z_var / max_var).sum().item()
+                else:
+                    utilization = 0.0
+                self.log(f"{prefix} latent_utilization", utilization, **log_kwargs)
         except Exception:
             pass
 
