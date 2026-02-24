@@ -1,0 +1,27 @@
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_latent, set at runtime
+  hidden_dim: [256, 512, 512]
+  num_layers: 3
+  output_dim: null   # = n_latent * n_latent, set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.build_ssm
+  n_input: 1
+  n_latent: 10
+  d_model: 64
+  d_state: 64
+  n_layers: 3
+  dropout: 0.1
+  use_positional_encoding: True
+  positional_encoding_type: sinusoidal
+  decoder_hidden: 128
+  decoder_layers: 2
+  context_margin: 0
+
+prediction_steps: 10
+encoder_warmup_epochs: 0
+jac_window_stride: null  # defaults to prediction_steps (non-overlapping)
