@@ -5,11 +5,11 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import pytz
 import torch
 import wandb
 from omegaconf import OmegaConf
@@ -25,7 +25,7 @@ from .legacy import reverse_wandb_run
 logger = logging.getLogger(__name__)
 
 # Cutoff date for legacy run handling (January 31st 2025 at 2pm EST)
-LEGACY_CUTOFF_DATE = datetime(2025, 1, 31, 14, 0, tzinfo=pytz.timezone("US/Eastern"))
+LEGACY_CUTOFF_DATE = datetime(2025, 1, 31, 14, 0, tzinfo=ZoneInfo("America/New_York"))
 
 
 def load_run(
@@ -74,8 +74,8 @@ def load_run(
 
     # Check run date to determine handling method
     utc_dt = datetime.strptime(run.created_at, "%Y-%m-%dT%H:%M:%SZ")
-    utc_dt = utc_dt.replace(tzinfo=pytz.UTC)
-    est_dt = utc_dt.astimezone(pytz.timezone("US/Eastern"))
+    utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+    est_dt = utc_dt.astimezone(ZoneInfo("America/New_York"))
 
     if verbose:
         logger.info(f"Run created at {est_dt} EST")
