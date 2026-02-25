@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from datetime import datetime
@@ -131,17 +132,35 @@ def _load_recent_run(
         sol = None
         dt = None if dt is None else float(dt)
 
-    # Clean up lightning config
+    # Clean up lightning config: remove keys not accepted by the target class.
+    # Use the union of LitBase and the actual target class's __init__ variables
+    # so that subclass-specific parameters (e.g. reconstruction_loss_weight in
+    # LitLatentJacobianODE) are not incorrectly stripped.
+    valid_lightning_vars = set(LitBase.__init__.__code__.co_varnames)
+    target_str = str(cfg.training.lightning.get("_target_", ""))
+    if target_str:
+        try:
+            module_path, class_name = target_str.rsplit(".", 1)
+            target_module = importlib.import_module(module_path)
+            target_cls = getattr(target_module, class_name)
+            if target_cls is not LitBase:
+                valid_lightning_vars |= set(target_cls.__init__.__code__.co_varnames)
+        except (ImportError, AttributeError, ValueError):
+            pass
+
     del_keys = []
     for key in cfg.training.lightning.keys():
-        if key not in LitBase.__init__.__code__.co_varnames and key != "_target_":
+        if key not in valid_lightning_vars and key != "_target_":
             del_keys.append(key)
     for key in del_keys:
         del cfg.training.lightning[key]
 
     if generate_data:
-        # Postprocess data
-        values = postprocess_data(cfg, sol["values"])
+        # Postprocess data.  The W&B config already stores the noise that was
+        # scaled during training (postprocess_data mutates obs_noise in-place
+        # before the config is logged).  Pass scale_noise=False so we add noise
+        # at exactly the training level instead of re-scaling it a second time.
+        values = postprocess_data(cfg, sol["values"], scale_noise=False)
         # Create train and test sets
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
             cfg, values

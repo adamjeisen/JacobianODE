@@ -134,6 +134,13 @@ from .tuning import (
     DEFAULT_LAMBDA_LOOP_VALUES,
 )
 
+# Metrics
+from .metrics import (
+    mase,
+    mse,
+    mae,
+    r2_score,
+)
 __all__ = [
     # Legacy
     "reverse_wandb_config",

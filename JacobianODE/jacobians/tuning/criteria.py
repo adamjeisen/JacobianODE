@@ -185,15 +185,25 @@ def compute_all_diagnostics(
             traj_free_ret = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=0)
             trajectory_losses.append(traj_free_ret["loss"].float().item())
 
+            # For latent models (LitLatentJacobianODE), the Jacobian MLP and
+            # loop closure operate in latent space, not observation space.
+            # Encode the batch first so compute_jacobians and
+            # loop_closure_model_step receive latent vectors, matching what
+            # validation_step does during training.
+            if hasattr(lit_model, 'encode_trajectory'):
+                z_for_eval = lit_model.encode_trajectory(batch)
+            else:
+                z_for_eval = batch
+
             # Eigenvalue fraction
-            pred_jacs = lit_model.compute_jacobians(batch)
+            pred_jacs = lit_model.compute_jacobians(z_for_eval)
             eigs_real = torch.linalg.eigvals(pred_jacs).real.flatten()
             num_eigs_too_fast += torch.sum(eigs_real <= threshold).float().item()
             total_eigs += len(eigs_real)
 
             # Loop closure
             if use_loop_closure:
-                lc_ret = lit_model.loop_closure_model_step(batch)
+                lc_ret = lit_model.loop_closure_model_step(z_for_eval)
                 loop_closure_losses.append(lc_ret["metric_vals"]["mse"].float().item())
 
     n = len(one_step_errors)

@@ -54,12 +54,14 @@ class LitLatentJacobianODE(LitBase):
         encoder_warmup_epochs=0,
         jac_window_stride=None,
         true_lyapunov_exponents=None,
+        reconstruction_loss_weight=1.0,
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
         self.encoder = encoder
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
+        self.reconstruction_loss_weight = reconstruction_loss_weight
         # Stride for JacobianODE sub-windows within each encoded batch.
         # Defaults to prediction_steps (non-overlapping).
         self.jac_window_stride = jac_window_stride if jac_window_stride is not None else prediction_steps
@@ -176,33 +178,41 @@ class LitLatentJacobianODE(LitBase):
         ----------
         jacs : torch.Tensor
             Sequence of Jacobian matrices along a trajectory,
-            shape ``(T, D, D)``.
+            shape ``(T, D, D)`` or ``(B, T, D, D)``.
         dt : float
             Time step between successive Jacobians.
 
         Returns
         -------
         torch.Tensor
-            Lyapunov exponents of shape ``(D,)``, sorted descending.
+            Lyapunov exponents of shape ``(D,)`` or ``(B, D)``, sorted
+            descending.
         """
-        T, D, _ = jacs.shape
-        Q = torch.eye(D, dtype=jacs.dtype, device=jacs.device)
-        log_diag_sum = torch.zeros(D, dtype=jacs.dtype, device=jacs.device)
+        unbatched = jacs.ndim == 3
+        if unbatched:
+            jacs = jacs.unsqueeze(0)
+
+        B, T, D, _ = jacs.shape
+        Q = torch.eye(D, dtype=jacs.dtype, device=jacs.device).expand(B, -1, -1).clone()
+        log_diag_sum = torch.zeros(B, D, dtype=jacs.dtype, device=jacs.device)
 
         for t in range(T):
-            # Convert continuous-time Jacobian to discrete propagator
-            M = torch.linalg.matrix_exp(jacs[t] * dt)
+            M = torch.linalg.matrix_exp(jacs[:, t] * dt)
             Z = M @ Q
             Q, R = torch.linalg.qr(Z)
-            # Ensure positive diagonal
-            signs = torch.sign(torch.diag(R))
+            diag_R = torch.diagonal(R, dim1=-2, dim2=-1)
+            signs = torch.sign(diag_R)
             signs[signs == 0] = 1.0
-            Q = Q * signs.unsqueeze(0)
-            R = R * signs.unsqueeze(0).T
-            log_diag_sum += torch.log(torch.abs(torch.diag(R)))
+            Q = Q * signs.unsqueeze(-2)
+            R = R * signs.unsqueeze(-1)
+            log_diag_sum += torch.log(torch.abs(torch.diagonal(R, dim1=-2, dim2=-1)))
 
         exponents = log_diag_sum / (T * dt)
-        return exponents.sort(descending=True).values
+        exponents = exponents.sort(descending=True, dim=-1).values
+
+        if unbatched:
+            exponents = exponents.squeeze(0)
+        return exponents
 
     # ------------------------------------------------------------------
     # Core training step
@@ -230,6 +240,9 @@ class LitLatentJacobianODE(LitBase):
         n_windows_actual : int
             Number of sub-windows per batch element.
         traj_init_steps : int
+
+        return_latent : bool
+            Whether to return the latent targets instead of the observation targets.
 
         Returns
         -------
@@ -279,6 +292,7 @@ class LitLatentJacobianODE(LitBase):
         jacobianODEint_kwargs=None,
         criterion=None,
         verbose=False,
+        return_decoded=False,
     ):
         """Trajectory prediction step in latent space.
 
@@ -382,7 +396,45 @@ class LitLatentJacobianODE(LitBase):
             metric_vals['mase'] = mase(tgt_flat, pred_flat)
             metric_vals['r2_score'] = r2_score(tgt_flat, pred_flat)
 
-        return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred}
+        if return_decoded:
+            return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
+        else:
+            return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred}
+
+    # ------------------------------------------------------------------
+    # Reconstruction loss
+    # ------------------------------------------------------------------
+
+    def _reconstruction_loss(self, batch, z_full=None):
+        """Compute observation-space reconstruction loss: decode(encode(x)) ≈ x.
+
+        Parameters
+        ----------
+        batch : torch.Tensor
+            Raw observations ``(B, T, D_obs)``.
+        z_full : torch.Tensor, optional
+            Pre-computed latent trajectory ``(B, T', D_latent)``.  If None,
+            the batch is encoded fresh.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar MSE reconstruction loss.
+        """
+        if z_full is None:
+            z_full = self.encode_trajectory(batch)
+
+        recon_decoded = self.decode_trajectory(z_full)
+
+        if hasattr(self.encoder, 'time_window'):
+            w = self.encoder.time_window
+            B, T, D = batch.shape
+            recon_targets = batch.unfold(1, w, 1).permute(0, 1, 3, 2)  # (B, T', w, D)
+        else:
+            margin = getattr(self.encoder, 'context_margin', 0)
+            recon_targets = batch[:, margin:, :] if margin > 0 else batch
+
+        return nn.functional.mse_loss(recon_decoded, recon_targets)
 
     # ------------------------------------------------------------------
     # Training step
@@ -458,9 +510,11 @@ class LitLatentJacobianODE(LitBase):
                 batch, batch_idx, dataloader_idx
             )
 
+        # Encode once for loop closure and/or reconstruction
+        z_full = self.encode_trajectory(batch)
+
         # Loop closure in latent space
         if self.loop_closure_training:
-            z_full = self.encode_trajectory(batch)
             train_rets['loop_closure'] = self.loop_closure_model_step(
                 z_full, batch_idx, dataloader_idx
             )
@@ -482,6 +536,12 @@ class LitLatentJacobianODE(LitBase):
         if self.jac_penalty > 0:
             total_loss += self.jac_penalty * jac_norm
 
+        # Reconstruction loss: decode(encode(x)) ≈ x in observation space
+        recon_loss = None
+        if self.reconstruction_loss_weight > 0:
+            recon_loss = self._reconstruction_loss(batch, z_full=z_full)
+            total_loss += self.reconstruction_loss_weight * recon_loss
+
         l1_loss = torch.sum(torch.abs(
             torch.cat([p.view(-1) for p in self.get_main_params()], dim=0)
         ))
@@ -495,6 +555,7 @@ class LitLatentJacobianODE(LitBase):
                 batch=batch,
                 jacs_pred=jacs_pred,
                 batch_idx=batch_idx,
+                recon_loss=recon_loss,
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
@@ -527,11 +588,17 @@ class LitLatentJacobianODE(LitBase):
             batch, batch_idx, dataloader_idx, **model_step_kwargs
         )
 
-        # Loop closure in latent space
+        # Encode once for loop closure and reconstruction
         z_full = self.encode_trajectory(batch)
         val_loop_closure = self.loop_closure_model_step(
             z_full, batch_idx, dataloader_idx
         )
+
+        # Reconstruction loss
+        val_recon_loss = None
+        if self.reconstruction_loss_weight > 0:
+            with torch.no_grad():
+                val_recon_loss = self._reconstruction_loss(batch, z_full=z_full)
 
         if log_metrics:
             self.log_validation_metrics(
@@ -539,11 +606,14 @@ class LitLatentJacobianODE(LitBase):
                 batch=batch,
                 sync_dist=True,
                 val_loop_closure=val_loop_closure,
+                val_recon_loss=val_recon_loss,
             )
 
         total_loss = sum(
             val_rets[pred_type]['loss'] for pred_type in val_rets
         )
+        if val_recon_loss is not None:
+            total_loss = total_loss + self.reconstruction_loss_weight * val_recon_loss
 
         if not hasattr(self, 'current_epoch_val_losses'):
             self.current_epoch_val_losses = []
@@ -627,8 +697,9 @@ class LitLatentJacobianODE(LitBase):
             pass
 
     def log_training_metrics(self, train_rets, total_loss, jac_norm, l1_loss,
-                              batch, jacs_pred, batch_idx, on_step=False,
-                              on_epoch=True, sync_dist=True, prog_bar=True):
+                              batch, jacs_pred, batch_idx, recon_loss=None,
+                              on_step=False, on_epoch=True, sync_dist=True,
+                              prog_bar=True):
         """Log training metrics.
 
         Overrides the base class to skip true-Jacobian comparison (not
@@ -649,6 +720,8 @@ class LitLatentJacobianODE(LitBase):
         if jac_norm is not None:
             self.log("train jac norm", jac_norm, **log_kwargs)
         self.log("train l1 norm", l1_loss, **log_kwargs)
+        if recon_loss is not None:
+            self.log("train recon_loss", recon_loss, **log_kwargs)
 
         if self.teacher_forcing_annealing:
             self.log("alpha teacher forcing", self.alpha_teacher_forcing, **log_kwargs)
@@ -656,7 +729,8 @@ class LitLatentJacobianODE(LitBase):
         self._log_lyapunov_comparison(batch, "train", **log_kwargs)
         self._log_latent_utilization(batch, "train", **log_kwargs)
 
-    def log_validation_metrics(self, val_rets, batch, sync_dist=True, val_loop_closure=None):
+    def log_validation_metrics(self, val_rets, batch, sync_dist=True,
+                               val_loop_closure=None, val_recon_loss=None):
         """Log validation metrics.
 
         Overrides the base class to skip true-Jacobian comparison and
@@ -682,6 +756,10 @@ class LitLatentJacobianODE(LitBase):
                 sync_dist=sync_dist,
                 add_dataloader_idx=False,
             )
+
+        if val_recon_loss is not None:
+            self.log("val recon_loss", val_recon_loss, sync_dist=sync_dist,
+                     add_dataloader_idx=False)
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)
         self._log_latent_utilization(batch, "val", sync_dist=sync_dist)

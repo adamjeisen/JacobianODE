@@ -195,109 +195,142 @@ class TransformerSequenceEncoder(nn.Module):
 # 2. State Space Model (diagonal S4-style)
 # ===================================================================
 
-class DiagonalSSMLayer(nn.Module):
-    """Diagonal linear recurrence (simplified S4).
+class LRULayer(nn.Module):
+    """Linear Recurrent Unit (Orvieto et al., 2023).
 
-    Parameterises A as negative-log diagonal for stability, with B, C, D
-    learned per-channel.
+    Diagonal complex-valued linear recurrence followed by a gated
+    feed-forward sublayer (GEGLU), with pre-LayerNorm + residual for both.
 
-    State update:  x[t] = A_bar * x[t-1] + B_bar * u[t]
-    Output:        y[t] = Re(C * x[t]) + D * u[t]
+    Recurrence (per channel d, state dimension N):
+        lambda  = exp(-exp(nu) + i * exp(theta))
+        gamma   = sqrt(1 - |lambda|^2)                  (input normalisation)
+        x[t]    = lambda * x[t-1] + gamma * B * u[t]   (complex state)
+        y[t]    = Re(C * x[t]) + D * u[t]              (real output)
 
-    where A_bar, B_bar come from a ZOH discretisation.
+    Feed-forward (GEGLU):
+        h   = GELU(W_gate * y) * (W_up * y)
+        out = W_down * h
+
+    Parameters
+    ----------
+    d_model   : int   – feature dimension
+    d_state   : int   – SSM state dimension per channel
+    r_min     : float – minimum initial |lambda| (0 = may decay to zero)
+    r_max     : float – maximum initial |lambda| (1 = unit-circle, long memory)
+    ffn_expand: int   – FFN hidden dim = d_model * ffn_expand
+    dropout   : float – dropout after each sublayer
     """
 
-    def __init__(self, d_model: int, d_state: int = 64, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 64,
+        r_min: float = 0.0,
+        r_max: float = 1.0,
+        ffn_expand: int = 2,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
 
-        # A parameterised in log-space for guaranteed stability
-        log_A_real = torch.log(0.5 * torch.ones(d_model, d_state))
-        self.log_A_real = nn.Parameter(log_A_real)
+        # Stability parameterisation: |lambda| = exp(-exp(nu)) ∈ [r_min, r_max]
+        r = r_min + (r_max - r_min) * torch.rand(d_model, d_state)
+        self.nu_log = nn.Parameter(torch.log(-torch.log(r.clamp(min=1e-6))))
 
-        self.B = nn.Parameter(torch.randn(d_model, d_state) * 0.02)
-        self.C = nn.Parameter(torch.randn(d_model, d_state) * 0.02)
+        # Phase: theta = exp(theta_log) ∈ (0, pi)
+        theta_init = math.pi * torch.rand(d_model, d_state).clamp(min=1e-6)
+        self.theta_log = nn.Parameter(torch.log(theta_init))
+
+        # Complex B (input→state) and C (state→output)
+        self.B_re = nn.Parameter(torch.randn(d_model, d_state) * 0.02)
+        self.B_im = nn.Parameter(torch.randn(d_model, d_state) * 0.02)
+        self.C_re = nn.Parameter(torch.randn(d_model, d_state) * 0.02)
+        self.C_im = nn.Parameter(torch.randn(d_model, d_state) * 0.02)
         self.D = nn.Parameter(torch.ones(d_model))
 
-        log_dt = torch.log(torch.rand(d_model) * 0.1 + 0.001)
-        self.log_dt = nn.Parameter(log_dt)
+        # Pre-norms
+        self.norm_ssm = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_model)
+
+        # GEGLU feed-forward
+        ffn_dim = d_model * ffn_expand
+        self.ffn_gate = nn.Linear(d_model, ffn_dim)
+        self.ffn_up   = nn.Linear(d_model, ffn_dim)
+        self.ffn_down = nn.Linear(ffn_dim, d_model)
 
         self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        """u: (B, T, d_model) -> (B, T, d_model).
-
-        Uses a parallel associative scan over the time dimension for
-        O(log T) parallel depth instead of O(T) sequential steps.
-        """
+        """u: (B, T, d_model) -> (B, T, d_model)."""
         B_size, T, _ = u.shape
 
-        dt = torch.exp(self.log_dt)  # (d_model,)
-        A = -torch.exp(self.log_A_real)  # (d_model, d_state)
+        # --- SSM sublayer (pre-norm + residual) ---
+        u_n = self.norm_ssm(u)
 
-        # ZOH discretisation
-        A_bar = torch.exp(A * dt.unsqueeze(1))  # (d_model, d_state)
-        B_bar = self.B * dt.unsqueeze(1)  # (d_model, d_state)
+        mag   = torch.exp(-torch.exp(self.nu_log))               # (d_model, d_state)
+        phase = torch.exp(self.theta_log)
+        lre   = mag * torch.cos(phase)                           # Re(lambda)
+        lim   = mag * torch.sin(phase)                           # Im(lambda)
+        gamma = torch.sqrt((1.0 - mag ** 2).clamp(min=1e-6))    # input normalisation
 
-        # Expand to (B, T, d_model, d_state)
-        # a[t] = A_bar (constant across t and batch)
-        # b[t] = B_bar * u[:, t, :] (input-dependent)
-        a = A_bar.unsqueeze(0).unsqueeze(0).expand(B_size, T, -1, -1)
-        b = B_bar.unsqueeze(0).unsqueeze(0) * u.unsqueeze(-1)  # (B, T, d_model, d_state)
+        # b[t] = gamma * B * u_n[t]  —  (B, T, d_model, d_state)
+        bre = (gamma * self.B_re)[None, None] * u_n[..., None]
+        bim = (gamma * self.B_im)[None, None] * u_n[..., None]
 
-        # Parallel inclusive scan: x[t] = a[t]*x[t-1] + b[t], x[-1]=0
-        # Flatten d_model*d_state for the scan, then reshape back
+        # Parallel inclusive scan: x[t] = lambda * x[t-1] + b[t],  x[-1] = 0
         D_flat = self.d_model * self.d_state
-        a_flat = a.reshape(B_size, T, D_flat)
-        b_flat = b.reshape(B_size, T, D_flat)
+        xr = bre.reshape(B_size, T, D_flat)
+        xi = bim.reshape(B_size, T, D_flat)
+        ar = lre.reshape(1, 1, D_flat).expand(B_size, T, -1).clone()
+        ai = lim.reshape(1, 1, D_flat).expand(B_size, T, -1).clone()
 
-        # Inclusive parallel scan via repeated doubling
-        x = b_flat.clone()
-        a_cum = a_flat.clone()
         k = 1
         while k < T:
-            x_shifted = F.pad(x[:, :-k], (0, 0, k, 0))
-            a_shifted = F.pad(a_cum[:, :-k], (0, 0, k, 0), value=1.0)
-            x = a_cum * x_shifted + x
-            a_cum = a_cum * a_shifted
+            xr_s = F.pad(xr[:, :-k], (0, 0, k, 0))
+            xi_s = F.pad(xi[:, :-k], (0, 0, k, 0))
+            ar_s = F.pad(ar[:, :-k], (0, 0, k, 0), value=1.0)
+            ai_s = F.pad(ai[:, :-k], (0, 0, k, 0), value=0.0)
+            new_xr = ar * xr_s - ai * xi_s + xr
+            new_xi = ar * xi_s + ai * xr_s + xi
+            new_ar = ar * ar_s - ai * ai_s
+            new_ai = ar * ai_s + ai * ar_s
+            xr, xi, ar, ai = new_xr, new_xi, new_ar, new_ai
             k *= 2
 
-        # x: (B, T, d_model*d_state) -> (B, T, d_model, d_state)
-        x = x.reshape(B_size, T, self.d_model, self.d_state)
+        xr = xr.reshape(B_size, T, self.d_model, self.d_state)
+        xi = xi.reshape(B_size, T, self.d_model, self.d_state)
 
-        # Output: y[t] = C . x[t] + D * u[t]
-        y = (self.C.unsqueeze(0).unsqueeze(0) * x).sum(dim=-1)  # (B, T, d_model)
-        y = y + self.D.unsqueeze(0).unsqueeze(0) * u
+        # y[t] = Re(C * x[t]) + D * u_n[t]
+        y  = (self.C_re[None, None] * xr - self.C_im[None, None] * xi).sum(-1)
+        y  = y + self.D[None, None] * u_n
+        y  = self.dropout(y)
+        h  = u + y   # residual
 
-        y = self.dropout(y)
-        return self.norm(y + u)  # residual + layer norm
+        # --- FFN sublayer (pre-norm + residual, GEGLU) ---
+        h_n = self.norm_ffn(h)
+        out = self.ffn_down(F.gelu(self.ffn_gate(h_n)) * self.ffn_up(h_n))
+        out = self.dropout(out)
+        return h + out
 
 
 class SSMSequenceEncoder(nn.Module):
-    """Stack of diagonal SSM layers: (B, T, D) -> (B, T, D').
+    """Stack of LRU layers: (B, T, D) -> (B, T, D').
 
     Parameters
     ----------
-    n_input : int
-        Input feature dimension D.
-    n_latent : int
-        Latent dimension N.
-    d_model : int
-        Internal SSM dimension.
-    d_state : int
-        SSM state dimension per channel.
-    n_layers : int
-        Number of SSM layers.
-    dropout : float
-        Dropout rate.
-    use_positional_encoding : bool
-        Whether to add temporal positional embeddings.
-    positional_encoding_type : str
-        ``"sinusoidal"`` or ``"learned"``.
-    max_len : int
-        Maximum sequence length for positional encoding.
+    n_input   : int   – Input feature dimension D.
+    n_latent  : int   – Latent dimension N.
+    d_model   : int   – Internal model dimension.
+    d_state   : int   – SSM state dimension per channel.
+    n_layers  : int   – Number of LRU layers.
+    r_min     : float – Minimum initial |lambda| (see LRULayer).
+    r_max     : float – Maximum initial |lambda| (see LRULayer).
+    ffn_expand: int   – FFN expansion factor inside each LRU layer.
+    dropout   : float – Dropout rate.
+    use_positional_encoding : bool – Whether to add temporal positional embeddings.
+    positional_encoding_type: str  – ``"sinusoidal"`` or ``"learned"``.
+    max_len   : int   – Maximum sequence length for positional encoding.
     """
 
     def __init__(
@@ -307,6 +340,9 @@ class SSMSequenceEncoder(nn.Module):
         d_model: int = 64,
         d_state: int = 64,
         n_layers: int = 3,
+        r_min: float = 0.0,
+        r_max: float = 1.0,
+        ffn_expand: int = 2,
         dropout: float = 0.1,
         use_positional_encoding: bool = True,
         positional_encoding_type: str = "sinusoidal",
@@ -323,9 +359,10 @@ class SSMSequenceEncoder(nn.Module):
             else:
                 self.pos_enc = SinusoidalPositionalEncoding(d_model, max_len)
 
-        self.layers = nn.ModuleList(
-            [DiagonalSSMLayer(d_model, d_state, dropout) for _ in range(n_layers)]
-        )
+        self.layers = nn.ModuleList([
+            LRULayer(d_model, d_state, r_min, r_max, ffn_expand, dropout)
+            for _ in range(n_layers)
+        ])
         self.to_latent = nn.Linear(d_model, n_latent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

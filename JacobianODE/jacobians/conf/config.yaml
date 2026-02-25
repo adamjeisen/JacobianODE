@@ -9,6 +9,7 @@ defaults:
 
 logger: wandb
 wandb_entity: JacobianODE
+wandb_project: null
 
 hydra:
   # mode: MULTIRUN

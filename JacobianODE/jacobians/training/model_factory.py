@@ -59,6 +59,13 @@ def make_model(
         extra_kwargs["encoder"] = encoder
         if "prediction_steps" in cfg.model:
             extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
+        # Pass optional latent-model attributes stored in cfg.model so that
+        # load_run correctly reconstructs the architecture without manual
+        # attribute assignment after the fact.
+        if "encoder_warmup_epochs" in cfg.model:
+            extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+        if "jac_window_stride" in cfg.model and cfg.model.jac_window_stride is not None:
+            extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
 
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(

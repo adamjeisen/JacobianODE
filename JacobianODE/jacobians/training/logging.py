@@ -130,6 +130,9 @@ def setup_wandb(
     # Generate run name and project from config
     name, project = make_run_info(cfg)
 
+    if cfg.get("wandb_project"):
+        project = cfg.wandb_project
+
     # Handle entity/team name
     entity = _resolve_entity(log, prompt_entity)
 
