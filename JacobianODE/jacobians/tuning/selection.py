@@ -44,7 +44,6 @@ class SelectionResult:
 
 def select_best_model(
     candidates: Sequence[DiagnosticMetrics],
-    persistence_baseline: float,
     n_dims: int,
     eigenvalue_threshold: float = 0.001,
     use_loop_closure: bool = True,
@@ -60,7 +59,6 @@ def select_best_model(
 
     Args:
         candidates: Sequence of DiagnosticMetrics, one per model.
-        persistence_baseline: Persistence baseline MSE for C1.
         n_dims: State-space dimensionality for C2.
         eigenvalue_threshold: Threshold for C3 (default 0.001).
         use_loop_closure: Whether to apply C2 (False for NeuralODE).
@@ -80,7 +78,7 @@ def select_best_model(
 
     # Step 1: evaluate each criterion independently
     fails_c1 = [
-        fails_one_step_criterion(m, persistence_baseline) for m in candidates
+        fails_one_step_criterion(m) for m in candidates
     ]
     fails_c2 = [
         fails_loop_closure_criterion(m, n_dims) if use_loop_closure else False
