@@ -13,8 +13,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Optional
+from tqdm.auto import tqdm
 
 import torch
+
+from ..metrics import normalized_mse
 
 
 @dataclass
@@ -22,7 +25,7 @@ class DiagnosticMetrics:
     """Diagnostic metrics computed for a single trained model.
 
     Attributes:
-        one_step_error: Mean one-step prediction MSE (teacher-forced).
+        one_step_error: Mean one-step prediction normalized MSE (teacher-forced).
         loop_closure_loss: Mean loop closure MSE (None for NeuralODE).
         fast_eigenvalue_fraction: Fraction of eigenvalues with real part < -1/dt.
         trajectory_val_loss: Trajectory validation loss (used for final ranking).
@@ -34,22 +37,32 @@ class DiagnosticMetrics:
     trajectory_val_loss: float
 
 
-def compute_persistence_baseline(train_trajs: torch.Tensor) -> float:
-    """Compute persistence baseline: MSE of naive 'previous value' predictor.
+def compute_persistence_baseline(data: torch.Tensor, normalize: bool = False) -> float:
+    """Compute persistence baseline using normalized MSE.
+
+    Matches the scale of trajectory_model_step, which returns normalized_mse.
+    Uses the same per-dimension variance normalization so the baseline is
+    directly comparable to model one-step errors.
 
     Args:
         train_trajs: Training trajectories, shape (..., T, D).
 
     Returns:
-        Scalar persistence baseline value.
+        Scalar persistence baseline value (normalized MSE scale).
     """
-    return ((train_trajs[..., 1:, :] - train_trajs[..., :-1, :]) ** 2).mean().item()
+    pred = data[..., :-1, :]    # x_{t-1}
+    target = data[..., 1:, :]   # x_t
+    if normalize:
+        return normalized_mse(pred, target).item()
+    else:
+        return (target - pred).pow(2).mean().item()
 
 
 def compute_one_step_error(
     lit_model: torch.nn.Module,
     val_dataloader: torch.utils.data.DataLoader,
     n_batches: int = 100,
+    verbose: bool = False,
 ) -> float:
     """Compute mean one-step prediction error over validation data.
 
@@ -67,80 +80,79 @@ def compute_one_step_error(
     device = next(lit_model.parameters()).device
     errors = []
     with torch.no_grad():
-        for i, batch in enumerate(val_dataloader):
+        for i, batch in tqdm(enumerate(val_dataloader), total=n_batches, disable=not verbose):
             if i >= n_batches:
                 break
             batch = batch.to(device)
             ret = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=1)
-            print(ret)
             errors.append(ret["loss"].float().item())
     return sum(errors) / len(errors) if errors else float("inf")
 
 
-def compute_fast_eigenvalue_fraction(
-    lit_model: torch.nn.Module,
-    val_dataloader: torch.utils.data.DataLoader,
-    dt: float,
-    n_batches: int = 100,
-) -> float:
-    """Compute fraction of eigenvalues with real part < -1/dt.
+# def compute_fast_eigenvalue_fraction(
+#     lit_model: torch.nn.Module,
+#     val_dataloader: torch.utils.data.DataLoader,
+#     dt: float,
+#     n_batches: int = 100,
+# ) -> float:
+#     """Compute fraction of eigenvalues with real part < -1/dt.
 
-    These correspond to dynamics that are 'too fast' relative to the sampling
-    rate and suggest numerical instability.
+#     These correspond to dynamics that are 'too fast' relative to the sampling
+#     rate and suggest numerical instability.
 
-    Args:
-        lit_model: Lightning model (already on device, in eval mode).
-        val_dataloader: Validation data loader.
-        dt: Time step of the data.
-        n_batches: Maximum number of batches to evaluate.
+#     Args:
+#         lit_model: Lightning model (already on device, in eval mode).
+#         val_dataloader: Validation data loader.
+#         dt: Time step of the data.
+#         n_batches: Maximum number of batches to evaluate.
 
-    Returns:
-        Fraction of eigenvalues that are too fast.
-    """
-    device = next(lit_model.parameters()).device
-    num_too_fast = 0
-    total_eigs = 0
-    threshold = -1.0 / dt
-    with torch.no_grad():
-        for i, batch in enumerate(val_dataloader):
-            if i >= n_batches:
-                break
-            batch = batch.to(device)
-            lit_model.dt = dt
-            pred_jacs = lit_model.compute_jacobians(batch)
-            eigs_real = torch.linalg.eigvals(pred_jacs).real.flatten()
-            num_too_fast += torch.sum(eigs_real <= threshold).float().item()
-            total_eigs += len(eigs_real)
-    return num_too_fast / total_eigs if total_eigs > 0 else 0.0
+#     Returns:
+#         Fraction of eigenvalues that are too fast.
+#     """
+#     device = next(lit_model.parameters()).device
+#     num_too_fast = 0
+#     total_eigs = 0
+#     threshold = -1.0 / dt
+#     with torch.no_grad():
+#         for i, batch in enumerate(val_dataloader):
+#             if i >= n_batches:
+#                 break
+#             batch = batch.to(device)
+#             lit_model.dt = dt
+#             pred_jacs = lit_model.compute_jacobians(batch)
+#             eigs_real = torch.linalg.eigvals(pred_jacs).real.flatten()
+#             num_too_fast += torch.sum(eigs_real <= threshold).float().item()
+#             total_eigs += len(eigs_real)
+#     return num_too_fast / total_eigs if total_eigs > 0 else 0.0
 
 
-def compute_val_loop_closure_loss(
-    lit_model: torch.nn.Module,
-    val_dataloader: torch.utils.data.DataLoader,
-    n_batches: int = 100,
-) -> float:
-    """Compute mean loop closure MSE over validation data.
+# def compute_val_loop_closure_loss(
+#     lit_model: torch.nn.Module,
+#     val_dataloader: torch.utils.data.DataLoader,
+#     n_batches: int = 100,
+# ) -> float:
+#     """Compute mean loop closure MSE over validation data.
 
-    Calls ``lit_model.loop_closure_model_step(batch)`` to get loop closure loss.
+#     Calls ``lit_model.loop_closure_model_step(batch)`` to get loop closure loss.
 
-    Args:
-        lit_model: Lightning model (already on device, in eval mode).
-        val_dataloader: Validation data loader.
-        n_batches: Maximum number of batches to evaluate.
+#     Args:
+#         lit_model: Lightning model (already on device, in eval mode).
+#         val_dataloader: Validation data loader.
+#         n_batches: Maximum number of batches to evaluate.
 
-    Returns:
-        Mean loop closure MSE.
-    """
-    device = next(lit_model.parameters()).device
-    losses = []
-    with torch.no_grad():
-        for i, batch in enumerate(val_dataloader):
-            if i >= n_batches:
-                break
-            batch = batch.to(device)
-            ret = lit_model.loop_closure_model_step(batch)
-            losses.append(ret["mse"].float().item())
-    return sum(losses) / len(losses) if losses else float("inf")
+#     Returns:
+#         Mean loop closure MSE.
+#     """
+#     device = next(lit_model.parameters()).device
+#     losses = []
+#     with torch.no_grad():
+#         for i, batch in enumerate(val_dataloader):
+#             if i >= n_batches:
+#                 break
+#             batch = batch.to(device)
+#             ret = lit_model.loop_closure_model_step(batch)
+#             losses.append(ret["mse"].float().item())
+#     return sum(losses) / len(losses) if losses else float("inf")
 
 
 def compute_all_diagnostics(
@@ -149,6 +161,7 @@ def compute_all_diagnostics(
     dt: float,
     n_batches: int = 100,
     use_loop_closure: bool = True,
+    verbose: bool = False,
 ) -> DiagnosticMetrics:
     """Compute all diagnostic metrics in a single pass over validation data.
 
@@ -171,7 +184,7 @@ def compute_all_diagnostics(
     threshold = -1.0 / dt
 
     with torch.no_grad():
-        for i, batch in enumerate(val_dataloader):
+        for i, batch in tqdm(enumerate(val_dataloader), total=n_batches, disable=not verbose):
             if i >= n_batches:
                 break
             batch = batch.to(device)
@@ -179,6 +192,7 @@ def compute_all_diagnostics(
 
             # One-step error (teacher-forced)
             traj_ret = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=1)
+            print(traj_ret["metric_vals"]["mase"])
             one_step_errors.append(traj_ret["loss"].float().item())
 
             # Trajectory val loss (free-running)

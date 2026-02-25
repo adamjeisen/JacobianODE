@@ -21,7 +21,7 @@ import torch.nn as nn
 
 from ..jacobians.lightning_base import LitBase, loop_closure
 from ..jacobians.jacobianODE import JacobianODEint
-from ..jacobians.metrics import mase, mse, r2_score
+from ..jacobians.metrics import mase, mse, r2_score, normalized_mse
 
 
 class LitLatentJacobianODE(LitBase):
@@ -55,6 +55,7 @@ class LitLatentJacobianODE(LitBase):
         jac_window_stride=None,
         true_lyapunov_exponents=None,
         reconstruction_loss_weight=1.0,
+        latent_prediction_loss_weight=0.0,
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
@@ -62,6 +63,7 @@ class LitLatentJacobianODE(LitBase):
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
         self.reconstruction_loss_weight = reconstruction_loss_weight
+        self.latent_prediction_loss_weight = latent_prediction_loss_weight
         # Stride for JacobianODE sub-windows within each encoded batch.
         # Defaults to prediction_steps (non-overlapping).
         self.jac_window_stride = jac_window_stride if jac_window_stride is not None else prediction_steps
@@ -375,6 +377,7 @@ class LitLatentJacobianODE(LitBase):
 
         # 4. Crop to prediction portion
         z_pred_crop = z_pred[..., traj_init_steps:, :]  # (N, prediction_steps, D_lat)
+        z_true_crop = z_windows[:, traj_init_steps:, :]  # (N, prediction_steps, D_lat)
 
         # 5. Decode predicted latents and compare to raw observation targets
         decoded_pred = self.decode_trajectory(z_pred_crop)
@@ -386,15 +389,22 @@ class LitLatentJacobianODE(LitBase):
             label, start_indices, n_windows_actual, traj_init_steps
         )  # same shape as decoded_pred
 
-        loss = criterion(decoded_pred, obs_targets)
+        # Variance-normalized losses: each ≈ mean_d(1 - R²_d), so all on the
+        # same scale regardless of whether we are in observation or latent space.
+        loss = normalized_mse(decoded_pred, obs_targets)
 
         # Metrics — flatten window dims for scalar metrics
         metric_vals = {}
         with torch.no_grad():
+            metric_vals['mase'] = mase(obs_targets, decoded_pred)
             pred_flat = decoded_pred.reshape(decoded_pred.shape[0], -1)
             tgt_flat = obs_targets.reshape(obs_targets.shape[0], -1)
-            metric_vals['mase'] = mase(tgt_flat, pred_flat)
             metric_vals['r2_score'] = r2_score(tgt_flat, pred_flat)
+
+        # Latent prediction loss (computed outside no_grad so gradients flow
+        # back through the encoder, penalising unpredictable latent dims).
+        latent_pred_loss = normalized_mse(z_pred_crop, z_true_crop)
+        metric_vals['latent_pred_loss'] = latent_pred_loss
 
         if return_decoded:
             return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
@@ -434,7 +444,7 @@ class LitLatentJacobianODE(LitBase):
             margin = getattr(self.encoder, 'context_margin', 0)
             recon_targets = batch[:, margin:, :] if margin > 0 else batch
 
-        return nn.functional.mse_loss(recon_decoded, recon_targets)
+        return normalized_mse(recon_decoded, recon_targets)
 
     # ------------------------------------------------------------------
     # Training step
@@ -542,6 +552,13 @@ class LitLatentJacobianODE(LitBase):
             recon_loss = self._reconstruction_loss(batch, z_full=z_full)
             total_loss += self.reconstruction_loss_weight * recon_loss
 
+        # Latent prediction loss: JacobianODE(z_t) ≈ z_{t+k} in latent space
+        latent_pred_loss = None
+        if self.latent_prediction_loss_weight > 0 and self.trajectory_training:
+            latent_pred_loss = train_rets['trajectory']['metric_vals'].get('latent_pred_loss')
+            if latent_pred_loss is not None:
+                total_loss += self.latent_prediction_loss_weight * latent_pred_loss
+
         l1_loss = torch.sum(torch.abs(
             torch.cat([p.view(-1) for p in self.get_main_params()], dim=0)
         ))
@@ -556,6 +573,7 @@ class LitLatentJacobianODE(LitBase):
                 jacs_pred=jacs_pred,
                 batch_idx=batch_idx,
                 recon_loss=recon_loss,
+                latent_pred_loss=latent_pred_loss,
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
@@ -600,6 +618,9 @@ class LitLatentJacobianODE(LitBase):
             with torch.no_grad():
                 val_recon_loss = self._reconstruction_loss(batch, z_full=z_full)
 
+        # Latent prediction loss (already computed inside trajectory_model_step)
+        val_latent_pred_loss = val_rets['trajectory']['metric_vals'].get('latent_pred_loss')
+
         if log_metrics:
             self.log_validation_metrics(
                 val_rets=val_rets,
@@ -607,6 +628,7 @@ class LitLatentJacobianODE(LitBase):
                 sync_dist=True,
                 val_loop_closure=val_loop_closure,
                 val_recon_loss=val_recon_loss,
+                val_latent_pred_loss=val_latent_pred_loss,
             )
 
         total_loss = sum(
@@ -614,6 +636,8 @@ class LitLatentJacobianODE(LitBase):
         )
         if val_recon_loss is not None:
             total_loss = total_loss + self.reconstruction_loss_weight * val_recon_loss
+        if val_latent_pred_loss is not None:
+            total_loss = total_loss + self.latent_prediction_loss_weight * val_latent_pred_loss
 
         if not hasattr(self, 'current_epoch_val_losses'):
             self.current_epoch_val_losses = []
@@ -698,6 +722,7 @@ class LitLatentJacobianODE(LitBase):
 
     def log_training_metrics(self, train_rets, total_loss, jac_norm, l1_loss,
                               batch, jacs_pred, batch_idx, recon_loss=None,
+                              latent_pred_loss=None,
                               on_step=False, on_epoch=True, sync_dist=True,
                               prog_bar=True):
         """Log training metrics.
@@ -722,6 +747,8 @@ class LitLatentJacobianODE(LitBase):
         self.log("train l1 norm", l1_loss, **log_kwargs)
         if recon_loss is not None:
             self.log("train recon_loss", recon_loss, **log_kwargs)
+        if latent_pred_loss is not None:
+            self.log("train latent_pred_loss", latent_pred_loss, **log_kwargs)
 
         if self.teacher_forcing_annealing:
             self.log("alpha teacher forcing", self.alpha_teacher_forcing, **log_kwargs)
@@ -730,7 +757,8 @@ class LitLatentJacobianODE(LitBase):
         self._log_latent_utilization(batch, "train", **log_kwargs)
 
     def log_validation_metrics(self, val_rets, batch, sync_dist=True,
-                               val_loop_closure=None, val_recon_loss=None):
+                               val_loop_closure=None, val_recon_loss=None,
+                               val_latent_pred_loss=None):
         """Log validation metrics.
 
         Overrides the base class to skip true-Jacobian comparison and
@@ -759,6 +787,9 @@ class LitLatentJacobianODE(LitBase):
 
         if val_recon_loss is not None:
             self.log("val recon_loss", val_recon_loss, sync_dist=sync_dist,
+                     add_dataloader_idx=False)
+        if val_latent_pred_loss is not None:
+            self.log("val latent_pred_loss", val_latent_pred_loss, sync_dist=sync_dist,
                      add_dataloader_idx=False)
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)

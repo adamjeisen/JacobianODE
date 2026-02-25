@@ -59,6 +59,7 @@ lightning:
   # RECONSTRUCTION LOSS
   # -----------------
   reconstruction_loss_weight: 1.0  # weight for decode(encode(x)) ≈ x loss in obs space
+  latent_prediction_loss_weight: 0.0  # weight for JacobianODE(z_t) ≈ z_{t+k} loss in latent space
 
   loop_closure_training: True # whether to train on loop closure integrals
   loop_closure_weight: 0.0
