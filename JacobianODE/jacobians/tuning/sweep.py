@@ -21,7 +21,6 @@ from torch.utils.data import DataLoader
 from .criteria import (
     DiagnosticMetrics,
     compute_all_diagnostics,
-    compute_persistence_baseline,
 )
 from .selection import SelectionResult, select_best_model
 
@@ -40,7 +39,6 @@ class SweepResult:
         selection: The SelectionResult from model selection.
         all_diagnostics: DiagnosticMetrics for each lambda value.
         lambda_values: The lambda_loop values that were swept.
-        persistence_baseline: The persistence baseline used for C1.
         best_lit_model: The best Lightning model (only in notebook mode).
         run_ids: W&B run IDs (only in post-hoc mode).
     """
@@ -48,7 +46,6 @@ class SweepResult:
     selection: SelectionResult
     all_diagnostics: List[DiagnosticMetrics]
     lambda_values: List[float]
-    persistence_baseline: float
     best_lit_model: Optional[Any] = None
     run_ids: Optional[List[str]] = None
 
@@ -57,7 +54,6 @@ def run_sweep(
     cfg: DictConfig,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
-    train_trajs: torch.Tensor,
     dt: float,
     n_dims: int,
     lambda_values: Optional[List[float]] = None,
@@ -80,7 +76,6 @@ def run_sweep(
         cfg: Base Hydra config (will be deep-copied per lambda).
         train_dataloader: Training data loader.
         val_dataloader: Validation data loader.
-        train_trajs: Training trajectories tensor for persistence baseline.
         dt: Time step of the data.
         n_dims: State-space dimensionality.
         lambda_values: Lambda values to sweep (default: DEFAULT_LAMBDA_LOOP_VALUES).
@@ -102,7 +97,6 @@ def run_sweep(
     if lambda_values is None:
         lambda_values = list(DEFAULT_LAMBDA_LOOP_VALUES)
 
-    persistence = compute_persistence_baseline(train_trajs)
     all_diagnostics: List[DiagnosticMetrics] = []
     lit_models: List[Any] = []
 
@@ -150,7 +144,6 @@ def run_sweep(
 
     selection = select_best_model(
         all_diagnostics,
-        persistence,
         n_dims,
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
@@ -164,7 +157,6 @@ def run_sweep(
         selection=selection,
         all_diagnostics=all_diagnostics,
         lambda_values=lambda_values,
-        persistence_baseline=persistence,
         best_lit_model=best_model,
     )
 
@@ -172,7 +164,6 @@ def run_sweep(
 def select_from_wandb_runs(
     run_ids: List[str],
     project: str,
-    train_trajs: torch.Tensor,
     dt: float,
     n_dims: int,
     n_batches: int = 100,
@@ -189,7 +180,6 @@ def select_from_wandb_runs(
     Args:
         run_ids: List of W&B run IDs to evaluate.
         project: W&B project name.
-        train_trajs: Training trajectories tensor for persistence baseline.
         dt: Time step of the data.
         n_dims: State-space dimensionality.
         n_batches: Number of validation batches for diagnostics.
@@ -203,7 +193,6 @@ def select_from_wandb_runs(
     """
     from ..checkpoints import load_run, load_checkpoint
 
-    persistence = compute_persistence_baseline(train_trajs)
     all_diagnostics: List[DiagnosticMetrics] = []
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -239,7 +228,6 @@ def select_from_wandb_runs(
 
     selection = select_best_model(
         all_diagnostics,
-        persistence,
         n_dims,
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
@@ -252,6 +240,5 @@ def select_from_wandb_runs(
         selection=selection,
         all_diagnostics=all_diagnostics,
         lambda_values=lambda_values,
-        persistence_baseline=persistence,
         run_ids=run_ids,
     )
