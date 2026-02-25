@@ -68,11 +68,10 @@ def r2_score(y_true, y_pred):
 
 
 def normalized_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Per-dimension variance-normalized MSE, averaged over dimensions.
+    """MSE normalized by the mean variance across dimensions.
 
-    Computes mean_d( MSE_d / Var_d(target) ), which equals mean_d(1 - R²_d).
-    This makes the loss scale-invariant and directly comparable across spaces
-    with different units (e.g. observation space vs latent space).
+    Computes MSE(pred, target) / mean_d(Var_d(target)), making the loss
+    scale-invariant without amplifying errors in low-variance dimensions.
 
     Parameters
     ----------
@@ -84,15 +83,16 @@ def normalized_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     Returns
     -------
     torch.Tensor
-        Scalar ≈ mean_d(1 - R²_d).  A value of 0 is perfect prediction;
-        a value of 1 means no better than predicting the per-dimension mean.
+        Scalar. A value of 0 is perfect prediction; a value of 1 means the
+        MSE equals the mean variance of the target (i.e. no better than
+        predicting the global mean).
     """
     D = target.shape[-1]
     pred_flat = pred.reshape(-1, D)
     tgt_flat = target.reshape(-1, D)
-    var_per_dim = tgt_flat.var(dim=0).clamp(min=1e-8)
-    mse_per_dim = (pred_flat - tgt_flat).pow(2).mean(dim=0)
-    return (mse_per_dim / var_per_dim).mean()
+    mean_var = tgt_flat.var(dim=0).mean().clamp(min=1e-8)
+    mse_total = (pred_flat - tgt_flat).pow(2).mean()
+    return mse_total / mean_var
 
 
 # def mape(y_true, y_pred):

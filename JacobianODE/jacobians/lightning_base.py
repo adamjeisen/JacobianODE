@@ -257,7 +257,8 @@ class LitBase(L.LightningModule):
                     early_stopping_mode='min',
                     percent_thresh=0.01,
                     mu=0,
-                    sigma=1
+                    sigma=1,
+                    **kwargs
                 ):
         super().__init__()
         # self.save_hyperparameters(ignore=['model'])
