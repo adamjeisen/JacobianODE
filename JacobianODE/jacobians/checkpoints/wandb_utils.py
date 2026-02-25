@@ -1,9 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import hydra
 import numpy as np
 import os
 import pickle
-import pytz
+from zoneinfo import ZoneInfo
 import torch
 from sklearn.metrics import r2_score
 import time
@@ -28,7 +28,7 @@ def collect_runs(model_name, cutoff_date, projects, obs_noises, network_info, lo
         api = wandb.Api()
     for project in projects:
         raise ValueError("Project redacted due to anonimity")
-        project_runs = [run for run in project_runs if datetime.strptime(run.created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC) > cutoff_date]
+        project_runs = [run for run in project_runs if datetime.strptime(run.created_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc) > cutoff_date]
         for run in project_runs:
             if 'model' not in run.config:
                 print(project)
