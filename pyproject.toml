@@ -33,7 +33,7 @@ dependencies = [
     "hydra-core",
     "hydra-submitit-launcher",
     "hydra-list-sweeper",
-    "wandb==0.18.3",
+    "wandb>=0.25.0",
     "OmegaConf",
     "torchquad",
     "torchdiffeq",
