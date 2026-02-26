@@ -155,12 +155,22 @@ def _load_recent_run(
     for key in del_keys:
         del cfg.training.lightning[key]
 
+    # Detect whether this is a new-style run (noise stored as percentage)
+    # or old-style (noise already scaled in config by postprocess_data).
+    is_new_style = "noise_scale_factor" in cfg.data.postprocessing
+
     if generate_data:
-        # Postprocess data.  The W&B config already stores the noise that was
-        # scaled during training (postprocess_data mutates obs_noise in-place
-        # before the config is logged).  Pass scale_noise=False so we add noise
-        # at exactly the training level instead of re-scaling it a second time.
-        values = postprocess_data(cfg, sol["values"], scale_noise=False)
+        if is_new_style:
+            # New style: obs_noise is a percentage, recompute scale factor.
+            result = postprocess_data(cfg, sol["values"], scale_noise=True)
+        else:
+            # Old style: obs_noise was already scaled in-place before logging.
+            # Pass scale_noise=False to avoid double-scaling.
+            result = postprocess_data(cfg, sol["values"], scale_noise=False)
+        values = result.values
+        mu = result.mu
+        sigma = result.sigma
+        noise_scale_factor = result.noise_scale_factor
         # Create train and test sets
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
             cfg, values
@@ -171,16 +181,31 @@ def _load_recent_run(
         val_dataloader = None
         test_dataloader = None
         trajs = None
+        # Use stored values from config if available, else defaults
+        if is_new_style:
+            mu = cfg.data.postprocessing.get("mu", 0.0)
+            sigma = cfg.data.postprocessing.get("sigma", 1.0)
+            noise_scale_factor = cfg.data.postprocessing.noise_scale_factor
+        else:
+            mu = 0.0
+            sigma = 1.0
+            noise_scale_factor = 1.0
 
     # Make model
     if "NeuralODE" in cfg.model.params._target_:
         cfg.model.params.dt = float(dt)
 
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
-        lit_model = make_model(cfg, dt, eq=None, save_dir=save_dir, verbose=verbose)
+        lit_model = make_model(
+            cfg, dt, eq=None, save_dir=save_dir,
+            mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
+            verbose=verbose,
+        )
     else:
         lit_model = make_model(
-            cfg, dt, eq=eq, project=project, save_dir=save_dir, verbose=verbose
+            cfg, dt, eq=eq, project=project, save_dir=save_dir,
+            mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
+            verbose=verbose,
         )
 
     return (

@@ -22,6 +22,7 @@ def make_model(
     save_dir: Optional[str] = None,
     mu: float = 0.0,
     sigma: float = 1.0,
+    noise_scale_factor: float = 1.0,
     verbose: bool = False,
 ) -> Any:
     """Create and initialize the model for training.
@@ -38,6 +39,8 @@ def make_model(
         save_dir: Directory to save model checkpoints. Defaults to None.
         mu: Mean for normalization. Defaults to 0.0.
         sigma: Standard deviation for normalization. Defaults to 1.0.
+        noise_scale_factor: Factor to scale noise percentages by data magnitude.
+            Defaults to 1.0.
         verbose: Whether to print progress information. Defaults to False.
 
     Returns:
@@ -76,6 +79,7 @@ def make_model(
         base_pt_init=x0,
         mu=mu,
         sigma=sigma,
+        noise_scale_factor=noise_scale_factor,
         **extra_kwargs,
     )
 

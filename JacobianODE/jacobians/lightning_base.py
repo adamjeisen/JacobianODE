@@ -258,6 +258,7 @@ class LitBase(L.LightningModule):
                     percent_thresh=0.01,
                     mu=0,
                     sigma=1,
+                    noise_scale_factor=1.0,
                     **kwargs
                 ):
         super().__init__()
@@ -273,8 +274,9 @@ class LitBase(L.LightningModule):
             self.criterion = nn.MSELoss()
         else: # not implemented
             raise ValueError(f"Loss function {loss_func} not implemented")
- 
+
         self.obs_noise_scale = obs_noise_scale
+        self.noise_scale_factor = noise_scale_factor
         self.log_interval = log_interval
         self.jac_loss_interval = jac_loss_interval
 
@@ -420,7 +422,8 @@ class LitBase(L.LightningModule):
 
         batch = batch.type(self.dtype)
         label = batch.detach().clone() # Detach to prevent gradient flow through label
-        batch = batch + (torch.randn(*batch.shape)*obs_noise_scale).type(batch.dtype).to(batch.device)
+        scaled_noise = obs_noise_scale * self.noise_scale_factor
+        batch = batch + (torch.randn(*batch.shape)*scaled_noise).type(batch.dtype).to(batch.device)
 
         # sample traj_init_steps as an integer between min_traj_init_steps and max_traj_init_steps inclusive
         if 'traj_init_steps' not in jacobianODEint_kwargs:

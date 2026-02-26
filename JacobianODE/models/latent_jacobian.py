@@ -319,7 +319,8 @@ class LitLatentJacobianODE(LitBase):
         label = batch.detach().clone()
 
         # Add observation noise during training
-        batch_noisy = batch + (torch.randn_like(batch) * obs_noise_scale)
+        scaled_noise = obs_noise_scale * self.noise_scale_factor
+        batch_noisy = batch + (torch.randn_like(batch) * scaled_noise)
 
         # 1. Encode full observation sequence
         z_full = self.encode_trajectory(batch_noisy)  # (B, T', D_latent)

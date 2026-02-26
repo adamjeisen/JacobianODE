@@ -36,7 +36,7 @@ def make_run_info(cfg):
     name = name + tuple([f"{key}_{value}" for key, value in cfg.training.items() if key in ['batch_size', 'save_top_k']])
     name = name + tuple([f"{key}_{value:.4f}" if key in ['obs_noise_scale', 'obs_noise_scale_validation'] else f"{key}_{value}" for key, value in cfg.training.lightning.items() if value is not None and key not in ['_target_', 'eq']])
     name = (cfg.model.params._target_.split('.')[-1],) + name
-    name = name + tuple([f"{key}_{value:.4f}" if key in ['obs_noise'] else f"{key}_{value}" for key, value in cfg.data.postprocessing.items()])
+    name = name + tuple([f"{key}_{value:.4f}" if key in ['obs_noise'] else f"{key}_{value}" for key, value in cfg.data.postprocessing.items() if key not in ('noise_scale_factor', 'mu', 'sigma')])
     name = name + tuple([f"{key}_{value}" for key, value in cfg.data.train_test_params.items() if key in ("n_delays")])
     name = name + tuple([f"{key}_{value}" for key, value in cfg.data.train_test_params.items() if key in ("seq_length")])
     if 'trajectory_params' in cfg.data:
@@ -131,6 +131,10 @@ def setup_wandb(
     name, project = make_run_info(cfg)
 
     if cfg.get("wandb_project"):
+        logger.info(
+            f"Overriding auto-generated project '{project}' with "
+            f"wandb_project='{cfg.wandb_project}'"
+        )
         project = cfg.wandb_project
 
     # Handle entity/team name

@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 # Import from new modular structure
 from .core import in_ipython, initialize_config, seed_everything
-from .data import make_trajectories, postprocess_data, normalize_data, create_dataloaders
+from .data import make_trajectories, postprocess_data, create_dataloaders
 from .training import make_model, train_model, log_training_info, setup_wandb
 
 # Set up logging
@@ -73,13 +73,17 @@ def train_jacobians(cfg: DictConfig) -> None:
     # ----------------------------------------
     # POSTPROCESS DATA
     # ----------------------------------------
-    values = postprocess_data(cfg, values_raw, raw_values_to_use_for_noise=raw_values_noise)
+    result = postprocess_data(cfg, values_raw, raw_values_to_use_for_noise=raw_values_noise)
+    values = result.values
+    mu = result.mu
+    sigma = result.sigma
+    noise_scale_factor = result.noise_scale_factor
 
-    if cfg.data.postprocessing.normalize:
-        values, mu, sigma = normalize_data(values)
-    else:
-        mu = 0
-        sigma = 1
+    # Store postprocessing metadata on config so it gets logged to W&B.
+    # This allows load_run to correctly reconstruct the data pipeline.
+    cfg.data.postprocessing.noise_scale_factor = noise_scale_factor
+    cfg.data.postprocessing.mu = mu
+    cfg.data.postprocessing.sigma = sigma
 
     # ----------------------------------------
     # CREATE DATALOADERS
@@ -114,9 +118,9 @@ def train_jacobians(cfg: DictConfig) -> None:
         x0 = None
 
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
-        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, verbose=True)
+        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, verbose=True)
     else:
-        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, verbose=True)
+        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, verbose=True)
 
     # Log training information
     log_training_info(train_dataloader, trajs, lit_model, log=log)

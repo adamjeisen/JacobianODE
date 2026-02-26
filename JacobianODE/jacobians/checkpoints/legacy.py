@@ -89,7 +89,7 @@ def reverse_wandb_run(
     if return_data:
         eq, sol, dt = make_trajectories(cfg_rev, save_dir=save_dir)
         values_orig = sol["values"]
-        values = postprocess_data(cfg_rev, sol["values"])
+        values = postprocess_data(cfg_rev, sol["values"]).values
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
             cfg_rev, values
         )

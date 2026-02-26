@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Tuple, Union
+from typing import NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -14,40 +14,57 @@ from .filtering import filter_data
 logger = logging.getLogger(__name__)
 
 
+class PostprocessResult(NamedTuple):
+    """Result of postprocess_data containing processed values and metadata."""
+    values: Union[np.ndarray, torch.Tensor]
+    mu: float
+    sigma: float
+    noise_scale_factor: float
+
+
 def postprocess_data(
     cfg: DictConfig,
     raw_values: Union[np.ndarray, torch.Tensor],
     raw_values_to_use_for_noise: Optional[Union[np.ndarray, torch.Tensor]] = None,
     scale_noise: bool = True,
     dt: Optional[float] = None,
-) -> Union[np.ndarray, torch.Tensor]:
-    """Post-process trajectory data by adding noise and/or filtering.
+) -> PostprocessResult:
+    """Post-process trajectory data by adding noise, filtering, and normalizing.
 
-    Applies observation noise and optional filtering to the trajectory data.
-    Noise can be scaled based on the data magnitude.
+    Applies observation noise (optionally scaled by data magnitude), optional
+    filtering, and optional z-score normalization.  The config is NOT mutated;
+    noise percentages remain as the user specified them.
 
     Args:
         cfg: Configuration object containing postprocessing parameters.
-        raw_values: Raw trajectory values - must be of shape (n_traj, time_steps, n_dim).
-        raw_values_to_use_for_noise: Alternative raw values to use for noise scaling.
+            Uses ``cfg.data.postprocessing.obs_noise`` (noise percentage),
+            ``cfg.data.postprocessing.normalize`` (whether to z-score normalize),
+            and filter settings.
+        raw_values: Raw trajectory values of shape ``(n_traj, time_steps, n_dim)``.
+        raw_values_to_use_for_noise: Alternative raw values to use for noise
+            scaling.  Defaults to None (uses *raw_values*).
+        scale_noise: Whether to scale noise based on data magnitude.
+            Defaults to True.
+        dt: Time step for filtering.  Required if ``filter_data`` is True.
             Defaults to None.
-        scale_noise: Whether to scale noise based on data magnitude. Defaults to True.
-        dt: Time step for filtering. Required if filter_data is True. Defaults to None.
 
     Returns:
-        Processed trajectory values with same type as input.
-
-    Example:
-        >>> values = postprocess_data(cfg, sol['values'])
-        >>> print(f"Processed values shape: {values.shape}")
+        PostprocessResult namedtuple with fields:
+            - values: Processed trajectory values (same type as input).
+            - mu: Mean used for normalization (0.0 if normalize=False).
+            - sigma: Std dev used for normalization (1.0 if normalize=False).
+            - noise_scale_factor: Factor by which noise percentages were
+              multiplied to get absolute noise levels.
 
     Note:
         The noise level is scaled by the average L2 norm of the data divided by
-        sqrt(n_dim) to make it dimension-independent.
+        ``sqrt(n_dim)`` to make it dimension-independent.
     """
-    obs_noise = cfg.data.postprocessing.obs_noise
+    obs_noise_pct = cfg.data.postprocessing.obs_noise
 
-    if scale_noise:
+    # Compute noise scale factor from data magnitude
+    noise_scale_factor = 1.0
+    if scale_noise and obs_noise_pct > 0:
         if raw_values_to_use_for_noise is None:
             noise_ref = raw_values
         else:
@@ -56,18 +73,17 @@ def postprocess_data(
         noise_scale_factor = float(
             np.linalg.norm(noise_ref, axis=-1).mean() / np.sqrt(noise_ref.shape[-1])
         )
-        # Scale noise by average norm per dimension
-        obs_noise = obs_noise * noise_scale_factor
-        cfg.data.postprocessing.obs_noise = obs_noise
-        cfg.training.lightning.obs_noise_scale *= noise_scale_factor
+
+    # Absolute noise level = percentage * scale factor
+    obs_noise_abs = obs_noise_pct * noise_scale_factor
 
     values = raw_values.copy() if isinstance(raw_values, np.ndarray) else raw_values.clone()
 
-    if obs_noise > 0:
+    if obs_noise_abs > 0:
         if isinstance(values, torch.Tensor):
-            values = values + torch.randn_like(values) * obs_noise
+            values = values + torch.randn_like(values) * obs_noise_abs
         else:
-            values = values + np.random.normal(0, obs_noise, values.shape)
+            values = values + np.random.normal(0, obs_noise_abs, values.shape)
 
     if cfg.data.postprocessing.filter_data:
         if dt is None:
@@ -85,7 +101,19 @@ def postprocess_data(
             )
         values = values_filtered
 
-    return values
+    # Normalization
+    if cfg.data.postprocessing.normalize:
+        values, mu, sigma = normalize_data(values)
+    else:
+        mu = 0.0
+        sigma = 1.0
+
+    return PostprocessResult(
+        values=values,
+        mu=mu,
+        sigma=sigma,
+        noise_scale_factor=noise_scale_factor,
+    )
 
 
 def normalize_data(
