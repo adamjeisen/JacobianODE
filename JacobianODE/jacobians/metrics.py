@@ -67,18 +67,18 @@ def r2_score(y_true, y_pred):
         return 1 - torch.sum(torch.square(y_true - y_pred)) / torch.sum(torch.square(y_true - torch.mean(y_true)))
 
 
-def normalized_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def normalized_mse(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """MSE normalized by the mean variance across dimensions.
 
-    Computes MSE(pred, target) / mean_d(Var_d(target)), making the loss
+    Computes MSE(y_pred, y_true) / mean_d(Var_d(y_true)), making the loss
     scale-invariant without amplifying errors in low-variance dimensions.
 
     Parameters
     ----------
-    pred : torch.Tensor
-        Predictions of any shape (..., D).
-    target : torch.Tensor
-        Targets of the same shape as pred.
+    y_true : torch.Tensor
+        Targets of any shape (..., D).
+    y_pred : torch.Tensor
+        Predictions of the same shape as y_true.
 
     Returns
     -------
@@ -87,11 +87,11 @@ def normalized_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         MSE equals the mean variance of the target (i.e. no better than
         predicting the global mean).
     """
-    D = target.shape[-1]
-    pred_flat = pred.reshape(-1, D)
-    tgt_flat = target.reshape(-1, D)
-    mean_var = tgt_flat.var(dim=0).mean().clamp(min=1e-8)
-    mse_total = (pred_flat - tgt_flat).pow(2).mean()
+    D = y_true.shape[-1]
+    true_flat = y_true.reshape(-1, D)
+    pred_flat = y_pred.reshape(-1, D)
+    mean_var = true_flat.var(dim=0).mean().clamp(min=1e-8)
+    mse_total = (pred_flat - true_flat).pow(2).mean()
     return mse_total / mean_var
 
 

@@ -391,7 +391,7 @@ class LitLatentJacobianODE(LitBase):
 
         # Variance-normalized losses: each ≈ mean_d(1 - R²_d), so all on the
         # same scale regardless of whether we are in observation or latent space.
-        loss = normalized_mse(decoded_pred, obs_targets)
+        loss = normalized_mse(obs_targets, decoded_pred)
 
         # Metrics — flatten window dims for scalar metrics
         metric_vals = {}
@@ -403,7 +403,7 @@ class LitLatentJacobianODE(LitBase):
 
         # Latent prediction loss (computed outside no_grad so gradients flow
         # back through the encoder, penalising unpredictable latent dims).
-        latent_pred_loss = normalized_mse(z_pred_crop, z_true_crop)
+        latent_pred_loss = normalized_mse(z_true_crop, z_pred_crop)
         metric_vals['latent_pred_loss'] = latent_pred_loss
 
         if return_decoded:
@@ -444,7 +444,7 @@ class LitLatentJacobianODE(LitBase):
             margin = getattr(self.encoder, 'context_margin', 0)
             recon_targets = batch[:, margin:, :] if margin > 0 else batch
 
-        return normalized_mse(recon_decoded, recon_targets)
+        return normalized_mse(recon_targets, recon_decoded)
 
     # ------------------------------------------------------------------
     # Training step
