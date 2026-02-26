@@ -54,7 +54,7 @@ def train_jacobians(cfg: DictConfig) -> None:
     # GENERATE DATA
     # ----------------------------------------
     # Set seeds for reproducibility
-    seed_everything(cfg.data.flow.random_state + cfg.training.run_number)
+    seed_everything(cfg.data.flow.random_state)
 
     eq, sol, dt = make_trajectories(cfg)
     values_raw = sol["values"]
@@ -102,6 +102,9 @@ def train_jacobians(cfg: DictConfig) -> None:
     # ----------------------------------------
     # MAKE MODEL
     # ----------------------------------------
+    # Re-seed with run_number offset for model initialization
+    seed_everything(cfg.data.flow.random_state + cfg.training.run_number + 1)
+
     if "NeuralODE" in cfg.model.params._target_:
         cfg.model.params.dt = float(dt)
 
@@ -109,9 +112,6 @@ def train_jacobians(cfg: DictConfig) -> None:
         x0 = trajs["train_trajs"].sequence.mean(dim=(0, 1))
     else:
         x0 = None
-
-    # Re-seed with run_number offset for model initialization
-    seed_everything(cfg.data.flow.random_state + cfg.training.run_number)
 
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
         lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, verbose=True)

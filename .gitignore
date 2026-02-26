@@ -5,6 +5,7 @@ _jupyter/multirun/
 _jupyter/outputs/
 _jupyter/checkpoints/
 JacobianODE/fnn/Deep_reconstruction_of_strange_attractors.pdf
+.claude
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
