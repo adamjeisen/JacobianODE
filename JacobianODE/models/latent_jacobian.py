@@ -22,6 +22,7 @@ import torch.nn as nn
 from ..jacobians.lightning_base import LitBase, loop_closure
 from ..jacobians.jacobianODE import JacobianODEint
 from ..jacobians.metrics import mase, mse, r2_score, normalized_mse
+from ..fnn.regularizers import loss_false
 
 
 class LitLatentJacobianODE(LitBase):
@@ -56,6 +57,8 @@ class LitLatentJacobianODE(LitBase):
         true_lyapunov_exponents=None,
         reconstruction_loss_weight=1.0,
         latent_prediction_loss_weight=0.0,
+        jac_consistency_weight=0.0,
+        fnn_weight=0.0,
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
@@ -64,6 +67,8 @@ class LitLatentJacobianODE(LitBase):
         self.encoder_warmup_epochs = encoder_warmup_epochs
         self.reconstruction_loss_weight = reconstruction_loss_weight
         self.latent_prediction_loss_weight = latent_prediction_loss_weight
+        self.jac_consistency_weight = jac_consistency_weight
+        self.fnn_weight = fnn_weight
         # Stride for JacobianODE sub-windows within each encoded batch.
         # Defaults to prediction_steps (non-overlapping).
         self.jac_window_stride = jac_window_stride if jac_window_stride is not None else prediction_steps
@@ -447,6 +452,33 @@ class LitLatentJacobianODE(LitBase):
 
         return normalized_mse(recon_targets, recon_decoded)
 
+    def _jac_consistency_loss(self, z, jacs):
+        """Jacobian-consistency loss in latent space.
+
+        Measures how well the learned Jacobians propagate velocity vectors
+        forward via the variational equation: if dz/dt = f(z), then a
+        displacement dz evolves as d(dz)/dt = J dz, so
+        dz(t+dt) ≈ e^{J dt} dz(t).
+
+        Loss: ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Latent trajectory ``(B, T, D_latent)``.
+        jacs : torch.Tensor
+            Predicted Jacobians ``(B, T, D_latent, D_latent)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss.
+        """
+        J_exp = torch.matrix_exp(jacs[:, :-2] * self.dt)          # (B, T-2, D, D)
+        vel = z[:, 1:] - z[:, :-1]                                 # (B, T-1, D)
+        vel_t1_pred = (J_exp @ vel[:, :-1].unsqueeze(-1)).squeeze(-1)  # (B, T-2, D)
+        return (vel[:, 1:] - vel_t1_pred).pow(2).mean() / z.var()
+
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
@@ -560,6 +592,26 @@ class LitLatentJacobianODE(LitBase):
             if latent_pred_loss is not None:
                 total_loss += self.latent_prediction_loss_weight * latent_pred_loss
 
+        # Jac-consistency loss: ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
+        jac_cons_loss = None
+        if self.jac_consistency_weight > 0:
+            jacs_for_cons = self.compute_jacobians(z_full)
+            jac_cons_loss = self._jac_consistency_loss(z_full, jacs_for_cons)
+            total_loss += self.jac_consistency_weight * jac_cons_loss
+
+        # FNN regularization: penalize false nearest neighbors in latent space.
+        # Encourages encoder to discover a geometrically well-structured embedding
+        # (Gilpin NeurIPS 2020 / Kennel et al. 1992).
+        fnn_loss = None
+        if self.fnn_weight > 0:
+            z_flat = z_full.reshape(-1, z_full.shape[-1])
+            # Subsample to cap pairwise-distance cost (O(N^2))
+            if len(z_flat) > 1024:
+                idx = torch.randperm(len(z_flat), device=z_flat.device)[:1024]
+                z_flat = z_flat[idx]
+            fnn_loss = loss_false(z_flat)
+            total_loss = total_loss + self.fnn_weight * fnn_loss
+
         l1_loss = torch.sum(torch.abs(
             torch.cat([p.view(-1) for p in self.get_main_params()], dim=0)
         ))
@@ -575,6 +627,8 @@ class LitLatentJacobianODE(LitBase):
                 batch_idx=batch_idx,
                 recon_loss=recon_loss,
                 latent_pred_loss=latent_pred_loss,
+                jac_cons_loss=jac_cons_loss,
+                fnn_loss=fnn_loss,
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
@@ -723,7 +777,8 @@ class LitLatentJacobianODE(LitBase):
 
     def log_training_metrics(self, train_rets, total_loss, jac_norm, l1_loss,
                               batch, jacs_pred, batch_idx, recon_loss=None,
-                              latent_pred_loss=None,
+                              latent_pred_loss=None, jac_cons_loss=None,
+                              fnn_loss=None,
                               on_step=False, on_epoch=True, sync_dist=True,
                               prog_bar=True):
         """Log training metrics.
@@ -750,6 +805,10 @@ class LitLatentJacobianODE(LitBase):
             self.log("train recon_loss", recon_loss, **log_kwargs)
         if latent_pred_loss is not None:
             self.log("train latent_pred_loss", latent_pred_loss, **log_kwargs)
+        if jac_cons_loss is not None:
+            self.log("train jac_cons_loss", jac_cons_loss, **log_kwargs)
+        if fnn_loss is not None:
+            self.log("train fnn_loss", fnn_loss, **log_kwargs)
 
         if self.teacher_forcing_annealing:
             self.log("alpha teacher forcing", self.alpha_teacher_forcing, **log_kwargs)
