@@ -10,6 +10,11 @@ postprocessing:
   low_pass: 10
   high_pass: null
   normalize: false
+  # Metadata fields populated at runtime by postprocess_data / run_jacobians.
+  # Stored so that load_run can reconstruct the exact data pipeline.
+  noise_scale_factor: null
+  mu: null
+  sigma: null
 
 train_test_params:
   seq_length: 25       # Length of sequences for training
