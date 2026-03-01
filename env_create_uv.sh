@@ -13,7 +13,11 @@ uv pip install -e .
 echo "Installing ipykernel and creating a Jupyter kernel bound to this venv..."
 # Add ipykernel as a dev dependency (persists to pyproject/uv.lock) and install the kernel
 uv add --dev ipykernel
-uv run ipython kernel install --user --env VIRTUAL_ENV "$(pwd)/.venv" --name=JacobianODE
+# uv run ipython kernel install --user --env VIRTUAL_ENV "$(pwd)/.venv" --name=JacobianODE
+uv run python -m ipykernel install \
+  --user \
+  --name jacobianode \
+  --display-name "JacobianODE"
 
 echo "Environment created successfully!"
 echo "To start Jupyter in Cursor/VSCode, click the kernel selecter in the top right corner."

@@ -15,7 +15,7 @@ DeCov regularizer based on: Cogswell et al. ICLR 2016.
 import torch
 import torch.nn as nn
 
-def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
+def loss_false(code_batch: torch.Tensor, k: int = 1, norm: bool = False) -> torch.Tensor:
     """Activity regularizer based on the False-Nearest-Neighbor algorithm.
 
     For each embedding dimension d (from 1 to n_latent), computes pairwise
@@ -136,7 +136,13 @@ def loss_false(code_batch: torch.Tensor, k: int = 1) -> torch.Tensor:
     # loss = torch.sum(reg_weights * activations_batch_averaged)
     loss = torch.sum(reg_weights * activations_batch_averaged_squared)
 
-    return loss.float()
+    if norm:
+        # return loss.float() / (n_latent * code_batch.var())
+        epsilon = 1e-8
+        denom = activations_batch_averaged_squared.sum() + epsilon
+        return loss.float() / denom
+    else:
+        return loss.float()
 
 
 def loss_cov(a: torch.Tensor, whiten: bool = False) -> torch.Tensor:
@@ -336,7 +342,8 @@ def loss_amplification(
     diff = neighbors.unsqueeze(2) - neighbors.unsqueeze(1) # (n_pts, K, K, latent_dim)
     sq_pairwise = diff.pow(2).sum(dim=-1)                  # (n_pts, K, K)
     K = n_neighbors
-    eps_k = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1))   # (n_pts,)
+    # eps_k = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1))   # (n_pts,)
+    eps_k = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1) * emb_flat.shape[-1]) # (n_pts,)
 
     # E_k(T): neighbor-variance of data T steps ahead ──────────────────
     E_k_list: list[torch.Tensor] = []
@@ -351,6 +358,6 @@ def loss_amplification(
     sig = (E_k / (eps_k + epsilon)).mean()
 
     if normalize:
-        sig = sig / (1.0 / (eps_k + epsilon)).sum()
+        sig = sig / (1.0 / (eps_k + epsilon)).mean()
 
     return sig
