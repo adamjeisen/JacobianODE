@@ -1,0 +1,21 @@
+# Temporal Convolutional Network (causal dilated) sequence encoder
+# n_input is set at runtime from the observation dimension.
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.TCNSequenceEncoder
+  n_input: null         # set at runtime from data
+  n_latent: 10          # N_LATENT: latent space dimension
+  n_channels: 64        # number of channels in each TCN block
+  kernel_size: 7        # convolution kernel size
+  n_layers: 4           # number of TCN blocks (dilation doubles each block: 1,2,4,8,...)
+  dropout: 0.1
+
+# ---- Decoder head configuration ----
+use_same_state_decoder: True
+use_next_state_decoder: False
+decoder_hidden_dim: 128
+decoder_n_layers: 2
+
+context_margin: 0
+# Burn-in for next-state prediction: skip first N steps (partial obs may need context)
+next_state_burn_in: 0

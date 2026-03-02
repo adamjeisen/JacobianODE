@@ -59,6 +59,12 @@ class LitLatentJacobianODE(LitBase):
         latent_prediction_loss_weight=0.0,
         jac_consistency_weight=0.0,
         fnn_weight=0.0,
+        learn_r2_weight=False,
+        learn_loop_closure_weight=False,
+        learn_fnn_weight=False,
+        learn_jac_cons_weight=False,
+        learn_jac_norm_weight=False,
+        log_var_init='naive',
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
@@ -84,6 +90,28 @@ class LitLatentJacobianODE(LitBase):
             )
         else:
             self.true_lyapunov_exponents = None
+
+        # Homoscedastic uncertainty weighting (Kendall et al. 2018).
+        # For each enabled group a learnable log-variance s_i is registered.
+        # The weighted contribution becomes: 0.5 * exp(-s_i) * L_i + 0.5 * s_i
+        self.learn_r2_weight = learn_r2_weight
+        self.learn_loop_closure_weight = learn_loop_closure_weight
+        self.learn_fnn_weight = learn_fnn_weight
+        self.learn_jac_cons_weight = learn_jac_cons_weight
+        self.learn_jac_norm_weight = learn_jac_norm_weight
+        self.log_var_init = log_var_init
+        self._log_var_auto_initialized = False
+
+        if learn_r2_weight:
+            self.log_var_r2 = nn.Parameter(torch.zeros(1))
+        if learn_loop_closure_weight:
+            self.log_var_loop_closure = nn.Parameter(torch.zeros(1))
+        if learn_fnn_weight:
+            self.log_var_fnn = nn.Parameter(torch.zeros(1))
+        if learn_jac_cons_weight:
+            self.log_var_jac_cons = nn.Parameter(torch.zeros(1))
+        if learn_jac_norm_weight:
+            self.log_var_jac_norm = nn.Parameter(torch.zeros(1))
 
     # ------------------------------------------------------------------
     # Encoder / decoder abstractions
@@ -480,6 +508,57 @@ class LitLatentJacobianODE(LitBase):
         return (vel[:, 1:] - vel_t1_pred).pow(2).mean() / z.var()
 
     # ------------------------------------------------------------------
+    # Homoscedastic uncertainty weighting helpers
+    # ------------------------------------------------------------------
+
+    def _homoscedastic_loss(self, loss, log_var):
+        """Apply homoscedastic uncertainty weighting to a loss term.
+
+        Computes ``0.5 * exp(-log_var) * loss + 0.5 * log_var``.
+        The first term down-weights large losses; the second acts as a
+        learned-regularisation penalty that prevents log_var from growing
+        without bound.
+
+        Parameters
+        ----------
+        loss : torch.Tensor
+            Scalar (or broadcastable) raw loss value.
+        log_var : nn.Parameter
+            Learnable log-variance scalar ``s_i``.
+        """
+        return 0.5 * torch.exp(-log_var) * loss + 0.5 * log_var
+
+    def _auto_init_log_vars(self, r2_loss=None, loop_loss=None, fnn_loss=None,
+                             jac_cons_loss=None, jac_norm=None):
+        """Initialise log_var parameters to log of initial loss magnitudes.
+
+        Sets each active ``log_var`` parameter to ``log(raw_loss)`` so that
+        the first-step gradient contribution is normalised and no extreme
+        spikes occur.  Called once, on the first training batch.
+
+        Parameters
+        ----------
+        r2_loss, loop_loss, fnn_loss, jac_cons_loss, jac_norm : Tensor or None
+            Raw (unweighted) loss values for each group.  Groups whose
+            corresponding flag is False are ignored.
+        """
+        eps = 1e-8
+        pairs = [
+            (self.learn_r2_weight,           getattr(self, 'log_var_r2', None),           r2_loss),
+            (self.learn_loop_closure_weight, getattr(self, 'log_var_loop_closure', None), loop_loss),
+            (self.learn_fnn_weight,          getattr(self, 'log_var_fnn', None),          fnn_loss),
+            (self.learn_jac_cons_weight,     getattr(self, 'log_var_jac_cons', None),     jac_cons_loss),
+            (self.learn_jac_norm_weight,     getattr(self, 'log_var_jac_norm', None),     jac_norm),
+        ]
+        with torch.no_grad():
+            for enabled, param, raw in pairs:
+                if enabled and param is not None and raw is not None:
+                    val = float(raw.detach()) if isinstance(raw, torch.Tensor) else float(raw)
+                    if val > eps:
+                        param.data.fill_(torch.tensor(val).log().item())
+        self._log_var_auto_initialized = True
+
+    # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
 
@@ -562,55 +641,118 @@ class LitLatentJacobianODE(LitBase):
                 z_full, batch_idx, dataloader_idx
             )
 
-        # Combine losses
-        total_loss = 0
-        for pred_type, ret_dict in train_rets.items():
-            if torch.isnan(ret_dict['loss']):
+        # ----------------------------------------------------------------
+        # Compute per-group losses
+        # ----------------------------------------------------------------
+
+        # --- Group 1: R²-like (trajectory + recon + latent_pred) ---
+        r2_loss = torch.zeros(1, device=batch.device, dtype=batch.dtype).squeeze()
+        if self.trajectory_training and 'trajectory' in train_rets:
+            traj_loss = train_rets['trajectory']['loss']
+            if torch.isnan(traj_loss):
                 print(
-                    f"Warning: Loss is nan for pred type {pred_type} "
+                    f"Warning: Loss is nan for pred type trajectory "
                     f"on epoch {self.current_epoch} batch {batch_idx}"
                 )
-            loss_val = ret_dict['loss'] if not torch.isnan(ret_dict['loss']) else 0
-            loss_weight = 1.0
-            if 'loop_closure' in pred_type:
-                loss_weight *= self.loop_closure_weight
-            total_loss += loss_weight * loss_val
-
-        if self.jac_penalty > 0:
-            total_loss += self.jac_penalty * jac_norm
+            else:
+                r2_loss = r2_loss + traj_loss
 
         # Reconstruction loss: decode(encode(x)) ≈ x in observation space
         recon_loss = None
         if self.reconstruction_loss_weight > 0:
             recon_loss = self._reconstruction_loss(batch, z_full=z_full)
-            total_loss += self.reconstruction_loss_weight * recon_loss
+            r2_loss = r2_loss + self.reconstruction_loss_weight * recon_loss
 
         # Latent prediction loss: JacobianODE(z_t) ≈ z_{t+k} in latent space
         latent_pred_loss = None
         if self.latent_prediction_loss_weight > 0 and self.trajectory_training:
             latent_pred_loss = train_rets['trajectory']['metric_vals'].get('latent_pred_loss')
             if latent_pred_loss is not None:
-                total_loss += self.latent_prediction_loss_weight * latent_pred_loss
+                r2_loss = r2_loss + self.latent_prediction_loss_weight * latent_pred_loss
 
-        # Jac-consistency loss: ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
-        jac_cons_loss = None
-        if self.jac_consistency_weight > 0:
-            jacs_for_cons = self.compute_jacobians(z_full)
-            jac_cons_loss = self._jac_consistency_loss(z_full, jacs_for_cons)
-            total_loss += self.jac_consistency_weight * jac_cons_loss
+        # --- Group 2: Loop closure ---
+        loop_loss = None
+        if self.loop_closure_training and 'loop_closure' in train_rets:
+            lc = train_rets['loop_closure']['loss']
+            if torch.isnan(lc):
+                print(
+                    f"Warning: Loss is nan for pred type loop_closure "
+                    f"on epoch {self.current_epoch} batch {batch_idx}"
+                )
+            else:
+                loop_loss = lc
 
-        # FNN regularization: penalize false nearest neighbors in latent space.
-        # Encourages encoder to discover a geometrically well-structured embedding
-        # (Gilpin NeurIPS 2020 / Kennel et al. 1992).
+        # --- Group 3: FNN regularization ---
+        # Penalize false nearest neighbors in latent space to encourage a
+        # geometrically well-structured embedding (Gilpin NeurIPS 2020 / Kennel 1992).
         fnn_loss = None
-        if self.fnn_weight > 0:
+        if self.fnn_weight > 0 or self.learn_fnn_weight:
             z_flat = z_full.reshape(-1, z_full.shape[-1])
             # Subsample to cap pairwise-distance cost (O(N^2))
             if len(z_flat) > 1024:
                 idx = torch.randperm(len(z_flat), device=z_flat.device)[:1024]
                 z_flat = z_flat[idx]
             fnn_loss = loss_false(z_flat)
-            total_loss = total_loss + self.fnn_weight * fnn_loss
+
+        # --- Group 4: Jac-consistency ---
+        # ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
+        jac_cons_loss = None
+        if self.jac_consistency_weight > 0 or self.learn_jac_cons_weight:
+            jacs_for_cons = self.compute_jacobians(z_full)
+            jac_cons_loss = self._jac_consistency_loss(z_full, jacs_for_cons)
+
+        # --- Group 5: Jac norm/penalty ---
+        # (jac_norm is already computed above for teacher-forcing; reused here)
+
+        # ----------------------------------------------------------------
+        # Auto-initialise log_var parameters on the very first batch
+        # ----------------------------------------------------------------
+        if self.log_var_init == 'auto' and not self._log_var_auto_initialized:
+            self._auto_init_log_vars(
+                r2_loss=r2_loss,
+                loop_loss=loop_loss,
+                fnn_loss=fnn_loss,
+                jac_cons_loss=jac_cons_loss,
+                jac_norm=jac_norm,
+            )
+
+        # ----------------------------------------------------------------
+        # Combine into total_loss, applying homoscedastic or fixed weights
+        # ----------------------------------------------------------------
+        total_loss = torch.zeros(1, device=batch.device, dtype=batch.dtype).squeeze()
+
+        # R²-like group
+        if self.learn_r2_weight:
+            total_loss = total_loss + self._homoscedastic_loss(r2_loss, self.log_var_r2)
+        else:
+            total_loss = total_loss + r2_loss
+
+        # Loop closure group
+        if loop_loss is not None:
+            if self.learn_loop_closure_weight:
+                total_loss = total_loss + self._homoscedastic_loss(loop_loss, self.log_var_loop_closure)
+            else:
+                total_loss = total_loss + self.loop_closure_weight * loop_loss
+
+        # Jac norm group
+        if self.learn_jac_norm_weight:
+            total_loss = total_loss + self._homoscedastic_loss(jac_norm, self.log_var_jac_norm)
+        elif self.jac_penalty > 0:
+            total_loss = total_loss + self.jac_penalty * jac_norm
+
+        # Jac consistency group
+        if jac_cons_loss is not None:
+            if self.learn_jac_cons_weight:
+                total_loss = total_loss + self._homoscedastic_loss(jac_cons_loss, self.log_var_jac_cons)
+            else:
+                total_loss = total_loss + self.jac_consistency_weight * jac_cons_loss
+
+        # FNN group
+        if fnn_loss is not None:
+            if self.learn_fnn_weight:
+                total_loss = total_loss + self._homoscedastic_loss(fnn_loss, self.log_var_fnn)
+            elif self.fnn_weight > 0:
+                total_loss = total_loss + self.fnn_weight * fnn_loss
 
         l1_loss = torch.sum(torch.abs(
             torch.cat([p.view(-1) for p in self.get_main_params()], dim=0)
@@ -809,6 +951,17 @@ class LitLatentJacobianODE(LitBase):
             self.log("train jac_cons_loss", jac_cons_loss, **log_kwargs)
         if fnn_loss is not None:
             self.log("train fnn_loss", fnn_loss, **log_kwargs)
+
+        if self.learn_r2_weight:
+            self.log("log_var r2", self.log_var_r2.squeeze(), **log_kwargs)
+        if self.learn_loop_closure_weight:
+            self.log("log_var loop_closure", self.log_var_loop_closure.squeeze(), **log_kwargs)
+        if self.learn_fnn_weight:
+            self.log("log_var fnn", self.log_var_fnn.squeeze(), **log_kwargs)
+        if self.learn_jac_cons_weight:
+            self.log("log_var jac_cons", self.log_var_jac_cons.squeeze(), **log_kwargs)
+        if self.learn_jac_norm_weight:
+            self.log("log_var jac_norm", self.log_var_jac_norm.squeeze(), **log_kwargs)
 
         if self.teacher_forcing_annealing:
             self.log("alpha teacher forcing", self.alpha_teacher_forcing, **log_kwargs)

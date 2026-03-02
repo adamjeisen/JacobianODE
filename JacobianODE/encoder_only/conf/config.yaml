@@ -1,0 +1,21 @@
+defaults:
+  - _self_
+  - training: training
+  - data: dysts
+  - model: ssm
+  - slurm: default
+  - override hydra/sweeper: list  # required for --multirun with comma-separated values
+
+
+wandb_entity: JacobianODE
+wandb_project: null   # if null, auto-generated as <DataClass>__EncoderOnly
+
+hydra:
+  job:
+    chdir: True
+  # Example multirun sweep:
+  # mode: MULTIRUN
+  # sweeper:
+  #   list_params:
+  #     ++training.lightning.fnn_weight: 0,0.001,0.01,0.1
+  #     ++training.lightning.amplification_weight: 0,0.001,0.01,0.1

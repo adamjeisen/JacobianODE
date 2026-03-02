@@ -26,6 +26,11 @@ def embed_signal_torch(data, n_delays, delay_interval=1):
     delay_interval : int
         The number of time steps between each delay in the delay embedding. Defaults
         to 1 time step.
+
+    Notes
+    -----
+    Delay blocks are ordered most recent to least recent: columns 0:N contain the
+    most recent state, columns N:2N the next delay, and so on through the oldest.
     """
     with torch.no_grad():
         if isinstance(data, np.ndarray):
@@ -109,7 +114,7 @@ def get_start_indices(seq_length, seq_spacing, T):
 
     return start_indices
 
-def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0.8, test_percent=0.05, split_by='time', dtype='torch.FloatTensor', delay_embedding_params=None, verbose=False):
+def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0.8, test_percent=0.05, split_by='time', dtype='torch.FloatTensor', delay_embedding_params=None, verbose=False, return_full_obs=False):
     """
     Generate training, validation, and test datasets from time series data.
 
@@ -140,13 +145,21 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         - 'delay_spacing': spacing between delays
     verbose : bool, optional
         Whether to print progress information, by default False
+    return_full_obs : bool, optional
+        When True and delay_embedding_params filters observed_indices, also
+        store the full-dimensional (unfiltered) test trajectories in the
+        returned trajs dict as ``trajs['test_trajs_full']``.  The same
+        train/test split indices are used, so the sequences align with
+        ``trajs['test_trajs']``.  Defaults to False.
 
     Returns
     -------
     tuple
         (train_dataset, val_dataset, test_dataset, trajs) where:
         - train_dataset, val_dataset, test_dataset are TimeSeriesDataset objects
-        - trajs is a dict containing the full trajectories and indices for each split
+        - trajs is a dict containing the full trajectories and indices for each
+          split; when return_full_obs=True the dict also contains
+          ``test_trajs_full`` with all observed dimensions.
 
     Raises
     ------
@@ -158,6 +171,9 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
 
     if train_percent + test_percent > 1:
         raise ValueError('train_percent + test_percent must be less than or equal to 1')
+
+    # Keep a reference to the full-dimensional data before any obs filtering.
+    pts_full = pts
 
     if delay_embedding_params is not None:
         if delay_embedding_params['observed_indices'] != 'all':
@@ -198,6 +214,9 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
             train_examples[i*n_train:(i + 1)*n_train] = train_trajs[:, start_ind:start_ind + seq_length]
             val_examples[i*n_val:(i + 1)*n_val] = val_trajs[:, start_ind:start_ind + seq_length]
             test_examples[i*n_test:(i + 1)*n_test] = test_trajs[:, start_ind:start_ind + seq_length]
+
+        if return_full_obs:
+            test_trajs_full_raw = pts_full[test_inds]  # (n_test, T, D_full)
 
     # elif split_by == 'random':
     #     all_examples = np.zeros((pts.shape[0]*len(start_indices), seq_length, pts.shape[2]))
@@ -250,6 +269,9 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
 
         iterator.close()
 
+        if return_full_obs:
+            test_trajs_full_raw = pts_full[:, np.arange(int((train_percent + val_percent)*pts_full.shape[1]), pts_full.shape[1])]  # (n_traj, T_test, D_full)
+
     train_dataset = TimeSeriesDataset(torch.from_numpy(train_examples).type(dtype))
     val_dataset = TimeSeriesDataset(torch.from_numpy(val_examples).type(dtype))
     test_dataset = TimeSeriesDataset(torch.from_numpy(test_examples).type(dtype))
@@ -277,8 +299,13 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         test_trajs=TimeSeriesDataset(test_trajs),
         train_inds=train_inds,
         val_inds=val_inds,
-        test_inds=test_inds
+        test_inds=test_inds,
     )
+
+    if return_full_obs:
+        if isinstance(test_trajs_full_raw, np.ndarray):
+            test_trajs_full_raw = torch.from_numpy(test_trajs_full_raw).type(dtype)
+        trajs['test_trajs_full'] = TimeSeriesDataset(test_trajs_full_raw)
 
     # train_dataset = TimeSeriesDataset(torch.from_numpy(train_examples).type(dtype), torch.from_numpy(train_labels))
     # test_dataset = TimeSeriesDataset(torch.from_numpy(test_examples).type(dtype), torch.from_numpy(test_labels))

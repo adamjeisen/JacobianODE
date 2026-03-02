@@ -1,0 +1,28 @@
+defaults:
+  - base@_here_
+  - _self_
+
+data_type: dysts
+
+flow:
+  _target_: JacobianODE.dysts_sim.flows.Lorenz
+  # Other options:
+  # _target_: JacobianODE.dysts_sim.flows.VanDerPol
+  # _target_: JacobianODE.dysts_sim.flows.Lorenz96Small
+  dt: null
+
+trajectory_params:
+  n_periods: 12
+  method: Radau
+  resample: True
+  pts_per_period: 100
+  return_times: True
+  standardize: False
+  noise: 0.0
+  num_ics: 32
+  new_ic_mode: 'random'
+  traj_offset_sd: 2e-1
+  verbose: True
+
+postprocessing:
+  obs_noise: 0.05

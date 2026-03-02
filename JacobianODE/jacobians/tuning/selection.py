@@ -8,6 +8,7 @@ Reference: checkpoints/wandb_utils.py lines 276-323.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -142,8 +143,16 @@ def select_best_model(
     if apply_c3:
         criteria_applied.append("C3")
 
-    # Pick lowest trajectory_val_loss among survivors
-    best_idx = min(survivors, key=lambda i: candidates[i].trajectory_val_loss)
+    # Pick lowest trajectory_val_loss among survivors.
+    # Exclude NaN/inf: min() treats NaN as "smaller" than everything (nothing
+    # ever replaces it), so models with invalid traj loss would be wrongly selected.
+    valid_survivors = [
+        i for i in survivors if math.isfinite(candidates[i].trajectory_val_loss)
+    ]
+    if valid_survivors:
+        best_idx = min(valid_survivors, key=lambda i: candidates[i].trajectory_val_loss)
+    else:
+        best_idx = survivors[0]  # fallback if all have NaN/inf
 
     return SelectionResult(
         best_index=best_idx,

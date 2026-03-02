@@ -53,6 +53,22 @@ lightning:
   jac_norm_ord: 'fro'
   jac_consistency_weight: 0.0  # weight for ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
   fnn_weight: 0.0  # weight for FNN latent-geometry regularizer (Gilpin NeurIPS 2020)
+
+  # -----------------
+  # HOMOSCEDASTIC UNCERTAINTY WEIGHTING (Kendall et al. 2018)
+  # When enabled, the fixed weight for a loss group is replaced by a
+  # learnable log-variance s_i; the contribution becomes:
+  #   0.5 * exp(-s_i) * L_i + 0.5 * s_i
+  # log_var_init controls initialisation:
+  #   'naive' -> s_i = 0  (effective weight = 1 for all groups)
+  #   'auto'  -> s_i = log(initial_loss_magnitude)  (prevents first-step gradient spikes)
+  # -----------------
+  learn_r2_weight: false            # learn weight for R²-like loss group (traj + recon + latent_pred)
+  learn_loop_closure_weight: false  # learn weight for loop closure loss
+  learn_fnn_weight: false           # learn weight for FNN regularization loss
+  learn_jac_cons_weight: false      # learn weight for Jacobian consistency loss
+  learn_jac_norm_weight: false      # learn weight for Jacobian norm penalty
+  log_var_init: 'naive'             # 'naive' or 'auto'
   
   # -----------------
   # LOOP CLOSURE TRAINING

@@ -1,0 +1,29 @@
+# Base configuration for all data types
+# Data should be in format: (n_trials, n_timepoints, n_dimensions)
+
+flow:
+  random_state: 42
+
+postprocessing:
+  obs_noise: 0
+  filter_data: false
+  low_pass: 10
+  high_pass: null
+  normalize: false
+  # Metadata fields populated at runtime by postprocess_data / run_encoder.
+  noise_scale_factor: null
+  mu: null
+  sigma: null
+
+train_test_params:
+  seq_length: 50        # Length of sequences fed to the encoder
+  seq_spacing: 1        # Spacing between sequence start points
+  split_by: 'trajectory'  # 'trajectory' or 'time'
+  train_percent: 0.7
+  test_percent: 0.1
+  dtype: torch.FloatTensor
+  verbose: true
+  delay_embedding_params:
+    observed_indices: 'all'
+    n_delays: 1
+    delay_spacing: 1

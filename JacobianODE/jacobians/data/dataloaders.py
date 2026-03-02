@@ -23,6 +23,7 @@ def create_dataloaders(
     num_workers: int = 2,
     persistent_workers: bool = True,
     pin_memory: bool = True,
+    return_full_obs: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
     """Create PyTorch DataLoaders for training, validation, and testing.
 
@@ -37,6 +38,10 @@ def create_dataloaders(
         num_workers: Number of worker processes for data loading. Defaults to 2.
         persistent_workers: Keep workers alive between epochs. Defaults to True.
         pin_memory: Pin memory for faster GPU transfer. Defaults to True.
+        return_full_obs: When True, also store full-dimensional (unfiltered) test
+            trajectories in ``trajs['test_trajs_full']``.  Only has an effect when
+            ``delay_embedding_params.observed_indices`` filters some dimensions.
+            Defaults to False.
 
     Returns:
         Tuple of (train_dataloader, val_dataloader, test_dataloader, trajs) where:
@@ -73,7 +78,7 @@ def create_dataloaders(
         del cfg.data.train_test_params[key]
 
     train_dataset, val_dataset, test_dataset, trajs = generate_train_and_test_sets(
-        values, **cfg.data.train_test_params
+        values, **cfg.data.train_test_params, return_full_obs=return_full_obs
     )
 
     batch_size = cfg.training.batch_size

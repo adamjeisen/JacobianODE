@@ -1,0 +1,26 @@
+# State Space Model (LRU / S4-style) sequence encoder
+# n_input is set at runtime from the observation dimension.
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.SSMSequenceEncoder
+  n_input: null         # set at runtime from data
+  n_latent: 10          # N_LATENT: latent space dimension
+  d_model: 64           # internal model dimension
+  d_state: 64           # SSM state dimension per channel
+  n_layers: 3           # number of LRU layers
+  r_min: 0.0            # LRU: minimum initial |lambda|  (0 = may decay to zero)
+  r_max: 0.99           # LRU: maximum initial |lambda|  (close to 1 = long memory)
+  ffn_expand: 2         # LRU: FFN hidden dim = d_model * ffn_expand
+  dropout: 0.1
+  use_positional_encoding: False  # SSMs are inherently position-aware; disabled by default
+  positional_encoding_type: sinusoidal
+
+# ---- Decoder head configuration ----
+use_same_state_decoder: True
+use_next_state_decoder: False
+decoder_hidden_dim: 128
+decoder_n_layers: 2
+
+context_margin: 0
+# Burn-in for next-state prediction: skip first N steps (partial obs may need context)
+next_state_burn_in: 0

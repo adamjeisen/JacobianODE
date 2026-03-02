@@ -1,0 +1,61 @@
+batch_size: 32
+run_number: 0
+
+lightning:
+  _target_: JacobianODE.encoder_only.model.LitEncoderDecoder
+
+  # -----------------
+  # OPTIMIZATION
+  # -----------------
+  optimizer: 'AdamW'
+  optimizer_kwargs:
+    lr: 1e-4
+    weight_decay: 1e-4
+  use_scheduler: True
+  min_lr: 1e-6
+  lr_scheduler_patience: 10
+  lr_scheduler_factor: 0.5
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: 'norm'
+
+  # -----------------
+  # DECODER OBJECTIVE WEIGHTS
+  # -----------------
+  same_state_weight: 1.0   # weight for decode(z_t) ≈ x_t
+  next_state_weight: 1.0   # weight for decode(z_t) ≈ x_{t+1} (only if use_next_state_decoder)
+
+  # -----------------
+  # REGULARISATION WEIGHTS
+  # -----------------
+  # Set to 0 to disable; >0 to enable with that weight
+  fnn_weight: 0.0           # FNN latent-geometry regulariser (Gilpin NeurIPS 2020)
+  amplification_weight: 0.0 # Noise amplification regulariser
+  decov_weight: 0.0         # DeCov off-diagonal covariance penalty (Cogswell ICLR 2016)
+
+  # Advanced: amplification regulariser settings
+  amplification_n_neighbors: 10
+  amplification_max_T: 5
+
+
+logger:
+  _target_: pytorch_lightning.loggers.WandbLogger
+  save_dir: null
+  log_model: True
+
+trainer_params:
+  limit_train_batches: 500
+  limit_val_batches: 100
+  max_epochs: 1000
+  accumulate_grad_batches: 4
+
+early_stopping:
+  early_stopping_patience: 5
+  early_stopping_mode: 'percent_thresh'
+  percent_thresh: 0.005
+  monitor: 'mean val loss'
+  mode: 'min'
+
+model_checkpoint:
+  save_top_k: 1
+  monitor: 'mean val loss'
+  mode: 'min'

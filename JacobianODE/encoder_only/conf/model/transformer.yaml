@@ -1,0 +1,27 @@
+# Transformer-based sequence encoder
+# n_input is set at runtime from the observation dimension.
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.TransformerSequenceEncoder
+  n_input: null         # set at runtime from data
+  n_latent: 10          # N_LATENT: latent space dimension
+  d_model: 64           # internal Transformer dimension
+  n_heads: 4            # number of attention heads  (d_model must be divisible by n_heads)
+  n_layers: 3           # number of Transformer encoder layers
+  dim_feedforward: 128  # FFN hidden dim inside each layer
+  dropout: 0.1
+  use_positional_encoding: True
+  positional_encoding_type: sinusoidal  # 'sinusoidal' or 'learned'
+
+# ---- Decoder head configuration ----
+# These are passed to LitEncoderDecoder at runtime.
+use_same_state_decoder: True   # reconstruct x_t from z_t
+use_next_state_decoder: False  # predict x_{t+1} from z_t
+decoder_hidden_dim: 128
+decoder_n_layers: 2
+
+# Number of leading timesteps to discard from encoder output.
+# Increase if the causal encoder needs a warm-up context window.
+context_margin: 0
+# Burn-in for next-state prediction: skip first N steps (partial obs may need context)
+next_state_burn_in: 0
