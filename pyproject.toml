@@ -43,6 +43,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "ipdb",
     "ipykernel>=7.1.0",
     "pytest>=9.0.2",
 ]

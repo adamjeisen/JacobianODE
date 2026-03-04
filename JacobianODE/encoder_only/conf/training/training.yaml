@@ -29,6 +29,8 @@ lightning:
   # -----------------
   # Set to 0 to disable; >0 to enable with that weight
   fnn_weight: 0.0           # FNN latent-geometry regulariser (Gilpin NeurIPS 2020)
+  fnn_normalize: false      # Normalize FNN loss by activation variance
+  fnn_elementwise_regularization: false  # Elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
   amplification_weight: 0.0 # Noise amplification regulariser
   decov_weight: 0.0         # DeCov off-diagonal covariance penalty (Cogswell ICLR 2016)
 

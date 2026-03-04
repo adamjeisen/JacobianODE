@@ -21,5 +21,17 @@ _jupyter/Encoder-Only*/         – Example and sweep notebooks
 """
 
 from .model import LitEncoderDecoder
+from .pretrained import (
+    PretrainedEncoderAdapter,
+    PretrainedJacRunResult,
+    load_pretrained_encoder,
+    load_pretrained_jac_run,
+)
 
-__all__ = ["LitEncoderDecoder"]
+__all__ = [
+    "LitEncoderDecoder",
+    "PretrainedEncoderAdapter",
+    "PretrainedJacRunResult",
+    "load_pretrained_encoder",
+    "load_pretrained_jac_run",
+]

@@ -22,6 +22,45 @@ from ..lightning_base import LitBase
 from ..training.model_factory import make_model
 from .legacy import reverse_wandb_run
 
+# Lazy import to avoid circular import when encoder_only loads from jacobians
+def _make_encoder_model(cfg, n_obs, save_dir, verbose):
+    from hydra.utils import instantiate
+    encoder = instantiate(cfg.model.encoder, n_input=n_obs)
+    # n_obs_pred: for next_state_decoder; when using delay embedding, should be raw obs
+    # dim (before embedding), not full delay-embedded dim (n_obs)
+    n_obs_pred = cfg.model.get("n_obs_pred")
+    if n_obs_pred is None:
+        delay_params = cfg.data.train_test_params.get("delay_embedding_params") or {}
+        n_delays = int(delay_params.get("n_delays", 1))
+        if n_delays > 1:
+            obs_indices = delay_params.get("observed_indices", [0])
+            if obs_indices == "all":
+                n_obs_pred = n_obs // n_delays  # raw dim from delay embedding
+            else:
+                n_obs_pred = len(obs_indices)
+        else:
+            n_obs_pred = n_obs
+    else:
+        n_obs_pred = int(n_obs_pred)
+    k_steps_ahead = int(cfg.model.get("k_steps_ahead", 1))
+    lit_model = instantiate(
+        cfg.training.lightning,
+        encoder=encoder,
+        n_obs=n_obs,
+        n_obs_pred=n_obs_pred,
+        k_steps_ahead=k_steps_ahead,
+        context_margin=int(cfg.model.get("context_margin", 0)),
+        next_state_burn_in=int(cfg.model.get("next_state_burn_in", 0)),
+        use_same_state_decoder=bool(cfg.model.get("use_same_state_decoder", True)),
+        use_next_state_decoder=bool(cfg.model.get("use_next_state_decoder", False)),
+        decoder_hidden_dim=int(cfg.model.get("decoder_hidden_dim", 128)),
+        decoder_n_layers=int(cfg.model.get("decoder_n_layers", 2)),
+    )
+    if verbose:
+        total_params = sum(p.numel() for p in lit_model.parameters())
+        logger.info(f"Created encoder-only model with {total_params:,} parameters")
+    return lit_model
+
 logger = logging.getLogger(__name__)
 
 # Cutoff date for legacy run handling (January 31st 2025 at 2pm EST)
@@ -172,8 +211,9 @@ def _load_recent_run(
         sigma = result.sigma
         noise_scale_factor = result.noise_scale_factor
         # Create train and test sets
+        return_full = "LitEncoderDecoder" in str(cfg.training.lightning.get("_target_", ""))
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
-            cfg, values
+            cfg, values, return_full_obs=return_full
         )
     else:
         values = None
@@ -192,21 +232,39 @@ def _load_recent_run(
             noise_scale_factor = 1.0
 
     # Make model
-    if "NeuralODE" in cfg.model.params._target_:
-        cfg.model.params.dt = float(dt)
+    target_str = str(cfg.training.lightning.get("_target_", ""))
+    is_encoder_only = "LitEncoderDecoder" in target_str
 
-    if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
-        lit_model = make_model(
-            cfg, dt, eq=None, save_dir=save_dir,
-            mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
-            verbose=verbose,
+    if is_encoder_only:
+        if trajs is not None:
+            n_obs = trajs["train_trajs"].sequence.shape[-1]
+        else:
+            # Infer from config when no data generated (e.g. generate_data=False)
+            delay_params = cfg.data.train_test_params.delay_embedding_params
+            n_delays = int(delay_params.get("n_delays", 1))
+            obs_indices = delay_params.get("observed_indices", [0])
+            n_obs = n_delays * len(obs_indices)
+        lit_model = _make_encoder_model(cfg, n_obs, save_dir, verbose)
+        load_checkpoint(
+            run, cfg, lit_model, save_dir=save_dir,
+            loss_key="mean val loss", verbose=verbose,
         )
     else:
-        lit_model = make_model(
-            cfg, dt, eq=eq, project=project, save_dir=save_dir,
-            mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
-            verbose=verbose,
-        )
+        if "params" in cfg.model and "NeuralODE" in str(cfg.model.params.get("_target_", "")):
+            cfg.model.params.dt = float(dt)
+
+        if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
+            lit_model = make_model(
+                cfg, dt, eq=None, save_dir=save_dir,
+                mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
+                verbose=verbose,
+            )
+        else:
+            lit_model = make_model(
+                cfg, dt, eq=eq, project=project, save_dir=save_dir,
+                mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
+                verbose=verbose,
+            )
 
     return (
         run,
@@ -363,9 +421,27 @@ def load_checkpoint(
         epoch = mean_val_losses[
             np.argmin([mvl["mean_val_loss"] for mvl in mean_val_losses])
         ]["epoch"]
-        checkpoint = [f for f in checkpoint_files if f.startswith(f"epoch={epoch}-")][0]
+
+    # W&B may return epoch as float (e.g. 4.0); checkpoint filenames use int (epoch=4-)
+    epoch_int = int(epoch)
+    epoch_matches = [f for f in checkpoint_files if f.startswith(f"epoch={epoch_int}-")]
+    if epoch_matches:
+        checkpoint = epoch_matches[0]
     else:
-        checkpoint = [f for f in checkpoint_files if f.startswith(f"epoch={epoch}-")][0]
+        # Fallback: best epoch from history may not have a saved checkpoint (e.g. save_top_k=1
+        # replaced it). Use the checkpoint with the highest epoch among those available.
+        epoch_files = [f for f in checkpoint_files if f.startswith("epoch=")]
+        if not epoch_files:
+            raise FileNotFoundError(
+                f"No checkpoint files matching epoch=* found in {checkpoint_dir}. "
+                f"Available: {checkpoint_files}. "
+                f"Best epoch from W&B was {epoch}."
+            )
+        checkpoint = epoch_files[-1]
+        if verbose:
+            logger.warning(
+                f"No checkpoint for best epoch {epoch}; using {checkpoint} instead."
+            )
 
     if verbose:
         logger.info(f"Loading checkpoint from epoch {epoch}")

@@ -38,10 +38,11 @@ def create_dataloaders(
         num_workers: Number of worker processes for data loading. Defaults to 2.
         persistent_workers: Keep workers alive between epochs. Defaults to True.
         pin_memory: Pin memory for faster GPU transfer. Defaults to True.
-        return_full_obs: When True, also store full-dimensional (unfiltered) test
-            trajectories in ``trajs['test_trajs_full']``.  Only has an effect when
-            ``delay_embedding_params.observed_indices`` filters some dimensions.
-            Defaults to False.
+        return_full_obs: When True, also store full-dimensional (unfiltered)
+            trajectories for each split in ``trajs['train_trajs_full']``,
+            ``trajs['val_trajs_full']``, and ``trajs['test_trajs_full']``.
+            Only has an effect when ``delay_embedding_params.observed_indices``
+            filters some dimensions.  Defaults to False.
 
     Returns:
         Tuple of (train_dataloader, val_dataloader, test_dataloader, trajs) where:

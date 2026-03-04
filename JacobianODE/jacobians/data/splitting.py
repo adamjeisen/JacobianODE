@@ -147,10 +147,11 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         Whether to print progress information, by default False
     return_full_obs : bool, optional
         When True and delay_embedding_params filters observed_indices, also
-        store the full-dimensional (unfiltered) test trajectories in the
-        returned trajs dict as ``trajs['test_trajs_full']``.  The same
-        train/test split indices are used, so the sequences align with
-        ``trajs['test_trajs']``.  Defaults to False.
+        store the full-dimensional (unfiltered) trajectories for each split
+        in the returned trajs dict as ``trajs['train_trajs_full']``,
+        ``trajs['val_trajs_full']``, and ``trajs['test_trajs_full']``.
+        The same split indices are used, so sequences align with the
+        corresponding filtered trajs.  Defaults to False.
 
     Returns
     -------
@@ -159,7 +160,8 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         - train_dataset, val_dataset, test_dataset are TimeSeriesDataset objects
         - trajs is a dict containing the full trajectories and indices for each
           split; when return_full_obs=True the dict also contains
-          ``test_trajs_full`` with all observed dimensions.
+          ``train_trajs_full``, ``val_trajs_full``, and ``test_trajs_full``
+          with all observed dimensions.
 
     Raises
     ------
@@ -216,6 +218,8 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
             test_examples[i*n_test:(i + 1)*n_test] = test_trajs[:, start_ind:start_ind + seq_length]
 
         if return_full_obs:
+            train_trajs_full_raw = pts_full[train_inds]  # (n_train, T, D_full)
+            val_trajs_full_raw = pts_full[val_inds]  # (n_val, T, D_full)
             test_trajs_full_raw = pts_full[test_inds]  # (n_test, T, D_full)
 
     # elif split_by == 'random':
@@ -270,6 +274,8 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         iterator.close()
 
         if return_full_obs:
+            train_trajs_full_raw = pts_full[:, np.arange(0, int(train_percent*pts_full.shape[1]))]  # (n_traj, T_train, D_full)
+            val_trajs_full_raw = pts_full[:, np.arange(int(train_percent*pts_full.shape[1]), int((train_percent + val_percent)*pts_full.shape[1]))]  # (n_traj, T_val, D_full)
             test_trajs_full_raw = pts_full[:, np.arange(int((train_percent + val_percent)*pts_full.shape[1]), pts_full.shape[1])]  # (n_traj, T_test, D_full)
 
     train_dataset = TimeSeriesDataset(torch.from_numpy(train_examples).type(dtype))
@@ -303,9 +309,14 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
     )
 
     if return_full_obs:
-        if isinstance(test_trajs_full_raw, np.ndarray):
-            test_trajs_full_raw = torch.from_numpy(test_trajs_full_raw).type(dtype)
-        trajs['test_trajs_full'] = TimeSeriesDataset(test_trajs_full_raw)
+        for key, raw in [
+            ('train_trajs_full', train_trajs_full_raw),
+            ('val_trajs_full', val_trajs_full_raw),
+            ('test_trajs_full', test_trajs_full_raw),
+        ]:
+            if isinstance(raw, np.ndarray):
+                raw = torch.from_numpy(raw).type(dtype)
+            trajs[key] = TimeSeriesDataset(raw)
 
     # train_dataset = TimeSeriesDataset(torch.from_numpy(train_examples).type(dtype), torch.from_numpy(train_labels))
     # test_dataset = TimeSeriesDataset(torch.from_numpy(test_examples).type(dtype), torch.from_numpy(test_labels))

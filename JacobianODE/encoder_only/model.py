@@ -10,7 +10,11 @@ x : (B, T, D_obs)
     ↓  encoder  [TransformerSequenceEncoder | SSMSequenceEncoder | TCNSequenceEncoder]
 z : (B, T, N_LATENT)
     ↓  same_state_decoder  (optional MLP)           ↓  next_state_decoder  (optional MLP)
-x̂ : (B, T, D_obs)                              x̂_{t+1} : (B, T-1, D_obs)
+x̂ : (B, T, D_obs)                  x̂_{t+1..t+k} : (B, T-k, k * D_obs_pred)
+
+When k_steps_ahead > 1, the next-state decoder predicts all k future steps jointly
+from z_t: [x_{t+1}, ..., x_{t+k}].  D_obs_pred (n_obs_pred) is the raw observation
+dimension for the targets, which may differ from D_obs when delay embedding is used.
 
 Regularisation losses applied to the latent sequence z:
   - FNN   : false-nearest-neighbour (Gilpin NeurIPS 2020)
@@ -54,6 +58,12 @@ class LitEncoderDecoder(L.LightningModule):
         Loss coefficient for the next-state prediction objective.
     fnn_weight : float
         Loss coefficient for the FNN regulariser.  0 disables it.
+    fnn_normalize : bool
+        Whether to normalize the FNN loss by the variance of the activations.
+    fnn_elementwise_regularization : bool
+        Whether to use elementwise regularization in FNN.
+        If True, the loss is computed as E[W * A^2].
+        If False, the loss is computed as E[W] * E[A^2].
     amplification_weight : float
         Loss coefficient for the noise-amplification regulariser.  0 disables it.
     decov_weight : float
@@ -88,6 +98,19 @@ class LitEncoderDecoder(L.LightningModule):
         prediction loss. With partial observations, the encoder may need
         several steps to form a reliable latent before predicting the
         next observation. 0 means no burn-in.
+    k_steps_ahead : int
+        Number of future steps predicted by the next-state decoder.
+        When k=1 (default), the decoder predicts x_{t+1} only.
+        When k>1, the decoder jointly predicts [x_{t+1}, ..., x_{t+k}]
+        as a flat vector of size k * n_obs_pred, enforcing multi-step
+        consistency in the latent representation.
+    n_obs_pred : int, optional
+        Raw observation dimension used as next-state prediction targets.
+        Defaults to n_obs (= input dim).  Set this to the number of
+        observed variables (before delay embedding) when delay embedding
+        is active, so that targets are un-embedded: the decoder predicts
+        [x_{t+1}, ..., x_{t+k}] as raw observations rather than
+        delay-embedded states.
     """
 
     def __init__(
@@ -101,6 +124,8 @@ class LitEncoderDecoder(L.LightningModule):
         same_state_weight: float = 1.0,
         next_state_weight: float = 1.0,
         fnn_weight: float = 0.0,
+        fnn_normalize: bool = False,
+        fnn_elementwise_regularization: bool = False,
         amplification_weight: float = 0.0,
         decov_weight: float = 0.0,
         amplification_n_neighbors: int = 10,
@@ -115,6 +140,8 @@ class LitEncoderDecoder(L.LightningModule):
         gradient_clip_algorithm: str = "norm",
         context_margin: int = 0,
         next_state_burn_in: int = 0,
+        k_steps_ahead: int = 1,
+        n_obs_pred: Optional[int] = None,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["encoder"])
@@ -124,25 +151,32 @@ class LitEncoderDecoder(L.LightningModule):
         self.n_obs = n_obs
         self.context_margin = context_margin
         self.next_state_burn_in = next_state_burn_in
+        self.k_steps_ahead = k_steps_ahead
+        self.n_obs_pred = n_obs_pred if n_obs_pred is not None else n_obs
 
         self.use_same_state_decoder = use_same_state_decoder
         self.use_next_state_decoder = use_next_state_decoder
         self.same_state_weight = same_state_weight
         self.next_state_weight = next_state_weight
         self.fnn_weight = fnn_weight
+        self.fnn_normalize = fnn_normalize
+        self.fnn_elementwise_regularization = fnn_elementwise_regularization
         self.amplification_weight = amplification_weight
         self.decov_weight = decov_weight
         self.amplification_n_neighbors = amplification_n_neighbors
         self.amplification_max_T = amplification_max_T
 
         # Build decoder heads
+        # same-state: z_t → x_t  (full obs dim, including any delay embedding)
+        # next-state: z_t → [x_{t+1}, ..., x_{t+k}]  (k * raw obs dim)
         if use_same_state_decoder:
             self.same_state_decoder = self._build_decoder(
-                decoder_hidden_dim, decoder_n_layers
+                decoder_hidden_dim, decoder_n_layers, out_dim=self.n_obs
             )
         if use_next_state_decoder:
             self.next_state_decoder = self._build_decoder(
-                decoder_hidden_dim, decoder_n_layers
+                decoder_hidden_dim, decoder_n_layers,
+                out_dim=self.k_steps_ahead * self.n_obs_pred,
             )
 
         if not (use_same_state_decoder or use_next_state_decoder):
@@ -171,15 +205,15 @@ class LitEncoderDecoder(L.LightningModule):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_decoder(self, hidden_dim: int, n_layers: int) -> nn.Sequential:
-        """Build a pointwise MLP: N_LATENT -> (hidden)^n_layers -> D_obs."""
+    def _build_decoder(self, hidden_dim: int, n_layers: int, out_dim: int) -> nn.Sequential:
+        """Build a pointwise MLP: N_LATENT -> (hidden)^n_layers -> out_dim."""
         layers: list[nn.Module] = []
         in_dim = self.n_latent
         for _ in range(n_layers):
             layers.append(nn.Linear(in_dim, hidden_dim))
             layers.append(nn.GELU())
             in_dim = hidden_dim
-        layers.append(nn.Linear(in_dim, self.n_obs))
+        layers.append(nn.Linear(in_dim, out_dim))
         return nn.Sequential(*layers)
 
     def _latent_utilization(self, z: torch.Tensor) -> torch.Tensor:
@@ -266,24 +300,37 @@ class LitEncoderDecoder(L.LightningModule):
                 log_dict[f"{prefix}/same_state_r2"] = r2_score(x_valid, x_hat)
 
         # ----------------------------------------------------------
-        # Next-state prediction:  decode(z_t) ≈ x_{t+1}
-        # With burn-in: skip the first next_state_burn_in predictions
-        # (encoder may need context before predicting next step in partial obs)
+        # Next-state prediction:  decode(z_t) ≈ [x_{t+1}, ..., x_{t+k}]
+        # With burn-in: skip the first next_state_burn_in predictions.
+        # Targets use the first n_obs_pred dims of x (raw obs before any
+        # delay embedding), so k_steps_ahead > 1 forces multi-step consistency
+        # without the redundancy of predicting shifted delay-embedded states.
         # ----------------------------------------------------------
         if self.use_next_state_decoder:
             burn_in = self.next_state_burn_in
-            # z_t -> x_{t+1}: align z[:, :-1] with x[:, 1:]
-            # After burn-in: use z[:, burn_in:-1] and x[:, burn_in+1:]
+            k = self.k_steps_ahead
             T_valid = z_valid.shape[1]
-            if burn_in < T_valid - 1:
-                z_for_next = z_valid[:, burn_in:-1]   # (B, T'-1-burn_in, D)
-                x_next = x_valid[:, burn_in + 1:]    # (B, T'-1-burn_in, D)
-                x_next_hat = self.next_state_decoder(z_for_next)
-                next_loss = normalized_mse(x_next, x_next_hat)
+            T_pred = T_valid - burn_in - k  # number of valid prediction positions
+            if T_pred > 0:
+                z_for_next = z_valid[:, burn_in:burn_in + T_pred]  # (B, T_pred, N_LATENT)
+
+                # Stack k future raw-obs targets: (B, T_pred, k, n_obs_pred)
+                target_steps = torch.stack(
+                    [x_valid[:, burn_in + j:burn_in + j + T_pred, :self.n_obs_pred]
+                     for j in range(1, k + 1)],
+                    dim=2,
+                )
+                target_flat = target_steps.reshape(
+                    target_steps.shape[0], target_steps.shape[1],
+                    k * self.n_obs_pred,
+                )  # (B, T_pred, k * n_obs_pred)
+
+                x_next_hat = self.next_state_decoder(z_for_next)  # (B, T_pred, k * n_obs_pred)
+                next_loss = normalized_mse(target_flat, x_next_hat)
                 total_loss = total_loss + self.next_state_weight * next_loss
                 log_dict[f"{prefix}/next_state_loss"] = next_loss.detach()
                 with torch.no_grad():
-                    log_dict[f"{prefix}/next_state_r2"] = r2_score(x_next, x_next_hat)
+                    log_dict[f"{prefix}/next_state_r2"] = r2_score(target_flat, x_next_hat)
             else:
                 # No valid predictions after burn-in; skip this loss
                 log_dict[f"{prefix}/next_state_loss"] = x.new_tensor(float("nan"))
@@ -304,7 +351,11 @@ class LitEncoderDecoder(L.LightningModule):
             z_centered = z_flat - z_flat.mean(dim=0, keepdim=True)
             _, _, Vh = torch.linalg.svd(z_centered, full_matrices=False)
             z_pca = z_centered @ Vh.T  # (n, min(n, n_latent)); axes ordered by variance
-            fnn_loss = loss_false(z_pca)
+            fnn_loss = loss_false(
+                z_pca,
+                normalize=self.fnn_normalize,
+                elementwise_regularization=self.fnn_elementwise_regularization,
+            )
             total_loss = total_loss + self.fnn_weight * fnn_loss
             log_dict[f"{prefix}/fnn_loss"] = fnn_loss.detach()
 

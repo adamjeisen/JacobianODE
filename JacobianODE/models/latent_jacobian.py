@@ -15,6 +15,8 @@ Architecture:
         -> Decoder -> Predicted observations
 """
 
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -439,6 +441,10 @@ class LitLatentJacobianODE(LitBase):
         # back through the encoder, penalising unpredictable latent dims).
         latent_pred_loss = normalized_mse(z_true_crop, z_pred_crop)
         metric_vals['latent_pred_loss'] = latent_pred_loss
+        with torch.no_grad():
+            z_pred_flat = z_pred_crop.reshape(z_pred_crop.shape[0], -1)
+            z_true_flat = z_true_crop.reshape(z_true_crop.shape[0], -1)
+            metric_vals['latent_pred_r2'] = r2_score(z_true_flat, z_pred_flat)
 
         if return_decoded:
             return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
@@ -874,7 +880,7 @@ class LitLatentJacobianODE(LitBase):
 
                 le_mse = torch.mean((pred_top_k - true_le) ** 2)
                 self.log(
-                    f"{prefix} lyapunov_mse", le_mse,
+                    f"{prefix}/lyapunov_mse", le_mse,
                     sync_dist=sync_dist, add_dataloader_idx=False,
                     **log_kwargs,
                 )
@@ -882,7 +888,7 @@ class LitLatentJacobianODE(LitBase):
                 # Log individual exponents
                 for i, (pred, true) in enumerate(zip(pred_top_k, true_le)):
                     self.log(
-                        f"{prefix} lyapunov_{i} (pred)", pred.item(),
+                        f"{prefix}/lyapunov_{i}_pred", pred.item(),
                         sync_dist=sync_dist, add_dataloader_idx=False,
                         **log_kwargs,
                     )
@@ -890,12 +896,10 @@ class LitLatentJacobianODE(LitBase):
             pass  # Don't fail training/validation on diagnostic errors
 
     def _log_latent_utilization(self, batch, prefix, **log_kwargs):
-        """Log sum of normalized latent variances (utilization score).
+        """Log entropy-based latent utilization score in [0, 1].
 
-        The per-dimension variances are divided by the largest variance
-        and summed.  A value of ~1 means only one dimension is active;
-        a value approaching ``D_latent`` means all dimensions are
-        equally utilized.
+        1.0 = all latent dimensions carry equal variance.
+        0.0 = a single dimension carries all variance.
 
         Parameters
         ----------
@@ -907,13 +911,13 @@ class LitLatentJacobianODE(LitBase):
         try:
             with torch.no_grad():
                 z = self.encode_trajectory(batch)
-                z_var = z.var(dim=(0, 1))  # (D_latent,)
-                max_var = z_var.max()
-                if max_var > 0:
-                    utilization = (z_var / max_var).sum().item()
-                else:
-                    utilization = 0.0
-                self.log(f"{prefix} latent_utilization", utilization, **log_kwargs)
+                var = z.float().var(dim=(0, 1)).clamp(min=1e-10)  # (D_latent,)
+                p = var / var.sum()
+                entropy = -(p * torch.log(p)).sum()
+                n_latent = z.shape[-1]
+                max_entropy = math.log(n_latent) if n_latent > 1 else 1.0
+                utilization = (entropy / max_entropy).item()
+                self.log(f"{prefix}/latent_utilization", utilization, **log_kwargs)
         except Exception:
             pass
 
@@ -933,38 +937,41 @@ class LitLatentJacobianODE(LitBase):
 
         for pred_type, ret_dict in train_rets.items():
             loss, metric_vals = ret_dict['loss'], ret_dict['metric_vals']
-            self.log(f"{pred_type} train_loss", loss, **log_kwargs)
+            self.log(f"train/{pred_type}_loss", loss, **log_kwargs)
             for metric, val in metric_vals.items():
                 if pred_type != 'trajectory':
                     continue
-                self.log(f"{pred_type} train {metric}", val, **log_kwargs)
+                self.log(f"train/{pred_type}_{metric}", val, **log_kwargs)
 
-        self.log("total train loss", total_loss, **log_kwargs)
+        self.log("train/total_loss", total_loss, **log_kwargs)
         if jac_norm is not None:
-            self.log("train jac norm", jac_norm, **log_kwargs)
-        self.log("train l1 norm", l1_loss, **log_kwargs)
+            self.log("train/jac_norm", jac_norm, **log_kwargs)
+        self.log("train/l1_norm", l1_loss, **log_kwargs)
         if recon_loss is not None:
-            self.log("train recon_loss", recon_loss, **log_kwargs)
+            self.log("train/recon_loss", recon_loss, **log_kwargs)
         if latent_pred_loss is not None:
-            self.log("train latent_pred_loss", latent_pred_loss, **log_kwargs)
+            self.log("train/latent_pred_loss", latent_pred_loss, **log_kwargs)
+        latent_pred_r2 = train_rets.get('trajectory', {}).get('metric_vals', {}).get('latent_pred_r2')
+        if latent_pred_r2 is not None:
+            self.log("train/latent_pred_r2", latent_pred_r2, **log_kwargs)
         if jac_cons_loss is not None:
-            self.log("train jac_cons_loss", jac_cons_loss, **log_kwargs)
+            self.log("train/jac_cons_loss", jac_cons_loss, **log_kwargs)
         if fnn_loss is not None:
-            self.log("train fnn_loss", fnn_loss, **log_kwargs)
+            self.log("train/fnn_loss", fnn_loss, **log_kwargs)
 
         if self.learn_r2_weight:
-            self.log("log_var r2", self.log_var_r2.squeeze(), **log_kwargs)
+            self.log("train/log_var_r2", self.log_var_r2.squeeze(), **log_kwargs)
         if self.learn_loop_closure_weight:
-            self.log("log_var loop_closure", self.log_var_loop_closure.squeeze(), **log_kwargs)
+            self.log("train/log_var_loop_closure", self.log_var_loop_closure.squeeze(), **log_kwargs)
         if self.learn_fnn_weight:
-            self.log("log_var fnn", self.log_var_fnn.squeeze(), **log_kwargs)
+            self.log("train/log_var_fnn", self.log_var_fnn.squeeze(), **log_kwargs)
         if self.learn_jac_cons_weight:
-            self.log("log_var jac_cons", self.log_var_jac_cons.squeeze(), **log_kwargs)
+            self.log("train/log_var_jac_cons", self.log_var_jac_cons.squeeze(), **log_kwargs)
         if self.learn_jac_norm_weight:
-            self.log("log_var jac_norm", self.log_var_jac_norm.squeeze(), **log_kwargs)
+            self.log("train/log_var_jac_norm", self.log_var_jac_norm.squeeze(), **log_kwargs)
 
         if self.teacher_forcing_annealing:
-            self.log("alpha teacher forcing", self.alpha_teacher_forcing, **log_kwargs)
+            self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs)
 
         self._log_lyapunov_comparison(batch, "train", **log_kwargs)
         self._log_latent_utilization(batch, "train", **log_kwargs)
@@ -979,30 +986,37 @@ class LitLatentJacobianODE(LitBase):
         """
         for pred_type, ret_dict in val_rets.items():
             loss, metric_vals = ret_dict['loss'], ret_dict['metric_vals']
-            self.log(f"{pred_type} val_loss", loss, sync_dist=sync_dist, add_dataloader_idx=False)
+            self.log(f"val/{pred_type}_loss", loss, sync_dist=sync_dist, add_dataloader_idx=False)
             for metric, val in metric_vals.items():
                 if pred_type != 'trajectory':
                     continue
-                self.log(f"{pred_type} val {metric}", val, sync_dist=sync_dist, add_dataloader_idx=False)
+                self.log(f"val/{pred_type}_{metric}", val, sync_dist=sync_dist, add_dataloader_idx=False)
 
         mean_val_loss = torch.stack(
             [val_rets[pt]['loss'] for pt in val_rets]
         ).mean()
+        # Canonical name used by early stopping, checkpoint, and loader
         self.log("mean val loss", mean_val_loss, sync_dist=sync_dist)
+        # Alias used by traj checkpoint in trainer.py
+        self.log("trajectory val_loss", val_rets['trajectory']['loss'], sync_dist=sync_dist)
 
         if val_loop_closure is not None:
             self.log(
-                "val loop closure loss",
+                "val/loop_closure_loss",
                 val_loop_closure['loss'],
                 sync_dist=sync_dist,
                 add_dataloader_idx=False,
             )
 
         if val_recon_loss is not None:
-            self.log("val recon_loss", val_recon_loss, sync_dist=sync_dist,
+            self.log("val/recon_loss", val_recon_loss, sync_dist=sync_dist,
                      add_dataloader_idx=False)
         if val_latent_pred_loss is not None:
-            self.log("val latent_pred_loss", val_latent_pred_loss, sync_dist=sync_dist,
+            self.log("val/latent_pred_loss", val_latent_pred_loss, sync_dist=sync_dist,
+                     add_dataloader_idx=False)
+        val_latent_pred_r2 = val_rets.get('trajectory', {}).get('metric_vals', {}).get('latent_pred_r2')
+        if val_latent_pred_r2 is not None:
+            self.log("val/latent_pred_r2", val_latent_pred_r2, sync_dist=sync_dist,
                      add_dataloader_idx=False)
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)

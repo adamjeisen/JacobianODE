@@ -15,7 +15,13 @@ DeCov regularizer based on: Cogswell et al. ICLR 2016.
 import torch
 import torch.nn as nn
 
-def loss_false(code_batch: torch.Tensor, k: int = 1, norm: bool = False) -> torch.Tensor:
+def loss_false(
+        code_batch: torch.Tensor,
+        k: int = 1,
+        normalize: bool = False,
+        return_fnn_weights: bool = False,
+        elementwise_regularization: bool = False,
+    ) -> torch.Tensor:
     """Activity regularizer based on the False-Nearest-Neighbor algorithm.
 
     For each embedding dimension d (from 1 to n_latent), computes pairwise
@@ -29,6 +35,14 @@ def loss_false(code_batch: torch.Tensor, k: int = 1, norm: bool = False) -> torc
         (batch_size, n_latent) tensor of encoded latent representations.
     k : int
         Number of nearest neighbors to consider. Default 1.
+    normalize : bool
+        Whether to normalize the loss by the variance of the activations.
+    return_fnn_weights : bool
+        Whether to return the FNN weights.
+    elementwise_regularization : bool
+        Whether to use elementwise regularization.
+        If True, the loss is computed as the sum of the elementwise regularization terms. (E[W A^2])
+        If False, the loss is computed as the sum of the FNN weights. (E[W] * E[A^2])
 
     Returns
     -------
@@ -121,28 +135,45 @@ def loss_false(code_batch: torch.Tensor, k: int = 1, norm: bool = False) -> torc
     # total false neighbors has shape (n_latent - 1, batch_size, k)
 
     # Weight: fraction of true (non-false) neighbors per dimension
-    # reg_weights has shape (n_latent,), where the i-th element is the fraction of true (non-false) neighbors in dimension i
-    reg_weights = 1 - total_false_neighbors.to(torch.float64).mean(dim=(1, 2))
-    reg_weights = torch.nn.functional.pad(reg_weights, (1, 0))  # pad zero for dim 0
-    # now reg_weights has shape (n_latent,)
+    if elementwise_regularization:
+        # reg_weights has shape (batch_size, n_latent), where the (i, j)-th element is the fraction of true (non-false) neighbors in dimension j for the i-th batch
+        reg_weights = (1 - total_false_neighbors).to(torch.float64).mean(dim=-1).transpose(0, 1)
+        reg_weights = torch.nn.functional.pad(reg_weights, (1, 0))  # pad zero for dim 0
+    else:
+        # reg_weights has shape (n_latent,), where the i-th element is the fraction of true (non-false) neighbors in dimension i
+        reg_weights = 1 - total_false_neighbors.to(torch.float64).mean(dim=(1, 2))
+        reg_weights = torch.nn.functional.pad(reg_weights, (1, 0))  # pad zero for dim 0
+        # now reg_weights has shape (n_latent,)
 
-    # RMS activity per latent dimension, matching Gilpin TF implementation
-    # activations_batch_averaged = torch.sqrt(
-    #     torch.mean(code_batch ** 2, dim=0)
-    # ).to(torch.float64)
-    activations_batch_averaged_squared = torch.mean(code_batch ** 2, dim=0)
+    # elementwise_reg = (1 - total_false_neighbors).to(torch.float64).mean(dim=-1).transpose(0, 1)
+    # torch.sum(elementwise_reg*(code_batch[...,1:]**2))/(code_batch[..., 1:]**2).sum()
 
     # Weighted L1 activity regularization
-    # loss = torch.sum(reg_weights * activations_batch_averaged)
-    loss = torch.sum(reg_weights * activations_batch_averaged_squared)
+    if elementwise_regularization:
+        # take the mean over batches and sum over latents
+        # loss_j = (1/B) \sum_i ^ B W_ij * A_ij^2
+        loss = (reg_weights * (code_batch**2)).mean(dim=0).sum()
+    else:
+        # take the mean activity over batches and sum over latents
+        activations_batch_averaged_squared = torch.mean(code_batch ** 2, dim=0)
+        loss = torch.sum(reg_weights * activations_batch_averaged_squared)
 
-    if norm:
+    if normalize:
         # return loss.float() / (n_latent * code_batch.var())
         epsilon = 1e-8
-        denom = activations_batch_averaged_squared.sum() + epsilon
-        return loss.float() / denom
+        if elementwise_regularization:
+            denom = (code_batch**2).mean(dim=0).sum() + epsilon
+        else:
+            denom = activations_batch_averaged_squared.sum() + epsilon
+        if return_fnn_weights:
+            return loss.float() / denom, reg_weights
+        else:
+            return loss.float() / denom
     else:
-        return loss.float()
+        if return_fnn_weights:
+            return loss.float(), reg_weights
+        else:
+            return loss.float()
 
 
 def loss_cov(a: torch.Tensor, whiten: bool = False) -> torch.Tensor:
