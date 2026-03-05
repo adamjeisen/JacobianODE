@@ -66,6 +66,10 @@ logger = logging.getLogger(__name__)
 # Cutoff date for legacy run handling (January 31st 2025 at 2pm EST)
 LEGACY_CUTOFF_DATE = datetime(2025, 1, 31, 14, 0, tzinfo=ZoneInfo("America/New_York"))
 
+# Cache for pretrained encoder adapter when loading multiple pretrained-encoder runs
+# (e.g. select_from_wandb_runs loads the same encoder 6 times; cache avoids redundant W&B/disk I/O)
+_PRETRAINED_ADAPTER_CACHE: Dict[Tuple[str, ...], Any] = {}
+
 
 def load_run(
     project: str,
@@ -106,7 +110,7 @@ def load_run(
     """
     # Get run object
     if run is None:
-        api = wandb.Api(timeout=30)
+        api = wandb.Api(timeout=90)
         run = api.run(f"{project}/{run_id}")
     elif run_id is None:
         raise ValueError("run_id and run cannot both be None")
@@ -234,6 +238,13 @@ def _load_recent_run(
     # Make model
     target_str = str(cfg.training.lightning.get("_target_", ""))
     is_encoder_only = "LitEncoderDecoder" in target_str
+    pretrained_enc = cfg.get("pretrained_encoder") or {}
+    is_pretrained_jac_run = (
+        not is_encoder_only
+        and "LitLatentJacobianODE" in target_str
+        and pretrained_enc.get("project")
+        and pretrained_enc.get("run_id")
+    )
 
     if is_encoder_only:
         if trajs is not None:
@@ -249,6 +260,58 @@ def _load_recent_run(
             run, cfg, lit_model, save_dir=save_dir,
             loss_key="mean val loss", verbose=verbose,
         )
+    elif is_pretrained_jac_run:
+        # Pretrained-encoder runs use PretrainedEncoderAdapter (decoder is nn.Sequential),
+        # not the latent_ssm build_ssm (which uses StepDecoder with .net). Build the model
+        # the same way run_pretrained_jacobians does so checkpoint keys match.
+        # Cache the adapter when loading multiple runs from the same sweep (same encoder).
+        from hydra.utils import instantiate
+        from ...encoder_only.pretrained import load_pretrained_encoder
+
+        cache_key = (
+            str(pretrained_enc.project),
+            str(pretrained_enc.run_id),
+            str(pretrained_enc.get("save_dir") or ""),
+            bool(pretrained_enc.get("freeze", True)),
+        )
+        if cache_key not in _PRETRAINED_ADAPTER_CACHE:
+            if verbose:
+                print("Loading pretrained encoder (once per sweep)...", flush=True)
+            adapter, _, _ = load_pretrained_encoder(
+                project=cache_key[0],
+                run_id=cache_key[1],
+                save_dir=pretrained_enc.get("save_dir") or None,
+                freeze=cache_key[3],
+                verbose=verbose,
+            )
+            _PRETRAINED_ADAPTER_CACHE[cache_key] = adapter
+        else:
+            if verbose:
+                logger.info("Using cached pretrained encoder adapter")
+                print("Using cached pretrained encoder.", flush=True)
+        adapter = _PRETRAINED_ADAPTER_CACHE[cache_key]
+
+        jac_model = instantiate(cfg.model.params)
+        extra_kwargs = {}
+        if "prediction_steps" in cfg.model:
+            extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
+        if "encoder_warmup_epochs" in cfg.model:
+            extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+        if cfg.model.get("jac_window_stride") is not None:
+            extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
+
+        lit_model = instantiate(
+            cfg.training.lightning,
+            model=jac_model,
+            encoder=adapter,
+            dt=dt,
+            save_dir=save_dir,
+            mu=float(mu),
+            sigma=float(sigma),
+            noise_scale_factor=float(noise_scale_factor),
+            **extra_kwargs,
+        )
+        lit_model.eq = eq
     else:
         if "params" in cfg.model and "NeuralODE" in str(cfg.model.params.get("_target_", "")):
             cfg.model.params.dt = float(dt)
@@ -445,6 +508,7 @@ def load_checkpoint(
 
     if verbose:
         logger.info(f"Loading checkpoint from epoch {epoch}")
+        print(f"Loading checkpoint {checkpoint}...", flush=True)
 
     # Load checkpoint
     checkpoint_data = torch.load(

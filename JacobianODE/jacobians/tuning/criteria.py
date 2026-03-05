@@ -85,7 +85,8 @@ def compute_all_diagnostics(
     threshold = -1.0 / dt
 
     with torch.no_grad():
-        for i, batch in tqdm(enumerate(rand_dl), total=n_batches, disable=not verbose):
+        iterator = tqdm(total=n_batches, disable=not verbose)
+        for i, batch in enumerate(rand_dl):
             if i >= n_batches:
                 break
             batch = batch.to(device)
@@ -119,6 +120,9 @@ def compute_all_diagnostics(
             if use_loop_closure:
                 lc_ret = lit_model.loop_closure_model_step(z_for_eval)
                 loop_closure_losses.append(lc_ret["metric_vals"]["mse"].float().item())
+            iterator.update(1)
+
+        iterator.close()
 
     n = len(one_step_mases)
     return DiagnosticMetrics(

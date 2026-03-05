@@ -1,0 +1,25 @@
+defaults:
+  - _self_
+  - training: training
+  - data: dysts
+  - model: latent_ssm
+  - slurm: default
+  - override hydra/sweeper: list  # required for --multirun with comma-separated values
+
+
+logger: wandb
+wandb_entity: JacobianODE
+wandb_project: null
+
+# ---------------------------------------------------------------
+# Pre-trained encoder settings (required)
+# ---------------------------------------------------------------
+pretrained_encoder:
+  project: null      # W&B project path, e.g. "LorenzPartial__Encoder"
+  run_id: null       # W&B run ID of the pre-trained encoder
+  save_dir: null     # local directory for encoder checkpoints
+  freeze: true       # freeze encoder weights during JacobianODE training
+
+hydra:
+  job:
+    chdir: True

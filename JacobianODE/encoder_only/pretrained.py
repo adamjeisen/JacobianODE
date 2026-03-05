@@ -281,7 +281,7 @@ def load_pretrained_jac_run(
     from ..jacobians.data.trajectory import make_trajectories
 
     # ---- Step 1: load W&B run + config ----
-    api = wandb.Api(timeout=30)
+    api = wandb.Api(timeout=90)
     run = api.run(f"{entity}/{project}/{run_id}")
     cfg = OmegaConf.create(run.config)
 
