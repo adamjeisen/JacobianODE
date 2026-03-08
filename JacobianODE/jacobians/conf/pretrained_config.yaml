@@ -15,10 +15,17 @@ wandb_project: null
 # Pre-trained encoder settings (required)
 # ---------------------------------------------------------------
 pretrained_encoder:
+  encoder_type: pretrained  # "pretrained" (load from W&B) or "eigentime_delay" (build from data)
   project: null      # W&B project path, e.g. "LorenzPartial__Encoder"
   run_id: null       # W&B run ID of the pre-trained encoder
   save_dir: null     # local directory for encoder checkpoints
   freeze: true       # freeze encoder weights during JacobianODE training
+
+  # Eigentime delay settings (only used when encoder_type=eigentime_delay)
+  eigentime:
+    use_pca: true
+    n_components: null       # null = use variance_threshold; int for fixed
+    variance_threshold: 0.99
 
 hydra:
   job:

@@ -1,0 +1,26 @@
+# Pointwise MLP sequence encoder (no temporal context)
+# Relies on delay embedding in the input to provide temporal information.
+# n_input is set at runtime from the observation dimension.
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.MLPSequenceEncoder
+  n_input: null         # set at runtime from data
+  n_latent: 10          # N_LATENT: latent space dimension
+  hidden_dim: 128       # hidden layer width
+  n_layers: 3           # number of hidden layers
+  dropout: 0.1
+
+# ---- Decoder head configuration ----
+use_same_state_decoder: True
+use_next_state_decoder: False
+decoder_hidden_dim: 128
+decoder_n_layers: 2
+
+context_margin: 0
+# Burn-in for next-state prediction: skip first N steps (partial obs may need context)
+next_state_burn_in: 0
+# Multi-step ahead prediction: next_state_decoder predicts [x_{t+1}, ..., x_{t+k}]
+k_steps_ahead: 1
+# Raw obs dim for next-state targets; null = use n_obs (set to len(observed_indices)
+# when using delay embedding so that targets are un-embedded observations)
+n_obs_pred: null

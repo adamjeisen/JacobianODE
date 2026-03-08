@@ -115,6 +115,147 @@ class PretrainedEncoderAdapter(nn.Module):
         return copy.deepcopy(self)
 
 
+class EigentimeDelayAdapter(nn.Module):
+    """Adapter that uses delay embedding (optionally with PCA) as latent space.
+
+    Instead of a learned encoder, this adapter treats the delay-embedded
+    observations directly as the latent representation.  When ``use_pca``
+    is enabled, it projects the delay embedding onto its top principal
+    components (eigentime delay coordinates), reducing the latent
+    dimensionality while preserving the dominant variance directions.
+
+    This adapter is a drop-in replacement for ``PretrainedEncoderAdapter``
+    and satisfies the ``LitLatentJacobianODE`` encoder interface:
+    ``encode(x) -> z``, ``decode(z) -> x_hat``, ``context_margin``,
+    ``n_latent``.
+
+    Parameters
+    ----------
+    n_obs : int
+        Input observation dimension D_obs (delay-embedded).
+    use_pca : bool
+        If ``True``, compute PCA on training data and project into the
+        top ``n_components`` directions.  If ``False``, the latent space
+        IS the delay embedding (identity encoder).
+    n_components : int or None
+        Number of PCA components to keep.  Ignored when ``use_pca=False``.
+        If ``None`` and ``variance_threshold`` is set, the number of
+        components is chosen to explain that fraction of variance.
+    variance_threshold : float or None
+        Fraction of total variance to preserve (e.g. 0.99).  Only used
+        when ``use_pca=True`` and ``n_components is None``.
+    """
+
+    def __init__(
+        self,
+        n_obs: int,
+        use_pca: bool = False,
+        n_components: Optional[int] = None,
+        variance_threshold: Optional[float] = None,
+    ):
+        super().__init__()
+        self.n_obs = n_obs
+        self.use_pca = use_pca
+        self.context_margin = 0
+        self._n_components = n_components
+        self._variance_threshold = variance_threshold
+
+        # PCA parameters (set by fit_pca)
+        self._fitted = not use_pca  # identity mode is always "fitted"
+        self.register_buffer("_mean", torch.zeros(n_obs))
+        self.register_buffer("_components", torch.eye(n_obs))  # (n_latent, n_obs)
+        self.register_buffer("_singular_values", torch.ones(n_obs))
+        self._n_latent = n_components if (use_pca and n_components is not None) else n_obs
+
+    @property
+    def n_latent(self) -> int:
+        return self._n_latent
+
+    def fit_pca(self, z_flat: torch.Tensor) -> None:
+        """Fit PCA on training data.
+
+        Parameters
+        ----------
+        z_flat : torch.Tensor
+            Flattened training observations ``(N, D_obs)``.
+        """
+        if not self.use_pca:
+            return
+
+        z_flat = z_flat.float()
+        mean = z_flat.mean(dim=0)
+        centered = z_flat - mean
+        U, S, Vh = torch.linalg.svd(centered, full_matrices=False)
+
+        # Determine number of components
+        if self._n_components is not None:
+            k = self._n_components
+        elif self._variance_threshold is not None:
+            explained = (S ** 2).cumsum(0) / (S ** 2).sum()
+            k = int((explained < self._variance_threshold).sum().item()) + 1
+            k = min(k, len(S))
+        else:
+            k = len(S)
+
+        self._n_latent = k
+        self._mean = mean
+        self._components = Vh[:k]  # (k, n_obs)
+        self._singular_values = S[:k]
+        self._fitted = True
+
+        total_var = (S ** 2).sum().item()
+        explained_var = (S[:k] ** 2).sum().item()
+        logger.info(
+            f"EigentimeDelayAdapter: PCA fitted with k={k} components, "
+            f"explained variance = {explained_var / total_var:.4f}"
+        )
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode delay-embedded observations to eigentime coordinates.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            ``(B, T, D_obs)`` delay-embedded observations.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, T, n_latent)`` — PCA-projected or identity.
+        """
+        if not self._fitted:
+            raise RuntimeError(
+                "EigentimeDelayAdapter: PCA not fitted. Call fit_pca() first."
+            )
+        if not self.use_pca:
+            return x
+        return (x - self._mean) @ self._components.T
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode from eigentime coordinates back to delay-embedded space.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            ``(B, T, n_latent)`` or ``(B, n_latent)``.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, T, D_obs)`` or ``(B, D_obs)`` — reconstructed observations.
+        """
+        if not self.use_pca:
+            return z
+        return z @ self._components + self._mean
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decode(self.encode(x))
+
+    def clone(self) -> "EigentimeDelayAdapter":
+        """Return a deep copy."""
+        return copy.deepcopy(self)
+
+
 def load_pretrained_encoder(
     project: str,
     run_id: str,
@@ -192,6 +333,80 @@ def load_pretrained_encoder(
         )
 
     return adapter, cfg, run
+
+
+def create_eigentime_delay_adapter(
+    train_dataloader,
+    use_pca: bool = True,
+    n_components: Optional[int] = None,
+    variance_threshold: float = 0.99,
+    max_samples: int = 50_000,
+    verbose: bool = True,
+) -> EigentimeDelayAdapter:
+    """Create an ``EigentimeDelayAdapter`` fitted on training data.
+
+    Parameters
+    ----------
+    train_dataloader : DataLoader
+        Training DataLoader producing ``(B, T, D_obs)`` batches (delay-embedded).
+    use_pca : bool
+        Enable PCA projection into eigentime delay coordinates.
+    n_components : int or None
+        Fixed number of PCA components.  If ``None``, uses ``variance_threshold``.
+    variance_threshold : float
+        Fraction of variance to preserve (default 0.99).
+    max_samples : int
+        Maximum number of (flattened) samples for PCA fitting.
+    verbose : bool
+        Print summary.
+
+    Returns
+    -------
+    EigentimeDelayAdapter
+        Fitted adapter ready for ``LitLatentJacobianODE``.
+    """
+    # Collect training data for PCA fitting
+    all_z = []
+    n_collected = 0
+    for batch in train_dataloader:
+        x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        all_z.append(x.reshape(-1, x.shape[-1]))
+        n_collected += all_z[-1].shape[0]
+        if n_collected >= max_samples:
+            break
+
+    z_flat = torch.cat(all_z, dim=0)[:max_samples].float()
+    n_obs = z_flat.shape[-1]
+
+    adapter = EigentimeDelayAdapter(
+        n_obs=n_obs,
+        use_pca=use_pca,
+        n_components=n_components,
+        variance_threshold=variance_threshold,
+    )
+
+    if use_pca:
+        adapter.fit_pca(z_flat)
+
+    # Freeze — no trainable parameters (this is a fixed transform)
+    adapter.requires_grad_(False)
+
+    if verbose:
+        print(f"EigentimeDelayAdapter: n_obs={n_obs}, use_pca={use_pca}, "
+              f"n_latent={adapter.n_latent}")
+        if use_pca:
+            total_var = (adapter._singular_values ** 2).sum().item()
+            # Recompute from full SVD for % explained
+            centered = z_flat - z_flat.mean(0)
+            _, S_full, _ = torch.linalg.svd(centered, full_matrices=False)
+            full_var = (S_full ** 2).sum().item()
+            explained = (adapter._singular_values ** 2).sum().item() / full_var
+            print(f"  PCA: {adapter.n_latent} components, "
+                  f"explained variance = {explained:.4f}")
+            print(f"  Singular values: {adapter._singular_values[:10].tolist()}"
+                  + ("..." if adapter.n_latent > 10 else ""))
+
+    return adapter
 
 
 # ---------------------------------------------------------------

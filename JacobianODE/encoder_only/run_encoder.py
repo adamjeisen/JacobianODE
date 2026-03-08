@@ -23,7 +23,7 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
-from ..jacobians.core import initialize_config, seed_everything
+from ..jacobians.core import seed_everything
 from ..jacobians.data import create_dataloaders, make_trajectories, postprocess_data
 from ..jacobians.training import train_model
 from ..jacobians.training.logging import (
@@ -105,7 +105,9 @@ def train_encoder(cfg: DictConfig) -> None:
     log.info(f"GPUs available: {torch.cuda.device_count()}")
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
-    cfg = initialize_config(cfg)
+    # NOTE: Do NOT call initialize_config() here — that function is designed
+    # for the JacobianODE pipeline and overwrites the Lightning _target_ to
+    # LitLatentJacobianODE, breaking encoder-only training.
 
     # ------------------------------------------------------------------
     # DATA
@@ -167,6 +169,8 @@ def train_encoder(cfg: DictConfig) -> None:
         use_next_state_decoder=bool(cfg.model.get("use_next_state_decoder", False)),
         decoder_hidden_dim=int(cfg.model.get("decoder_hidden_dim", 128)),
         decoder_n_layers=int(cfg.model.get("decoder_n_layers", 2)),
+        k_steps_ahead=int(cfg.model.get("k_steps_ahead", 1)),
+        n_obs_pred=cfg.model.get("n_obs_pred", None),
     )
 
     # Instantiate Lightning model; cfg.training.lightning provides _target_ + training HPs

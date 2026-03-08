@@ -1,0 +1,31 @@
+# Eigentime Delay Encoder — uses delay embedding directly (+ optional PCA)
+# as the latent space for JacobianODE.  No learned encoder; the delay
+# embedding IS the representation.  PCA projects onto eigentime delay
+# coordinates for dimensionality reduction.
+#
+# NOTE: The encoder is NOT instantiated from this config via Hydra.
+#       Instead, use create_eigentime_delay_adapter() at runtime to
+#       build and fit the adapter from training data.  The encoder
+#       section here stores metadata for logging and reproducibility.
+
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_latent, set at runtime
+  hidden_dim: [256, 512, 512]
+  num_layers: 3
+  output_dim: null   # = n_latent * n_latent, set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  type: eigentime_delay
+  n_latent: null           # REQUIRED: set at runtime (= n_components or n_delays)
+  use_pca: true
+  n_components: null       # null = use variance_threshold; set to int for fixed
+  variance_threshold: 0.99 # fraction of variance to preserve
+  context_margin: 0
+
+prediction_steps: 10
+encoder_warmup_epochs: 0
+jac_window_stride: null

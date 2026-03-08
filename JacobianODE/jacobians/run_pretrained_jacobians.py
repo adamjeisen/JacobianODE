@@ -42,24 +42,33 @@ def train_pretrained_jacobians(cfg: DictConfig) -> None:
     cfg = initialize_config(cfg)
 
     # ----------------------------------------
-    # LOAD PRE-TRAINED ENCODER
+    # LOAD / BUILD ENCODER
     # ----------------------------------------
-    from ..encoder_only.pretrained import load_pretrained_encoder
+    encoder_type = cfg.pretrained_encoder.get("encoder_type", "pretrained")
 
-    adapter, encoder_cfg, encoder_run = load_pretrained_encoder(
-        project=cfg.pretrained_encoder.project,
-        run_id=cfg.pretrained_encoder.run_id,
-        save_dir=cfg.pretrained_encoder.get("save_dir"),
-        freeze=cfg.pretrained_encoder.get("freeze", True),
-        verbose=True,
-    )
+    if encoder_type == "eigentime_delay":
+        # Eigentime delay adapter is built from training data (below),
+        # so we just store config here and defer creation until after
+        # dataloaders are ready.
+        adapter = None
+        log.info("Encoder type: eigentime_delay — adapter will be built from training data")
+    else:
+        from ..encoder_only.pretrained import load_pretrained_encoder
 
-    log.info(
-        f"Loaded pretrained encoder: {type(adapter.encoder).__name__}, "
-        f"n_latent={adapter.n_latent}, "
-        f"context_margin={adapter.context_margin}, "
-        f"frozen={cfg.pretrained_encoder.get('freeze', True)}"
-    )
+        adapter, encoder_cfg, encoder_run = load_pretrained_encoder(
+            project=cfg.pretrained_encoder.project,
+            run_id=cfg.pretrained_encoder.run_id,
+            save_dir=cfg.pretrained_encoder.get("save_dir"),
+            freeze=cfg.pretrained_encoder.get("freeze", True),
+            verbose=True,
+        )
+
+        log.info(
+            f"Loaded pretrained encoder: {type(adapter.encoder).__name__}, "
+            f"n_latent={adapter.n_latent}, "
+            f"context_margin={adapter.context_margin}, "
+            f"frozen={cfg.pretrained_encoder.get('freeze', True)}"
+        )
 
     # ----------------------------------------
     # GENERATE DATA
@@ -90,6 +99,25 @@ def train_pretrained_jacobians(cfg: DictConfig) -> None:
     )
 
     # ----------------------------------------
+    # BUILD EIGENTIME DELAY ADAPTER (if needed)
+    # ----------------------------------------
+    if encoder_type == "eigentime_delay":
+        from ..encoder_only.pretrained import create_eigentime_delay_adapter
+
+        etd_cfg = cfg.pretrained_encoder.eigentime
+        adapter = create_eigentime_delay_adapter(
+            train_dataloader,
+            use_pca=etd_cfg.get("use_pca", True),
+            n_components=etd_cfg.get("n_components", None),
+            variance_threshold=etd_cfg.get("variance_threshold", 0.99),
+            verbose=True,
+        )
+        log.info(
+            f"Built eigentime delay adapter: n_latent={adapter.n_latent}, "
+            f"use_pca={etd_cfg.get('use_pca', True)}"
+        )
+
+    # ----------------------------------------
     # SET UP WANDB
     # ----------------------------------------
     entity = cfg.wandb_entity
@@ -99,14 +127,17 @@ def train_pretrained_jacobians(cfg: DictConfig) -> None:
     project = cfg.wandb_project or f"{data_cls}__PretrainedEncoderJacODE"
 
     # Build a descriptive run name
-    encoder_type = type(adapter.encoder).__name__
+    if encoder_type == "eigentime_delay":
+        enc_type_name = "EigentimeDelay"
+    else:
+        enc_type_name = type(adapter.encoder).__name__
     n_latent = adapter.n_latent
     freeze_tag = "frozen" if cfg.pretrained_encoder.get("freeze", True) else "unfrozen"
     lc_weight = cfg.training.lightning.loop_closure_weight
     pred_steps = cfg.model.prediction_steps
 
     name = (
-        f"{data_cls}__{encoder_type}__n{n_latent}__{freeze_tag}"
+        f"{data_cls}__{enc_type_name}__n{n_latent}__{freeze_tag}"
         f"__lc{lc_weight}__pred{pred_steps}"
     )
 

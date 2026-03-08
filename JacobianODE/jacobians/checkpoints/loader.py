@@ -239,8 +239,14 @@ def _load_recent_run(
     target_str = str(cfg.training.lightning.get("_target_", ""))
     is_encoder_only = "LitEncoderDecoder" in target_str
     pretrained_enc = cfg.get("pretrained_encoder") or {}
+    is_eigentime_delay = (
+        not is_encoder_only
+        and "LitLatentJacobianODE" in target_str
+        and pretrained_enc.get("encoder_type") == "eigentime_delay"
+    )
     is_pretrained_jac_run = (
         not is_encoder_only
+        and not is_eigentime_delay
         and "LitLatentJacobianODE" in target_str
         and pretrained_enc.get("project")
         and pretrained_enc.get("run_id")
@@ -260,6 +266,62 @@ def _load_recent_run(
             run, cfg, lit_model, save_dir=save_dir,
             loss_key="mean val loss", verbose=verbose,
         )
+    elif is_eigentime_delay:
+        # Build ETD adapter from training data (same as run_pretrained_jacobians does).
+        # Cache the adapter so repeated load_run calls (e.g. select_from_wandb_runs)
+        # don't fail when generate_data=False (train_dataloader=None).
+        from hydra.utils import instantiate
+        from ...encoder_only.pretrained import create_eigentime_delay_adapter
+
+        etd_cfg = pretrained_enc.get("eigentime", {})
+        cache_key = (
+            "eigentime_delay",
+            bool(etd_cfg.get("use_pca", True)),
+            etd_cfg.get("n_components"),
+            float(etd_cfg.get("variance_threshold", 0.99)),
+        )
+        if cache_key not in _PRETRAINED_ADAPTER_CACHE:
+            if train_dataloader is None:
+                raise RuntimeError(
+                    "Cannot build EigentimeDelayAdapter without training data. "
+                    "Ensure generate_data=True on the first load_run call."
+                )
+            if verbose:
+                print("Building eigentime delay adapter (once per sweep)...", flush=True)
+            adapter = create_eigentime_delay_adapter(
+                train_dataloader,
+                use_pca=etd_cfg.get("use_pca", True),
+                n_components=etd_cfg.get("n_components", None),
+                variance_threshold=etd_cfg.get("variance_threshold", 0.99),
+                verbose=verbose,
+            )
+            _PRETRAINED_ADAPTER_CACHE[cache_key] = adapter
+        else:
+            if verbose:
+                print("Using cached eigentime delay adapter.", flush=True)
+        adapter = _PRETRAINED_ADAPTER_CACHE[cache_key]
+
+        jac_model = instantiate(cfg.model.params)
+        extra_kwargs = {}
+        if "prediction_steps" in cfg.model:
+            extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
+        if "encoder_warmup_epochs" in cfg.model:
+            extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+        if cfg.model.get("jac_window_stride") is not None:
+            extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
+
+        lit_model = instantiate(
+            cfg.training.lightning,
+            model=jac_model,
+            encoder=adapter,
+            dt=dt,
+            save_dir=save_dir,
+            mu=float(mu),
+            sigma=float(sigma),
+            noise_scale_factor=float(noise_scale_factor),
+            **extra_kwargs,
+        )
+        lit_model.eq = eq
     elif is_pretrained_jac_run:
         # Pretrained-encoder runs use PretrainedEncoderAdapter (decoder is nn.Sequential),
         # not the latent_ssm build_ssm (which uses StepDecoder with .net). Build the model

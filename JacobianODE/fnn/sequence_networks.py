@@ -611,6 +611,56 @@ class TCNSpatialSequenceEncoder(nn.Module):
 
 
 # ===================================================================
+# 5. Pointwise MLP (no temporal context)
+# ===================================================================
+
+class MLPSequenceEncoder(nn.Module):
+    """Pointwise MLP encoder: (B, T, D) -> (B, T, D').
+
+    Applies the same MLP independently at every timestep.  Unlike the
+    SSM / Transformer / TCN encoders, this adds **no temporal context**
+    — each output z_t depends only on x_t.  When paired with a delay
+    embedding as input, the delay embedding alone provides temporal
+    context (Takens' theorem), avoiding the double-smoothing that
+    recurrent encoders introduce.
+
+    Parameters
+    ----------
+    n_input  : int   – Input feature dimension D (e.g. n_delays * n_obs).
+    n_latent : int   – Latent dimension D'.
+    hidden_dim : int – Hidden layer width.
+    n_layers : int   – Number of hidden layers.
+    dropout  : float – Dropout rate applied after each hidden layer.
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        n_latent: int,
+        hidden_dim: int = 128,
+        n_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.n_latent = n_latent
+
+        layers: list[nn.Module] = []
+        in_dim = n_input
+        for _ in range(n_layers):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.GELU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, n_latent))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, T, D) -> (B, T, D')."""
+        return self.net(x)
+
+
+# ===================================================================
 # Unified wrapper:  Encoder + Decoder = SequenceAutoencoder
 # ===================================================================
 
@@ -723,6 +773,24 @@ def build_tcn_spatial(
 ) -> SequenceAutoencoder:
     """Build a TCN+Spatial SequenceAutoencoder."""
     encoder = TCNSpatialSequenceEncoder(
+        n_input=n_input,
+        n_latent=n_latent,
+        **encoder_kwargs,
+    )
+    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
+
+
+def build_mlp(
+    n_input: int,
+    n_latent: int,
+    decoder_hidden: int = 128,
+    decoder_layers: int = 2,
+    context_margin: int = 0,
+    **encoder_kwargs,
+) -> SequenceAutoencoder:
+    """Build a pointwise-MLP SequenceAutoencoder (no temporal context)."""
+    encoder = MLPSequenceEncoder(
         n_input=n_input,
         n_latent=n_latent,
         **encoder_kwargs,
