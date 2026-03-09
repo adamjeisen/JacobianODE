@@ -485,6 +485,15 @@ class LitBase(L.LightningModule):
         else:
             metric_vals = {}
             metric_vals['mase'] = mase(label_cropped, outputs_cropped)
+            # Store raw MAE components so callers can aggregate correctly
+            # (ratio-of-means instead of mean-of-ratios).
+            metric_vals['model_mae'] = torch.mean(torch.abs(label_cropped - outputs_cropped))
+            if label_cropped.dim() == 3:
+                metric_vals['persistence_mae'] = torch.mean(
+                    torch.abs(label_cropped[:, 1:] - label_cropped[:, :-1]))
+            else:
+                metric_vals['persistence_mae'] = torch.mean(
+                    torch.abs(label_cropped[1:] - label_cropped[:-1]))
             metric_vals['r2_score'] = r2_score(label_cropped, outputs_cropped)
 
         return {'loss': loss, 'metric_vals': metric_vals, 'outputs': outputs}
@@ -730,10 +739,13 @@ class LitBase(L.LightningModule):
 
         total_loss = sum(val_rets[pred_type]['loss'] for pred_type in val_rets.keys())
         
-        # Store the batch loss for later use in on_validation_epoch_end
+        # Track the same metric that PercentEarlyStopping monitors ("mean val loss")
+        mean_val_loss = torch.stack(
+            [val_rets[pt]['loss'] for pt in val_rets]
+        ).mean()
         if not hasattr(self, 'current_epoch_val_losses'):
             self.current_epoch_val_losses = []
-        self.current_epoch_val_losses.append(total_loss.item())
+        self.current_epoch_val_losses.append(mean_val_loss.item())
 
         return total_loss
 

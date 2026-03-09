@@ -38,7 +38,8 @@ dependencies = [
     "torchquad",
     "torchdiffeq",
     "sdeint",
-    "torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git"
+    "torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git",
+    "nbconvert",
 ]
 
 [dependency-groups]

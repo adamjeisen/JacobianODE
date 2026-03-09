@@ -77,12 +77,14 @@ def compute_all_diagnostics(
         pin_memory=val_dataloader.pin_memory,
     )
 
-    one_step_mases = []
+    total_model_mae = 0.0
+    total_persistence_mae = 0.0
     loop_closure_losses = []
     num_eigs_too_fast = 0
     total_eigs = 0
     trajectory_losses = []
     threshold = -1.0 / dt
+    n_mase_batches = 0
 
     with torch.no_grad():
         iterator = tqdm(total=n_batches, disable=not verbose)
@@ -92,9 +94,12 @@ def compute_all_diagnostics(
             batch = batch.to(device)
             lit_model.dt = dt
 
-            # One-step MASE (teacher-forced)
+            # One-step MASE (teacher-forced) — accumulate numerator/denominator
+            # for ratio-of-means (avoids inflation from small-denominator windows).
             traj_ret = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=1)
-            one_step_mases.append(traj_ret["metric_vals"]["mase"].float().item())
+            total_model_mae += traj_ret["metric_vals"]["model_mae"].float().item()
+            total_persistence_mae += traj_ret["metric_vals"]["persistence_mae"].float().item()
+            n_mase_batches += 1
 
             # Trajectory val loss (free-running)
             traj_free_ret = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=0)
@@ -124,9 +129,13 @@ def compute_all_diagnostics(
 
         iterator.close()
 
-    n = len(one_step_mases)
+    n = n_mase_batches
+    # Compute MASE as ratio-of-means (not mean-of-ratios) to avoid
+    # inflation from windows with small persistence denominators.
+    avg_model_mae = total_model_mae / n if n > 0 else float("inf")
+    avg_persistence_mae = total_persistence_mae / n if n > 0 else 1e-8
     return DiagnosticMetrics(
-        one_step_mase=sum(one_step_mases) / n if n > 0 else float("inf"),
+        one_step_mase=avg_model_mae / avg_persistence_mae if n > 0 else float("inf"),
         loop_closure_loss=(
             sum(loop_closure_losses) / len(loop_closure_losses)
             if loop_closure_losses

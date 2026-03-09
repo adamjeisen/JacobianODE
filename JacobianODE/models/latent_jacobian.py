@@ -256,7 +256,7 @@ class LitLatentJacobianODE(LitBase):
     # ------------------------------------------------------------------
 
     def _extract_obs_targets(self, batch, start_indices, n_windows_actual,
-                              traj_init_steps):
+                              traj_init_steps, prediction_steps=None):
         """Extract observation-space targets for predicted latent steps.
 
         For window-based encoders, latent index ``t`` was encoded from
@@ -277,6 +277,9 @@ class LitLatentJacobianODE(LitBase):
         n_windows_actual : int
             Number of sub-windows per batch element.
         traj_init_steps : int
+        prediction_steps : int, optional
+            Number of steps to predict. Defaults to ``self.prediction_steps``.
+            Used when ``strided=False`` to predict the full trajectory remainder.
 
         return_latent : bool
             Whether to return the latent targets instead of the observation targets.
@@ -286,7 +289,7 @@ class LitLatentJacobianODE(LitBase):
         torch.Tensor
             Observation targets.
         """
-        prediction_steps = self.prediction_steps
+        prediction_steps = prediction_steps if prediction_steps is not None else self.prediction_steps
         B = batch.shape[0]
 
         if hasattr(self.encoder, 'time_window'):
@@ -330,11 +333,14 @@ class LitLatentJacobianODE(LitBase):
         criterion=None,
         verbose=False,
         return_decoded=False,
+        strided=True,
     ):
         """Trajectory prediction step in latent space.
 
         1. Encode full observation sequence to latent trajectory.
-        2. Extract *strided* sub-windows (not just one per batch element).
+        2. Extract sub-windows: if strided=True, use strided sub-windows (multiple
+           per batch element); if strided=False, use one full-length window per
+           batch element.
         3. Integrate forward in latent space via JacobianODEint.
         4. Decode predicted latent vectors to observation space.
         5. Compute loss against raw observation targets (not decoded true z).
@@ -362,33 +368,43 @@ class LitLatentJacobianODE(LitBase):
 
         # 2. Determine sub-window parameters
         traj_init_steps = jacobianODEint_kwargs.get('traj_init_steps', 15)
-        jac_window_len = traj_init_steps + self.prediction_steps
-
         B, T_prime, D_latent = z_full.shape
-        if T_prime < jac_window_len:
-            raise ValueError(
-                f"Latent trajectory length ({T_prime}) is shorter than "
-                f"required JacobianODE window ({jac_window_len} = "
-                f"traj_init_steps={traj_init_steps} + "
-                f"prediction_steps={self.prediction_steps}). "
-                f"Increase observation sequence length or reduce prediction_steps."
-            )
 
-        # Extract strided sub-windows from each trajectory
-        stride = self.jac_window_stride
-        n_windows = max(1, (T_prime - jac_window_len) // stride + 1)
-        all_starts = []
-        for b in range(B):
-            for w_idx in range(n_windows):
-                start = w_idx * stride
-                if start + jac_window_len <= T_prime:
-                    all_starts.append(start)
-                    # Repeat z_full[b] — we'll gather below
-        # Build start_indices tensor: (N,) where N = B * n_windows
-        n_windows_actual = len(all_starts) // B
-        start_indices = torch.tensor(
-            all_starts, device=z_full.device, dtype=torch.long
-        )
+        if strided:
+            jac_window_len = traj_init_steps + self.prediction_steps
+            prediction_steps_actual = self.prediction_steps
+            if T_prime < jac_window_len:
+                raise ValueError(
+                    f"Latent trajectory length ({T_prime}) is shorter than "
+                    f"required JacobianODE window ({jac_window_len} = "
+                    f"traj_init_steps={traj_init_steps} + "
+                    f"prediction_steps={self.prediction_steps}). "
+                    f"Increase observation sequence length or reduce prediction_steps."
+                )
+            # Extract strided sub-windows from each trajectory
+            stride = self.jac_window_stride
+            n_windows = max(1, (T_prime - jac_window_len) // stride + 1)
+            all_starts = []
+            for b in range(B):
+                for w_idx in range(n_windows):
+                    start = w_idx * stride
+                    if start + jac_window_len <= T_prime:
+                        all_starts.append(start)
+            n_windows_actual = len(all_starts) // B
+            start_indices = torch.tensor(
+                all_starts, device=z_full.device, dtype=torch.long
+            )
+        else:
+            # Non-strided: one full-length window per batch element
+            jac_window_len = T_prime
+            prediction_steps_actual = T_prime - traj_init_steps
+            if prediction_steps_actual <= 0:
+                raise ValueError(
+                    f"Latent trajectory length ({T_prime}) too short for "
+                    f"traj_init_steps={traj_init_steps}. Need T' > traj_init_steps."
+                )
+            n_windows_actual = 1
+            start_indices = torch.zeros(B, device=z_full.device, dtype=torch.long)
 
         # Gather sub-windows: (N, jac_window_len, D_latent)
         z_windows_list = []
@@ -422,7 +438,8 @@ class LitLatentJacobianODE(LitBase):
 
         # Build observation-space targets from the original (clean) batch
         obs_targets = self._extract_obs_targets(
-            label, start_indices, n_windows_actual, traj_init_steps
+            label, start_indices, n_windows_actual, traj_init_steps,
+            prediction_steps=prediction_steps_actual,
         )  # same shape as decoded_pred
 
         # Variance-normalized losses: each ≈ mean_d(1 - R²_d), so all on the
@@ -433,6 +450,15 @@ class LitLatentJacobianODE(LitBase):
         metric_vals = {}
         with torch.no_grad():
             metric_vals['mase'] = mase(obs_targets, decoded_pred)
+            # Store raw MAE components so callers can aggregate correctly
+            # (ratio-of-means instead of mean-of-ratios).
+            metric_vals['model_mae'] = torch.mean(torch.abs(obs_targets - decoded_pred))
+            if obs_targets.dim() == 3:
+                metric_vals['persistence_mae'] = torch.mean(
+                    torch.abs(obs_targets[:, 1:] - obs_targets[:, :-1]))
+            else:
+                metric_vals['persistence_mae'] = torch.mean(
+                    torch.abs(obs_targets[1:] - obs_targets[:-1]))
             pred_flat = decoded_pred.reshape(decoded_pred.shape[0], -1)
             tgt_flat = obs_targets.reshape(obs_targets.shape[0], -1)
             metric_vals['r2_score'] = r2_score(tgt_flat, pred_flat)
@@ -842,9 +868,13 @@ class LitLatentJacobianODE(LitBase):
         if val_latent_pred_loss is not None:
             total_loss = total_loss + self.latent_prediction_loss_weight * val_latent_pred_loss
 
+        # Track the same metric that PercentEarlyStopping monitors
+        mean_val_loss = torch.stack(
+            [val_rets[pt]['loss'] for pt in val_rets]
+        ).mean()
         if not hasattr(self, 'current_epoch_val_losses'):
             self.current_epoch_val_losses = []
-        self.current_epoch_val_losses.append(total_loss.item())
+        self.current_epoch_val_losses.append(mean_val_loss.item())
 
         return total_loss
 
