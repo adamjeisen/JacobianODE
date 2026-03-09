@@ -97,7 +97,7 @@ def create_dataloaders(
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,

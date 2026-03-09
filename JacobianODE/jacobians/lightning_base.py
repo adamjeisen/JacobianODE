@@ -503,10 +503,10 @@ class LitBase(L.LightningModule):
             batch, 
             batch_idx=0, 
             dataloader_idx=0,
-            mix_trajectories=True,
+            mix_trajectories=None,
             n_loops=None,
             n_loop_pts=None,
-            loop_path='line',
+            loop_path=None,
             loop_closure_interp_pts=None,
             loop_closure_int_method=None,
         ):
@@ -687,8 +687,7 @@ class LitBase(L.LightningModule):
         metric_vals = self.calc_metrics(batch[..., 1:, :], jac_outputs[..., 1:, :])
         val_rets['trajectory'] = {'loss': torch.mean((jac_outputs[..., 1:, :] - batch[..., 1:, :])**2), 'metric_vals': metric_vals, 'outputs': jac_outputs}
         
-        loop_closure_ret = loop_closure(batch, self.compute_jacobians, dt=self.dt, n_loops=self.n_loops, n_loop_pts=self.n_loop_pts, loop_path=self.loop_path, loop_closure_interp_pts=self.loop_closure_interp_pts, mix_trajectories=self.mix_trajectories, int_method=self.loop_closure_int_method)
-        val_loop_closure = {'loss': torch.mean(loop_closure_ret**2), 'metric_vals': {}}
+        val_loop_closure = self.loop_closure_model_step(batch, batch_idx, dataloader_idx)
 
         if log_metrics:
             self.log_validation_metrics(
@@ -857,7 +856,7 @@ class LitBase(L.LightningModule):
         self.log(f"mean val loss", mean_val_loss, sync_dist=sync_dist)
 
         if val_loop_closure is not None:
-            self.log(f"val loop closure loss", val_loop_closure['loss'], sync_dist=sync_dist, add_dataloader_idx=False)
+            self.log(f"val loop closure loss", val_loop_closure['metric_vals']['mse'], sync_dist=sync_dist, add_dataloader_idx=False)
         # Log Jacobian metrics if equation is available
         if self.eq is not None:
             jacs_true = self.get_true_jacs(batch)

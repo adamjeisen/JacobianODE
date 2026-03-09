@@ -1033,7 +1033,7 @@ class LitLatentJacobianODE(LitBase):
         if val_loop_closure is not None:
             self.log(
                 "val/loop_closure_loss",
-                val_loop_closure['loss'],
+                val_loop_closure['metric_vals']['mse'],
                 sync_dist=sync_dist,
                 add_dataloader_idx=False,
             )

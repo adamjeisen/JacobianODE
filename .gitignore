@@ -7,6 +7,7 @@ _jupyter/checkpoints/
 JacobianODE/fnn/Deep_reconstruction_of_strange_attractors.pdf
 .claude
 _jupyter/*.pdf
+_jupyter/*.html
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
