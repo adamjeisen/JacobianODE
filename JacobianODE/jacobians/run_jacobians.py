@@ -6,7 +6,11 @@ using Hydra for configuration management.
 
 from __future__ import annotations
 
+import faulthandler
 import logging
+import os
+import sys
+import traceback
 
 import hydra
 import torch
@@ -37,8 +41,32 @@ def train_jacobians(cfg: DictConfig) -> None:
         cfg: Hydra configuration object containing all training parameters.
     """
     # ----------------------------------------
+    # DIAGNOSTIC: Capture crashes and exceptions
+    # ----------------------------------------
+    # Faulthandler dumps Python traceback on SIGSEGV, SIGFPE, etc.
+    diag_dir = os.getcwd()
+    try:
+        _fh_file = open(os.path.join(diag_dir, "faulthandler_dump.txt"), "w")
+        faulthandler.enable(file=_fh_file, all_threads=True)
+    except OSError:
+        faulthandler.enable(all_threads=True)  # fallback to stderr
+
+    try:
+        _run_training(cfg)
+    except Exception as e:
+        err_path = os.path.join(diag_dir, "error_traceback.txt")
+        with open(err_path, "w") as f:
+            traceback.print_exc(file=f)
+        log.error(f"Fatal error (see {err_path}): {e}", exc_info=True)
+        raise
+
+
+def _run_training(cfg: DictConfig) -> None:
+    """Inner training logic (separated for diagnostic try/except)."""
+    # ----------------------------------------
     # INITIAL SETUP
     # ----------------------------------------
+    log = logging.getLogger("JacobianLogger")
     log.info("Starting JacobianODE training")
 
     torch.set_float32_matmul_precision("high")
@@ -48,6 +76,7 @@ def train_jacobians(cfg: DictConfig) -> None:
     log.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
 
     # Initialize configuration (non-mutating)
+    log.info("Initializing config...")
     cfg = initialize_config(cfg)
 
     # ----------------------------------------
@@ -56,7 +85,10 @@ def train_jacobians(cfg: DictConfig) -> None:
     # Set seeds for reproducibility
     seed_everything(cfg.data.flow.random_state)
 
-    eq, sol, dt = make_trajectories(cfg)
+    log.info("Generating trajectories (this may take several minutes if cache is cold)...")
+    log.info("Calling make_trajectories...")
+    eq, sol, dt = make_trajectories(cfg, verbose=True)
+    log.info("make_trajectories returned")
     values_raw = sol["values"]
 
     # Select which solution to use for noise scaling

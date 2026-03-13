@@ -63,6 +63,8 @@ class LitLatentJacobianODE(LitBase):
         fnn_weight=0.0,
         fnn_normalize=False,
         fnn_elementwise_regularization=False,
+        fnn_use_pca=False,
+        fnn_n_samples=None,
         latent_noise_scale=0.0,
         latent_noise_per_step=False,
         precompute_latent_noise_factor=True,
@@ -84,6 +86,8 @@ class LitLatentJacobianODE(LitBase):
         self.fnn_weight = fnn_weight
         self.fnn_normalize = fnn_normalize
         self.fnn_elementwise_regularization = fnn_elementwise_regularization
+        self.fnn_use_pca = fnn_use_pca
+        self.fnn_n_samples = fnn_n_samples
         self.latent_noise_scale = latent_noise_scale
         self.latent_noise_per_step = latent_noise_per_step
         self.precompute_latent_noise_factor = precompute_latent_noise_factor
@@ -760,14 +764,12 @@ class LitLatentJacobianODE(LitBase):
         fnn_loss = None
         if self.fnn_weight > 0 or self.learn_fnn_weight:
             z_flat = z_full.reshape(-1, z_full.shape[-1])
-            # Subsample to cap pairwise-distance cost (O(N^2))
-            if len(z_flat) > 1024:
-                idx = torch.randperm(len(z_flat), device=z_flat.device)[:1024]
-                z_flat = z_flat[idx]
             fnn_loss = loss_false(
                 z_flat,
                 normalize=self.fnn_normalize,
                 elementwise_regularization=self.fnn_elementwise_regularization,
+                use_pca=self.fnn_use_pca,
+                n_samples=self.fnn_n_samples,
             )
 
         # --- Group 4: Jac-consistency ---

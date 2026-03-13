@@ -1,0 +1,3 @@
+# Empty: no launcher override — Hydra uses default (basic), run in-process.
+# Use slurm=none for local diagnostics to avoid submitit/SLURM params.
+# @package _global_

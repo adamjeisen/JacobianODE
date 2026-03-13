@@ -21,6 +21,8 @@ def loss_false(
         normalize: bool = False,
         return_fnn_weights: bool = False,
         elementwise_regularization: bool = False,
+        use_pca: bool = False,
+        n_samples: int | None = None,
     ) -> torch.Tensor:
     """Activity regularizer based on the False-Nearest-Neighbor algorithm.
 
@@ -43,12 +45,29 @@ def loss_false(
         Whether to use elementwise regularization.
         If True, the loss is computed as the sum of the elementwise regularization terms. (E[W A^2])
         If False, the loss is computed as the sum of the FNN weights. (E[W] * E[A^2])
+    use_pca : bool
+        If True, project onto principal components (right singular vectors) before
+        computing the loss, making it rotationally invariant. Default False.
+    n_samples : int or None
+        If not None, randomly subsample this many points to compute the loss
+        (useful to cap O(N^2) pairwise cost). If None, use all points. Default None.
 
     Returns
     -------
     loss : torch.Tensor
         Scalar loss value.
     """
+    # Optional subsampling
+    if n_samples is not None and len(code_batch) > n_samples:
+        idx = torch.randperm(len(code_batch), device=code_batch.device)[:n_samples]
+        code_batch = code_batch[idx]
+
+    # Optional PCA projection for rotation invariance
+    if use_pca:
+        z_centered = code_batch - code_batch.mean(dim=0, keepdim=True)
+        _, _, Vh = torch.linalg.svd(z_centered, full_matrices=False)
+        code_batch = z_centered @ Vh.T
+
     n_batch, n_latent = code_batch.shape
     device = code_batch.device
 

@@ -191,6 +191,8 @@ def initialize_config(
     if "encoder" in cfg.model:
         # Latent model: Jacobian MLP operates on n_latent, not data dim
         n_latent = cfg.model.encoder.n_latent
+        # Encoder sees delay-embedded observations (dim = n_delays * len(observed_indices))
+        cfg.model.encoder.n_input = dim
         if "input_dim" in cfg.model.params:
             cfg.model.params.input_dim = n_latent
         cfg.model.params.output_dim = n_latent ** 2

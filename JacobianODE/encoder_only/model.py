@@ -126,6 +126,8 @@ class LitEncoderDecoder(L.LightningModule):
         fnn_weight: float = 0.0,
         fnn_normalize: bool = False,
         fnn_elementwise_regularization: bool = False,
+        fnn_use_pca: bool = False,
+        fnn_n_samples: Optional[int] = None,
         amplification_weight: float = 0.0,
         decov_weight: float = 0.0,
         amplification_n_neighbors: int = 10,
@@ -161,6 +163,8 @@ class LitEncoderDecoder(L.LightningModule):
         self.fnn_weight = fnn_weight
         self.fnn_normalize = fnn_normalize
         self.fnn_elementwise_regularization = fnn_elementwise_regularization
+        self.fnn_use_pca = fnn_use_pca
+        self.fnn_n_samples = fnn_n_samples
         self.amplification_weight = amplification_weight
         self.decov_weight = decov_weight
         self.amplification_n_neighbors = amplification_n_neighbors
@@ -338,23 +342,15 @@ class LitEncoderDecoder(L.LightningModule):
 
         # ----------------------------------------------------------
         # FNN regularisation (O(N²) — subsample to ≤1024 points)
-        # Project onto singular vectors for rotation invariance.
         # ----------------------------------------------------------
         if self.fnn_weight > 0:
             z_flat = z_valid.reshape(-1, self.n_latent).float()
-            # TODO: do without subsampling
-            subsample = False
-            if subsample and len(z_flat) > 1024:
-                idx = torch.randperm(len(z_flat), device=z_flat.device)[:1024]
-                z_flat = z_flat[idx]
-            # Project onto principal components (right singular vectors) for rotation invariance
-            z_centered = z_flat - z_flat.mean(dim=0, keepdim=True)
-            _, _, Vh = torch.linalg.svd(z_centered, full_matrices=False)
-            z_pca = z_centered @ Vh.T  # (n, min(n, n_latent)); axes ordered by variance
             fnn_loss = loss_false(
-                z_pca,
+                z_flat,
                 normalize=self.fnn_normalize,
                 elementwise_regularization=self.fnn_elementwise_regularization,
+                use_pca=self.fnn_use_pca,
+                n_samples=self.fnn_n_samples,
             )
             total_loss = total_loss + self.fnn_weight * fnn_loss
             log_dict[f"{prefix}/fnn_loss"] = fnn_loss.detach()

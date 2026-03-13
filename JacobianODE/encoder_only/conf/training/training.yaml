@@ -31,6 +31,8 @@ lightning:
   fnn_weight: 0.0           # FNN latent-geometry regulariser (Gilpin NeurIPS 2020)
   fnn_normalize: false      # Normalize FNN loss by activation variance
   fnn_elementwise_regularization: false  # Elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
+  fnn_use_pca: true        # Project onto PCA before FNN for rotation invariance
+  fnn_n_samples: 1024      # Max points for FNN (O(N²)); null = use all
   amplification_weight: 0.0 # Noise amplification regulariser
   decov_weight: 0.0         # DeCov off-diagonal covariance penalty (Cogswell ICLR 2016)
 

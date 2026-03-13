@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import logging
 import os
 import pickle
+import random
+import socket
+import tempfile
+import time
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -14,6 +19,26 @@ from omegaconf import DictConfig
 from ..custom_data import validate_data_shape
 
 logger = logging.getLogger(__name__)
+
+
+def _nfs_safe_makedirs(path: str, jlog: logging.Logger) -> None:
+    """Create directories with NFS contention mitigation.
+
+    Skips the syscall entirely if the directory already exists.  When it
+    does need to create, a small random jitter prevents many SLURM jobs
+    from issuing mkdir RPCs at the exact same instant.
+    """
+    if os.path.isdir(path):
+        return
+    # Stagger concurrent jobs so NFS metadata ops don't pile up
+    time.sleep(random.uniform(0, 2.0))
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        # On NFS another job may have created it between our check and
+        # our makedirs call — that's fine.
+        if not os.path.isdir(path):
+            raise
 
 
 def make_trajectories(
@@ -153,14 +178,20 @@ def make_dysts_trajectories(
         >>> eq, sol, dt = make_dysts_trajectories(cfg, verbose=True)
         >>> print(f"dt = {dt}")
     """
+    jlog = logging.getLogger("JacobianLogger")
+    jlog.info("make_dysts_trajectories: entered")
     if save_dir is None:
         save_dir = cfg.training.logger.save_dir
 
-    os.makedirs(save_dir, exist_ok=True)
+    jlog.info("make_dysts_trajectories: about to makedirs save_dir=%s", save_dir)
+    _nfs_safe_makedirs(save_dir, jlog)
+    jlog.info("make_dysts_trajectories: makedirs save_dir done")
     data_save_dir = os.path.join(save_dir, "dysts_data")
 
     if save_file:
-        os.makedirs(data_save_dir, exist_ok=True)
+        jlog.info("make_dysts_trajectories: about to makedirs data_save_dir=%s", data_save_dir)
+        _nfs_safe_makedirs(data_save_dir, jlog)
+        jlog.info("make_dysts_trajectories: makedirs data_save_dir done")
 
     # Build filename from config parameters
     filename = os.path.join(
@@ -173,23 +204,51 @@ def make_dysts_trajectories(
         f"random_state_{cfg.data.flow.random_state}.pkl",
     )
 
-    if os.path.exists(filename):
-        if verbose:
-            logger.info(f"Saved data found at {filename}, loading eq")
-        with open(filename, "rb") as f:
-            ret = pickle.load(f)
-        eq = ret["eq"]
-        sol = ret["sol"]
-        dt = ret["dt"]
-    else:
-        if verbose:
-            logger.info(f"Saved data not found at {filename}, instantiating eq")
-        eq = instantiate(cfg.data.flow)
-        cfg.data.trajectory_params.verbose = verbose
-        sol = eq.make_trajectory(**cfg.data.trajectory_params)
-        dt = sol["dt"]
-        if save_file:
-            with open(filename, "wb") as f:
-                pickle.dump({"eq": eq, "sol": sol, "dt": dt}, f)
+    host = socket.gethostname()
+    lockfile = filename + ".lock"
+
+    # Use file-based locking so only one job generates data; others wait.
+    jlog.info("[host=%s] acquiring lock %s", host, lockfile)
+    lock_fd = open(lockfile, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        jlog.info("[host=%s] lock acquired", host)
+
+        cache_exists = os.path.exists(filename)
+        jlog.info("[host=%s] cache path=%s, exists=%s", host, filename, cache_exists)
+
+        if cache_exists:
+            if verbose:
+                logger.info(f"Saved data found at {filename}, loading eq")
+            jlog.info("make_dysts_trajectories: loading pickle from %s", filename)
+            with open(filename, "rb") as f:
+                ret = pickle.load(f)
+            jlog.info("make_dysts_trajectories: pickle load done")
+            eq = ret["eq"]
+            sol = ret["sol"]
+            dt = ret["dt"]
+        else:
+            if verbose:
+                logger.info(f"Saved data not found at {filename}, instantiating eq")
+            eq = instantiate(cfg.data.flow)
+            cfg.data.trajectory_params.verbose = verbose
+            sol = eq.make_trajectory(**cfg.data.trajectory_params)
+            dt = sol["dt"]
+            if save_file:
+                # Atomic write: write to temp file then rename so readers
+                # never see a partially-written pickle.
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    dir=data_save_dir, suffix=".pkl.tmp"
+                )
+                try:
+                    with os.fdopen(tmp_fd, "wb") as f:
+                        pickle.dump({"eq": eq, "sol": sol, "dt": dt}, f)
+                    os.replace(tmp_path, filename)
+                except BaseException:
+                    os.unlink(tmp_path)
+                    raise
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
     return eq, sol, dt

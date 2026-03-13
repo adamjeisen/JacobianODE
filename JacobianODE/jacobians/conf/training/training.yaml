@@ -58,6 +58,8 @@ lightning:
   fnn_weight: 0.0  # weight for FNN latent-geometry regularizer (Gilpin NeurIPS 2020)
   fnn_normalize: false        # normalize FNN loss by activation variance
   fnn_elementwise_regularization: false  # elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
+  fnn_use_pca: false         # project onto PCA before FNN for rotation invariance
+  fnn_n_samples: 1024        # max points for FNN (O(N²)); null = use all
 
   # -----------------
   # HOMOSCEDASTIC UNCERTAINTY WEIGHTING (Kendall et al. 2018)
