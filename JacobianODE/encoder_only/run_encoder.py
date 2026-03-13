@@ -40,8 +40,8 @@ def _make_run_name(cfg: DictConfig) -> str:
     # Data class
     if cfg.data.data_type == "dysts":
         data_cls = cfg.data.flow._target_.split(".")[-1]
-    elif cfg.data.data_type == "custom":
-        data_cls = cfg.data.get("name", "custom")
+    elif cfg.data.data_type in ("custom", "wmtask"):
+        data_cls = cfg.data.get("name", cfg.data.data_type)
     else:
         data_cls = cfg.data.data_type
 
@@ -77,8 +77,8 @@ def _make_run_name(cfg: DictConfig) -> str:
 def _make_project(cfg: DictConfig) -> str:
     if cfg.data.data_type == "dysts":
         data_cls = cfg.data.flow._target_.split(".")[-1]
-    elif cfg.data.data_type == "custom":
-        data_cls = cfg.data.get("name", "custom")
+    elif cfg.data.data_type in ("custom", "wmtask"):
+        data_cls = cfg.data.get("name", cfg.data.data_type)
     else:
         data_cls = cfg.data.data_type
     return f"{data_cls}__EncoderOnly"
