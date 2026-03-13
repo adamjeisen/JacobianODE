@@ -9,6 +9,7 @@ JacobianODE/fnn/Deep_reconstruction_of_strange_attractors.pdf
 _jupyter/*.pdf
 _jupyter/*.html
 _jupyter/_sandbox/*.html
+_jupyter/reports/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
