@@ -260,7 +260,20 @@ def _load_recent_run(
             delay_params = cfg.data.train_test_params.delay_embedding_params
             n_delays = int(delay_params.get("n_delays", 1))
             obs_indices = delay_params.get("observed_indices", [0])
-            n_obs = n_delays * len(obs_indices)
+            if obs_indices == "all":
+                # "all" is a string; len("all") = 3 would be wrong. Use model.n_obs_pred
+                # or data.flow.dim instead.
+                n_obs = cfg.model.get("n_obs_pred")
+                if n_obs is None and cfg.data.get("flow") and hasattr(cfg.data.flow, "dim"):
+                    n_obs = cfg.data.flow.dim
+                if n_obs is None:
+                    raise ValueError(
+                        "Cannot infer n_obs when observed_indices='all' and generate_data=False. "
+                        "Set model.n_obs_pred or data.flow.dim in config."
+                    )
+                n_obs = int(n_obs)
+            else:
+                n_obs = n_delays * len(obs_indices)
         lit_model = _make_encoder_model(cfg, n_obs, save_dir, verbose)
         load_checkpoint(
             run, cfg, lit_model, save_dir=save_dir,

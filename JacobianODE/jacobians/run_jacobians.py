@@ -9,7 +9,9 @@ from __future__ import annotations
 import faulthandler
 import logging
 import os
+import random
 import sys
+import time
 import traceback
 
 import hydra
@@ -84,6 +86,13 @@ def _run_training(cfg: DictConfig) -> None:
     # ----------------------------------------
     # Set seeds for reproducibility
     seed_everything(cfg.data.flow.random_state)
+
+    # Stagger concurrent SLURM jobs to avoid NFS contention.
+    # Use a non-seeded source so seed_everything() doesn't make all jobs identical.
+    _rng = random.Random(os.getpid() ^ int(time.time() * 1000))
+    _jitter = _rng.uniform(0, 3.0)
+    log.info(f"NFS jitter: sleeping {_jitter:.2f}s before data loading (pid={os.getpid()})")
+    time.sleep(_jitter)
 
     log.info("Generating trajectories (this may take several minutes if cache is cold)...")
     log.info("Calling make_trajectories...")

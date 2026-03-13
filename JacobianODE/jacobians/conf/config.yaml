@@ -13,6 +13,8 @@ wandb_project: null
 wandb_group: null  # Optional: group runs into separate experiments within the same project
 
 hydra:
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}
   # mode: MULTIRUN
   job:
     chdir: True

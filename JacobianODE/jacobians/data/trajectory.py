@@ -30,8 +30,9 @@ def _nfs_safe_makedirs(path: str, jlog: logging.Logger) -> None:
     """
     if os.path.isdir(path):
         return
-    # Stagger concurrent jobs so NFS metadata ops don't pile up
-    time.sleep(random.uniform(0, 2.0))
+    # Use a non-seeded RNG so seed_everything() doesn't make all jobs identical
+    _rng = random.Random(os.getpid() ^ int(time.time() * 1000))
+    time.sleep(_rng.uniform(0, 2.0))
     try:
         os.makedirs(path, exist_ok=True)
     except OSError:

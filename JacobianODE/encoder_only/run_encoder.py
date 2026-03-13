@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import os
+import random
+import time
 
 import hydra
 import torch
@@ -114,9 +116,19 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     seed_everything(cfg.data.flow.random_state)
 
+    # Stagger concurrent SLURM jobs to avoid NFS contention.
+    # Use a non-seeded source so seed_everything() doesn't make all jobs identical.
+    _rng = random.Random(os.getpid() ^ int(time.time() * 1000))
+    jitter = _rng.uniform(0, 3.0)
+    log.info(f"NFS jitter: sleeping {jitter:.2f}s before data loading (pid={os.getpid()})")
+    time.sleep(jitter)
+
+    log.info("Calling make_trajectories...")
     eq, sol, dt = make_trajectories(cfg)
+    log.info("make_trajectories returned")
     values_raw = sol["values"]
 
+    log.info("Calling postprocess_data...")
     result = postprocess_data(cfg, values_raw)
     values = result.values
     mu, sigma = result.mu, result.sigma
@@ -130,6 +142,7 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # DATALOADERS
     # ------------------------------------------------------------------
+    log.info("Creating dataloaders...")
     train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
         cfg, values
     )
@@ -141,6 +154,7 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # WANDB
     # ------------------------------------------------------------------
+    log.info("Setting up W&B...")
     prompt_entity = cfg.wandb_entity is None
     name = _make_run_name(cfg)
     project = _make_project(cfg)
@@ -154,6 +168,7 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # MODEL
     # ------------------------------------------------------------------
+    log.info("Creating model...")
     seed_everything(cfg.data.flow.random_state + cfg.training.run_number + 1)
 
     # Instantiate encoder, injecting runtime n_input
@@ -181,6 +196,7 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # TRAIN
     # ------------------------------------------------------------------
+    log.info("Starting training...")
     wandb_group = cfg.get("wandb_group") or None
 
     train_model(
