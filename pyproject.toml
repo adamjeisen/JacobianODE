@@ -40,6 +40,7 @@ dependencies = [
     "sdeint",
     "torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git",
     "nbconvert",
+    "wmtask @ git+ssh://git@github.com/adamjeisen/wmtask.git",
 ]
 
 [dependency-groups]

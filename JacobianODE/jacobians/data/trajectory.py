@@ -146,6 +146,28 @@ def make_trajectories(
             logger.info(f"Time step (dt): {dt_loaded}")
 
         return eq, sol, dt_loaded
+    elif cfg.data.data_type == "wmtask":
+        eq = None
+        sol, dt_loaded = instantiate(cfg.data.dataset_loader)
+
+        validate_data_shape(sol["values"], "WMTask data")
+
+        data_dim = sol["values"].shape[-1]
+        if cfg.data.flow.dim is not None and cfg.data.flow.dim != data_dim:
+            raise ValueError(
+                f"Data dimension mismatch: config specifies data.flow.dim={cfg.data.flow.dim}, "
+                f"but loaded data has dimension {data_dim}. "
+                f"Please update data.flow.dim to match your data."
+            )
+
+        if verbose:
+            n_trials, n_time, n_dims = sol["values"].shape
+            logger.info(
+                f"Loaded WMTask data: {n_trials} trials, {n_time} timepoints, {n_dims} dimensions"
+            )
+            logger.info(f"Time step (dt): {dt_loaded}")
+
+        return eq, sol, dt_loaded
     else:
         raise ValueError(f"Unknown data type: {cfg.data.data_type}")
 

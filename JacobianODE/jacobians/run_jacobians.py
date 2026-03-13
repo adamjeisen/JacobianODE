@@ -95,10 +95,10 @@ def _run_training(cfg: DictConfig) -> None:
     raw_values_noise = None
     if (
         cfg.data.data_type == "wmtask"
-        and cfg.data.trajectory_params.model_to_load != "final"
+        and cfg.data.dataset_loader.model_to_load != "final"
     ):
         temp_cfg = cfg.copy()
-        temp_cfg.data.trajectory_params.model_to_load = "final"
+        temp_cfg.data.dataset_loader.model_to_load = "final"
         _, sol_noise, _ = make_trajectories(temp_cfg)
         raw_values_noise = sol_noise["values"]
 
