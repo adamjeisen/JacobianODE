@@ -410,6 +410,7 @@ def train_fnn_model(
             patience=cfg.training.early_stopping.patience,
             mode=cfg.training.early_stopping.mode,
             percent_thresh=cfg.training.early_stopping.get("percent_thresh", 0.01),
+            min_epochs=cfg.training.early_stopping.get("min_epochs", 0),
         )
     else:
         early_stopping_callback = EarlyStopping(

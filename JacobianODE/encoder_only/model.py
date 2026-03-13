@@ -422,9 +422,17 @@ class LitEncoderDecoder(L.LightningModule):
             )
             self.validation_losses.append(mean_val_loss)
             if len(self.validation_losses) > 1:
-                prev_loss = self.validation_losses[-2]
+                # Use last non-NaN losses for comparison (NaN comparisons always return False)
+                prev_loss = next(
+                    (x for x in reversed(self.validation_losses[:-1]) if not math.isnan(x)),
+                    None,
+                )
                 curr_loss = self.validation_losses[-1]
-                if prev_loss > curr_loss:
+                if (
+                    prev_loss is not None
+                    and not math.isnan(curr_loss)
+                    and prev_loss > curr_loss
+                ):
                     percent_improvement = (prev_loss - curr_loss) / prev_loss
                     self.percent_improvements.append(percent_improvement)
                 else:

@@ -128,7 +128,8 @@ def train_jacobians(cfg: DictConfig) -> None:
     # ----------------------------------------
     # TRAIN MODEL
     # ----------------------------------------
-    train_model(cfg, lit_model, train_dataloader, val_dataloader, name, project, entity=entity)
+    wandb_group = cfg.get("wandb_group") or None
+    train_model(cfg, lit_model, train_dataloader, val_dataloader, name, project, entity=entity, group=wandb_group)
 
 
 if __name__ == "__main__":

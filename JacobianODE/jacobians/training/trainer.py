@@ -28,6 +28,7 @@ def train_model(
     name: str,
     project: str,
     entity: Optional[str] = None,
+    group: Optional[str] = None,
 ) -> None:
     """Train the model using PyTorch Lightning.
 
@@ -42,6 +43,7 @@ def train_model(
         name: Name of the training run.
         project: W&B project name.
         entity: W&B entity/team name. Defaults to None.
+        group: W&B group name to organize runs within the project. Defaults to None.
 
     Example:
         >>> train_model(cfg, lit_model, train_dl, val_dl, name="run1", project="my-project")
@@ -59,6 +61,8 @@ def train_model(
     }
     if entity is not None:
         logger_kwargs["entity"] = entity
+    if group is not None:
+        logger_kwargs["group"] = group
 
     experiment_logger = instantiate(cfg.training.logger, **logger_kwargs)
 
@@ -88,6 +92,7 @@ def train_model(
             patience=cfg.training.early_stopping.early_stopping_patience,
             mode=cfg.training.early_stopping.mode,
             percent_thresh=cfg.training.early_stopping.percent_thresh,
+            min_epochs=cfg.training.early_stopping.get("min_epochs", 0),
         )
     else:
         early_stopping_callback = EarlyStopping(

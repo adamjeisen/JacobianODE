@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import torch
 from omegaconf import DictConfig
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from .splitting import generate_train_and_test_sets
 
@@ -94,10 +94,18 @@ def create_dataloaders(
         pin_memory=pin_memory,
     )
 
+    # Fixed random permutation so limit_val_batches selects a representative
+    # (but deterministic) subset rather than the first N sequential batches.
+    val_seed = int(cfg.data.flow.random_state)
+    val_perm = torch.randperm(
+        len(val_dataset), generator=torch.Generator().manual_seed(val_seed)
+    )
+    val_dataset_perm = Subset(val_dataset, val_perm.tolist())
+
     val_dataloader = DataLoader(
-        val_dataset,
+        val_dataset_perm,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,

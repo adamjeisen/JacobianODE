@@ -61,6 +61,11 @@ class LitLatentJacobianODE(LitBase):
         latent_prediction_loss_weight=0.0,
         jac_consistency_weight=0.0,
         fnn_weight=0.0,
+        fnn_normalize=False,
+        fnn_elementwise_regularization=False,
+        latent_noise_scale=0.0,
+        latent_noise_per_step=False,
+        precompute_latent_noise_factor=True,
         learn_r2_weight=False,
         learn_loop_closure_weight=False,
         learn_fnn_weight=False,
@@ -77,6 +82,12 @@ class LitLatentJacobianODE(LitBase):
         self.latent_prediction_loss_weight = latent_prediction_loss_weight
         self.jac_consistency_weight = jac_consistency_weight
         self.fnn_weight = fnn_weight
+        self.fnn_normalize = fnn_normalize
+        self.fnn_elementwise_regularization = fnn_elementwise_regularization
+        self.latent_noise_scale = latent_noise_scale
+        self.latent_noise_per_step = latent_noise_per_step
+        self.precompute_latent_noise_factor = precompute_latent_noise_factor
+        self._latent_noise_scale_factor = None
         # Stride for JacobianODE sub-windows within each encoded batch.
         # Defaults to prediction_steps (non-overlapping).
         self.jac_window_stride = jac_window_stride if jac_window_stride is not None else prediction_steps
@@ -327,6 +338,8 @@ class LitLatentJacobianODE(LitBase):
         all_metrics=False,
         direct=None,
         obs_noise_scale=None,
+        latent_noise_scale=None,
+        latent_noise_per_step=None,
         alpha_teacher_forcing=None,
         teacher_forcing_steps=None,
         jacobianODEint_kwargs=None,
@@ -347,6 +360,10 @@ class LitLatentJacobianODE(LitBase):
         """
         if obs_noise_scale is None:
             obs_noise_scale = self.obs_noise_scale
+        if latent_noise_scale is None:
+            latent_noise_scale = self.latent_noise_scale
+        if latent_noise_per_step is None:
+            latent_noise_per_step = self.latent_noise_per_step
         if alpha_teacher_forcing is None:
             alpha_teacher_forcing = self.alpha_teacher_forcing
         if teacher_forcing_steps is None:
@@ -365,6 +382,26 @@ class LitLatentJacobianODE(LitBase):
 
         # 1. Encode full observation sequence
         z_full = self.encode_trajectory(batch_noisy)  # (B, T', D_latent)
+        z_clean = z_full  # clean targets for latent prediction loss
+
+        # Add isotropic noise in latent space before propagation.
+        # per_step=False (default): same noise offset for all timesteps in
+        #   each trajectory, displacing off-manifold without corrupting
+        #   consecutive-point differences (velocities).
+        # per_step=True: independent noise at each timestep.
+        if latent_noise_scale > 0:
+            if self._latent_noise_scale_factor is not None:
+                factor = self._latent_noise_scale_factor
+            else:
+                factor = z_full.detach().norm(dim=-1).mean() / math.sqrt(z_full.shape[-1])
+            if latent_noise_per_step:
+                noise = torch.randn_like(z_full) * latent_noise_scale * factor
+            else:
+                noise = torch.randn(
+                    z_full.shape[0], 1, z_full.shape[-1],
+                    device=z_full.device, dtype=z_full.dtype,
+                ) * latent_noise_scale * factor
+            z_full = z_full + noise
 
         # 2. Determine sub-window parameters
         traj_init_steps = jacobianODEint_kwargs.get('traj_init_steps', 15)
@@ -408,11 +445,14 @@ class LitLatentJacobianODE(LitBase):
 
         # Gather sub-windows: (N, jac_window_len, D_latent)
         z_windows_list = []
+        z_clean_windows_list = []
         for idx in range(start_indices.shape[0]):
             b = idx // n_windows_actual
             s = start_indices[idx]
             z_windows_list.append(z_full[b, s:s + jac_window_len])
+            z_clean_windows_list.append(z_clean[b, s:s + jac_window_len])
         z_windows = torch.stack(z_windows_list)  # (N, jac_window_len, D_latent)
+        z_clean_windows = torch.stack(z_clean_windows_list)
 
         # 3. Run JacobianODEint on all sub-windows
         jacobian_odeint = JacobianODEint(self.compute_jacobians, self.dt)
@@ -427,9 +467,9 @@ class LitLatentJacobianODE(LitBase):
             traj_init_steps=traj_init_steps,
         )  # (N, jac_window_len, D_latent)
 
-        # 4. Crop to prediction portion
+        # 4. Crop to prediction portion (use clean targets for latent loss)
         z_pred_crop = z_pred[..., traj_init_steps:, :]  # (N, prediction_steps, D_lat)
-        z_true_crop = z_windows[:, traj_init_steps:, :]  # (N, prediction_steps, D_lat)
+        z_true_crop = z_clean_windows[:, traj_init_steps:, :]
 
         # 5. Decode predicted latents and compare to raw observation targets
         decoded_pred = self.decode_trajectory(z_pred_crop)
@@ -724,7 +764,11 @@ class LitLatentJacobianODE(LitBase):
             if len(z_flat) > 1024:
                 idx = torch.randperm(len(z_flat), device=z_flat.device)[:1024]
                 z_flat = z_flat[idx]
-            fnn_loss = loss_false(z_flat)
+            fnn_loss = loss_false(
+                z_flat,
+                normalize=self.fnn_normalize,
+                elementwise_regularization=self.fnn_elementwise_regularization,
+            )
 
         # --- Group 4: Jac-consistency ---
         # ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
@@ -828,6 +872,7 @@ class LitLatentJacobianODE(LitBase):
         model_step_kwargs = {
             'alpha_teacher_forcing': self.alpha_validation,
             'obs_noise_scale': 0,
+            'latent_noise_scale': 0,
         }
 
         val_rets = {}

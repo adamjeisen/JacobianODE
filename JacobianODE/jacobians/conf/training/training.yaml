@@ -45,6 +45,9 @@ lightning:
   # -----------------
   # obs_noise_scale: 5e-2
   obs_noise_scale: 0
+  latent_noise_scale: 0  # isotropic noise added to latent embeddings before JacobianODE propagation (latent model only)
+  latent_noise_per_step: false  # false = same offset for all timesteps (manifold displacement); true = independent noise each step
+  precompute_latent_noise_factor: true  # true = precompute scale factor from training data; false = compute per-batch on-the-fly
   
   # -----------------
   # JACOBIAN REGULARIZATION
@@ -53,6 +56,8 @@ lightning:
   jac_norm_ord: 'fro'
   jac_consistency_weight: 0.0  # weight for ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
   fnn_weight: 0.0  # weight for FNN latent-geometry regularizer (Gilpin NeurIPS 2020)
+  fnn_normalize: false        # normalize FNN loss by activation variance
+  fnn_elementwise_regularization: false  # elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
 
   # -----------------
   # HOMOSCEDASTIC UNCERTAINTY WEIGHTING (Kendall et al. 2018)
@@ -125,6 +130,7 @@ trainer_params:
   # strategy: 'ddp_find_unused_parameters_true'
 
 early_stopping:
+  min_epochs: 0  # Training runs at least this many epochs before early stopping can trigger
   early_stopping_patience: 2
   # early_stopping_mode: 'min'
   early_stopping_mode: 'percent_thresh'

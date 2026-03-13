@@ -26,6 +26,7 @@ trainer_params:
   limit_val_batches: 1.0
 
 early_stopping:
+  min_epochs: 0  # Training runs at least this many epochs before early stopping can trigger
   early_stopping_mode: 'percent_thresh'
   patience: 2
   percent_thresh: 0.01

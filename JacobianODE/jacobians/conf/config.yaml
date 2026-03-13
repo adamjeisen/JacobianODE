@@ -10,6 +10,7 @@ defaults:
 logger: wandb
 wandb_entity: JacobianODE
 wandb_project: null
+wandb_group: null  # Optional: group runs into separate experiments within the same project
 
 hydra:
   # mode: MULTIRUN

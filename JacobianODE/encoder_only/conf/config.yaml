@@ -9,6 +9,7 @@ defaults:
 
 wandb_entity: JacobianODE
 wandb_project: null   # if null, auto-generated as <DataClass>__EncoderOnly
+wandb_group: null     # Optional: group runs into separate experiments within the same project
 
 hydra:
   job:

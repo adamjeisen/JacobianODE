@@ -1,4 +1,5 @@
 import gc
+import math
 import numpy as np
 import lightning as L
 from lightning.pytorch.core.optimizer import LightningOptimizer
@@ -759,9 +760,17 @@ class LitBase(L.LightningModule):
             mean_val_loss = sum(self.current_epoch_val_losses) / len(self.current_epoch_val_losses)
             self.validation_losses.append(mean_val_loss)
             if len(self.validation_losses) > 1:
-                prev_loss = self.validation_losses[-2]
+                # Use last non-NaN losses for comparison (NaN comparisons always return False)
+                prev_loss = next(
+                    (x for x in reversed(self.validation_losses[:-1]) if not math.isnan(x)),
+                    None,
+                )
                 curr_loss = self.validation_losses[-1]
-                if prev_loss > curr_loss:
+                if (
+                    prev_loss is not None
+                    and not math.isnan(curr_loss)
+                    and prev_loss > curr_loss
+                ):
                     percent_improvement = (prev_loss - curr_loss) / prev_loss
                     self.percent_improvements.append(percent_improvement)
                     # print(f"  Current percent improvement: {percent_improvement:.4f}")
@@ -1016,24 +1025,58 @@ class PercentEarlyStopping(EarlyStopping):
 
     Args:
         percent_thresh (float): Minimum percentage improvement required (default: 0.01)
+        min_epochs (int): Minimum number of epochs to complete before early stopping
+            can trigger. Training always runs at least this many epochs. (default: 0)
         *args: Additional arguments for EarlyStopping
         **kwargs: Additional keyword arguments for EarlyStopping
     """
     def __init__(self, *args, **kwargs):
-        # Extract percent_thresh before calling parent init
+        # Extract percent_thresh and min_epochs before calling parent init
         self.percent_thresh = kwargs.pop('percent_thresh', 0.01)
+        self.min_epochs = kwargs.pop('min_epochs', 0)
         super().__init__(*args, **kwargs)
         self.prev_loss = None
         self.wait_count = 0
 
+    def _run_early_stopping_check(self, trainer):
+        """Skip early stopping check until min_epochs have completed."""
+        if trainer.current_epoch < self.min_epochs:
+            return
+        super()._run_early_stopping_check(trainer)
+
     def _evaluate_stopping_criteria(self, current):
-        if self.prev_loss is None:
-            self.prev_loss = current
+        # Convert to Python float for NaN/inf checks (current may be a 0-dim tensor)
+        current_val = current.item() if hasattr(current, 'item') else current
+        try:
+            current_is_nan = not math.isfinite(float(current_val))
+        except (TypeError, ValueError):
+            current_is_nan = True
+
+        # Ignore NaN/Inf: don't update baseline, count as no improvement
+        if current_is_nan:
+            self.wait_count += 1
+            if self.wait_count >= self.patience:
+                self.wait_count = 0
+                return True, None
             return False, None
 
-        # Calculate percent improvement
-        if self.prev_loss > current:
-            percent_improvement = (self.prev_loss - current) / self.prev_loss
+        if self.prev_loss is None:
+            self.prev_loss = current_val
+            return False, None
+
+        # prev_loss may be stale NaN/Inf from a previous epoch; reset to current valid value
+        try:
+            prev_is_nan = not math.isfinite(float(self.prev_loss))
+        except (TypeError, ValueError):
+            prev_is_nan = True
+        if prev_is_nan:
+            self.prev_loss = current_val
+            self.wait_count = 0  # New baseline, don't count against patience
+            return False, None
+
+        # Calculate percent improvement (both values are valid)
+        if self.prev_loss > current_val:
+            percent_improvement = (self.prev_loss - current_val) / self.prev_loss
             if percent_improvement < self.percent_thresh:
                 self.wait_count += 1
             else:
@@ -1041,11 +1084,11 @@ class PercentEarlyStopping(EarlyStopping):
         else:
             self.wait_count += 1
 
-        self.prev_loss = current
-        
+        self.prev_loss = current_val
+
         # Check if we've waited long enough
         if self.wait_count >= self.patience:
             self.wait_count = 0  # Reset for potential future use
             return True, None
-            
+
         return False, None

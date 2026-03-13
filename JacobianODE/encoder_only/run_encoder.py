@@ -181,6 +181,8 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # TRAIN
     # ------------------------------------------------------------------
+    wandb_group = cfg.get("wandb_group") or None
+
     train_model(
         cfg,
         lit_model,
@@ -189,6 +191,7 @@ def train_encoder(cfg: DictConfig) -> None:
         name,
         project,
         entity=entity,
+        group=wandb_group,
     )
 
 

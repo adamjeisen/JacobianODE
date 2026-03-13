@@ -2,7 +2,7 @@ defaults:
   - _self_
   - training: training
   - data: dysts
-  - model: latent_ssm
+  - model: latent_ssm  # Overridden at runtime to match pretrained encoder (latent_mlp, latent_ssm, etc.)
   - slurm: default
   - override hydra/sweeper: list  # required for --multirun with comma-separated values
 

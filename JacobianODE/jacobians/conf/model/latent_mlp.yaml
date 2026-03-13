@@ -9,12 +9,17 @@ params:
   activation: 'silu'
 
 encoder:
-  _target_: JacobianODE.fnn.networks.MLPAutoencoder
+  _target_: JacobianODE.fnn.sequence_networks.build_mlp
+  n_input: 1
   n_latent: 10
-  time_window: 50
-  n_features: 1
-  network_shape: [128, 128]
+  hidden_dim: 128
+  n_layers: 3
+  dropout: 0.1
+  decoder_hidden: 128
+  decoder_layers: 2
+  context_margin: 0
 
 prediction_steps: 10  # how many latent steps to predict forward
                       # JacobianODE window = traj_init_steps (15) + prediction_steps (10) = 25
 encoder_warmup_epochs: 0
+jac_window_stride: null  # defaults to prediction_steps (non-overlapping)
