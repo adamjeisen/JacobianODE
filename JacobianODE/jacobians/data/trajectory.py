@@ -148,8 +148,13 @@ def make_trajectories(
 
         return eq, sol, dt_loaded
     elif cfg.data.data_type == "wmtask":
-        eq = None
-        sol, dt_loaded = instantiate(cfg.data.dataset_loader)
+        out = instantiate(cfg.data.dataset_loader)
+        if len(out) == 2:
+            # Backward compat: older wmtask returns (sol, dt) without eq
+            sol, dt_loaded = out
+            eq = None
+        else:
+            eq, sol, dt_loaded = out
 
         validate_data_shape(sol["values"], "WMTask data")
 

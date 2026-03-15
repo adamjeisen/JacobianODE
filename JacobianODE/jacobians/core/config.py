@@ -184,6 +184,20 @@ def initialize_config(
                 "This should match the last axis of your data (trials x time x dim)."
             )
         dim = cfg.data.flow.dim
+    elif cfg.data.data_type == "wmtask":
+        if cfg.data.flow.dim is None:
+            raise ValueError(
+                "For wmtask data, you must specify 'data.flow.dim' to set the data dimensionality. "
+                "This should match the hidden state dimension of the WM RNN (e.g., N1 + N2)."
+            )
+        delay_params = cfg.data.train_test_params.delay_embedding_params
+        if delay_params.observed_indices == "all":
+            dim = int(cfg.data.flow.dim) * int(delay_params.n_delays)
+        else:
+            dim = (
+                len(delay_params.observed_indices)
+                * int(delay_params.n_delays)
+            )
     else:
         raise ValueError(f"Data type {cfg.data.data_type} not supported")
 

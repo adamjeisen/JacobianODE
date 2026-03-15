@@ -3495,7 +3495,7 @@ wheels = [
 [[package]]
 name = "wmtask"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/adamjeisen/wmtask.git#4a324ba51c1da36b3bea5a3a6f10f22a56802c14" }
+source = { git = "ssh://git@github.com/adamjeisen/wmtask.git#14849626789616a8589c2669058d0fcdc72c0a88" }
 dependencies = [
     { name = "hydra-core" },
     { name = "lightning" },

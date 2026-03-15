@@ -48,6 +48,7 @@ def select_best_model(
     n_dims: int,
     eigenvalue_threshold: float = 0.001,
     use_loop_closure: bool = True,
+    loop_closure_n_dims: Optional[int] = None,
 ) -> SelectionResult:
     """Select the best model from a sequence of diagnostic metrics.
 
@@ -60,9 +61,12 @@ def select_best_model(
 
     Args:
         candidates: Sequence of DiagnosticMetrics, one per model.
-        n_dims: State-space dimensionality for C2.
+        n_dims: State-space dimensionality (used for C2 when loop_closure_n_dims
+            is None; for latent models, pass loop_closure_n_dims=n_latent instead).
         eigenvalue_threshold: Threshold for C3 (default 0.001).
         use_loop_closure: Whether to apply C2 (False for NeuralODE).
+        loop_closure_n_dims: Dimension for C2 threshold sqrt(n). For latent models
+            (LitLatentJacobianODE), use n_latent. When None, defaults to n_dims.
 
     Returns:
         SelectionResult with selection outcome and diagnostics.
@@ -81,8 +85,9 @@ def select_best_model(
     fails_c1 = [
         fails_one_step_criterion(m) for m in candidates
     ]
+    lc_dims = loop_closure_n_dims if loop_closure_n_dims is not None else n_dims
     fails_c2 = [
-        fails_loop_closure_criterion(m, n_dims) if use_loop_closure else False
+        fails_loop_closure_criterion(m, lc_dims) if use_loop_closure else False
         for m in candidates
     ]
     fails_c3 = [

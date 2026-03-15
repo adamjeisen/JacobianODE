@@ -2,7 +2,8 @@
 
 Implements the physics-informed model selection criteria from Appendix D.8.8:
   C1 (one-step MASE): model must beat persistence (MASE < 1)
-  C2 (loop closure): loop closure loss must be below sqrt(n_dims)
+  C2 (loop closure): loop closure loss must be below sqrt(n) where n is the
+  loop-closure space dimension (n_latent for latent models, n_dims otherwise)
   C3 (eigenvalue): fraction of fast eigenvalues must be below threshold
 
 Reference: checkpoints/wandb_utils.py lines 210-240, 266, 276-320.
@@ -169,23 +170,26 @@ def fails_one_step_criterion(metrics: DiagnosticMetrics) -> bool:
 
 
 def fails_loop_closure_criterion(
-    metrics: DiagnosticMetrics, n_dims: int
+    metrics: DiagnosticMetrics, loop_closure_n_dims: int
 ) -> bool:
     """C2: Does the model fail the loop closure criterion?
 
-    A model fails if its loop closure loss exceeds sqrt(n_dims).
+    A model fails if its loop closure loss exceeds sqrt(loop_closure_n_dims).
+    For latent models (LitLatentJacobianODE), loop closure is computed in latent
+    space, so use n_latent. For non-latent models, use the state-space dimension.
     Models without loop closure loss (e.g., NeuralODE) always pass.
 
     Args:
         metrics: Diagnostic metrics for the model.
-        n_dims: Dimensionality of the state space.
+        loop_closure_n_dims: Dimensionality of the space where loop closure
+            is computed (n_latent for latent models, n_dims otherwise).
 
     Returns:
         True if the model FAILS (should be excluded).
     """
     if metrics.loop_closure_loss is None:
         return False
-    return metrics.loop_closure_loss > math.sqrt(n_dims)
+    return metrics.loop_closure_loss > math.sqrt(loop_closure_n_dims)
 
 
 def fails_eigenvalue_criterion(

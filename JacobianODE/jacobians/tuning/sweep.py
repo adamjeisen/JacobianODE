@@ -71,6 +71,7 @@ def run_sweep(
     mu: float = 0.0,
     sigma: float = 1.0,
     verbose: bool = False,
+    n_latent: Optional[int] = None,
 ) -> SweepResult:
     """Run a full hyperparameter sweep over lambda_loop values (notebook mode).
 
@@ -152,6 +153,7 @@ def run_sweep(
         n_dims,
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
+        loop_closure_n_dims=n_latent,
     )
 
     best_model = None
@@ -184,6 +186,7 @@ def select_from_wandb_runs(
     lambda_values: Optional[List[float]] = None,
     save_dir: Optional[str] = None,
     verbose: bool = False,
+    n_latent: Optional[int] = None,
 ) -> SweepResult:
     """Select the best model from already-trained W&B runs (post-hoc mode).
 
@@ -202,6 +205,9 @@ def select_from_wandb_runs(
         save_dir: If set, cache diagnostics per run in save_dir/diagnostics_cache/
             so the same run can be reused across sweeps without recomputing.
         verbose: Whether to print progress.
+        n_latent: Latent dimension of the encoder. For latent models
+            (LitLatentJacobianODE), C2 uses sqrt(n_latent) instead of sqrt(n_dims).
+            When None, uses n_dims for C2.
 
     Returns:
         SweepResult with selection, diagnostics, and run IDs.
@@ -303,6 +309,7 @@ def select_from_wandb_runs(
         n_dims,
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
+        loop_closure_n_dims=n_latent,
     )
 
     if lambda_values is None:

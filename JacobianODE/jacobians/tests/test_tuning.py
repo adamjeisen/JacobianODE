@@ -43,18 +43,18 @@ class TestFailsLoopClosureCriterion:
     def test_passes_when_below_sqrt_dim(self):
         m = DiagnosticMetrics(one_step_mase=0.1, loop_closure_loss=1.0,
                               fast_eigenvalue_fraction=0.0, trajectory_val_loss=0.3)
-        assert not fails_loop_closure_criterion(m, n_dims=4)  # sqrt(4) = 2
+        assert not fails_loop_closure_criterion(m, loop_closure_n_dims=4)  # sqrt(4) = 2
 
     def test_fails_when_above_sqrt_dim(self):
         m = DiagnosticMetrics(one_step_mase=0.1, loop_closure_loss=3.0,
                               fast_eigenvalue_fraction=0.0, trajectory_val_loss=0.3)
-        assert fails_loop_closure_criterion(m, n_dims=4)
+        assert fails_loop_closure_criterion(m, loop_closure_n_dims=4)
 
     def test_none_loop_closure_always_passes(self):
         """NeuralODE mode: no loop closure -> always passes."""
         m = DiagnosticMetrics(one_step_mase=0.1, loop_closure_loss=None,
                               fast_eigenvalue_fraction=0.0, trajectory_val_loss=0.3)
-        assert not fails_loop_closure_criterion(m, n_dims=4)
+        assert not fails_loop_closure_criterion(m, loop_closure_n_dims=4)
 
 
 class TestFailsEigenvalueCriterion:
