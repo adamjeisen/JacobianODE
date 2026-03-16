@@ -18,12 +18,14 @@ from __future__ import annotations
 import logging
 import os
 import random
+import sys
 import time
+import traceback
 
 import hydra
 import torch
 from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, read_write
 
 from ..jacobians.core import seed_everything
 from ..jacobians.data import create_dataloaders, make_trajectories, postprocess_data
@@ -65,7 +67,7 @@ def _make_run_name(cfg: DictConfig) -> str:
         parts.append("next")
 
     # Regularisation weights (only non-zero)
-    for key in ("fnn_weight", "amplification_weight", "decov_weight"):
+    for key in ("fnn_weight", "amplification_weight", "decov_weight", "jacobian_nuclear_weight"):
         val = cfg.training.lightning.get(key, 0.0)
         if val and val != 0.0:
             parts.append(f"{key}_{val:.4g}")
@@ -88,17 +90,17 @@ def _make_project(cfg: DictConfig) -> str:
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def train_encoder(cfg: DictConfig) -> None:
-    """Train an encoder-only representation learning model.
+    """Hydra entry point: runs encoder training with explicit traceback on error."""
+    try:
+        _train_encoder_impl(cfg)
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise
 
-    Pipeline
-    --------
-    1. Environment setup (GPU, logging, config)
-    2. Data generation and preprocessing
-    3. DataLoader creation
-    4. W&B setup
-    5. Model instantiation
-    6. Training
-    """
+
+def _train_encoder_impl(cfg: DictConfig) -> None:
+    """Internal implementation of encoder training. See train_encoder for docs."""
     # ------------------------------------------------------------------
     # SETUP
     # ------------------------------------------------------------------
@@ -196,6 +198,19 @@ def train_encoder(cfg: DictConfig) -> None:
     # ------------------------------------------------------------------
     # TRAIN
     # ------------------------------------------------------------------
+    # When both decoders are disabled, early stopping / checkpointing should
+    # monitor a regularization metric. Default to val/amplification_loss.
+    use_same = bool(cfg.model.get("use_same_state_decoder", True))
+    use_next = bool(cfg.model.get("use_next_state_decoder", False))
+    if not use_same and not use_next:
+        with read_write(cfg):
+            cfg.training.early_stopping.monitor = "val/amplification_loss"
+            cfg.training.model_checkpoint.monitor = "val/amplification_loss"
+        log.info(
+            "Both decoders disabled; monitoring val/amplification_loss for "
+            "early stopping and checkpointing"
+        )
+
     log.info("Starting training...")
     wandb_group = cfg.get("wandb_group") or None
 
@@ -212,4 +227,9 @@ def train_encoder(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    train_encoder()
+    try:
+        train_encoder()
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        raise

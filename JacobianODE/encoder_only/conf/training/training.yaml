@@ -35,6 +35,8 @@ lightning:
   fnn_n_samples: 1024      # Max points for FNN (O(N²)); null = use all
   amplification_weight: 0.0 # Noise amplification regulariser
   decov_weight: 0.0         # DeCov off-diagonal covariance penalty (Cogswell ICLR 2016)
+  jacobian_nuclear_weight: 0.0  # Nuclear norm of encoder Jacobian (mean of singular values per point)
+  jacobian_nuclear_n_samples: 256  # Max points for Jacobian nuclear loss; null = use all
 
   # Advanced: amplification regulariser settings
   amplification_n_neighbors: 10

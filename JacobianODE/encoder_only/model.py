@@ -68,6 +68,13 @@ class LitEncoderDecoder(L.LightningModule):
         Loss coefficient for the noise-amplification regulariser.  0 disables it.
     decov_weight : float
         Loss coefficient for the DeCov regulariser.  0 disables it.
+    jacobian_nuclear_weight : float
+        Loss coefficient for the encoder Jacobian nuclear-norm regulariser.
+        At each point, computes the mean of singular values of dz/dx; regularises
+        the batch mean.  0 disables it.
+    jacobian_nuclear_n_samples : int, optional
+        Max number of points to subsample when computing the Jacobian nuclear loss
+        (O(N) SVDs).  If None, use all points.
     amplification_n_neighbors : int
         k-NN neighbourhood size for the amplification loss.
     amplification_max_T : int
@@ -130,6 +137,8 @@ class LitEncoderDecoder(L.LightningModule):
         fnn_n_samples: Optional[int] = None,
         amplification_weight: float = 0.0,
         decov_weight: float = 0.0,
+        jacobian_nuclear_weight: float = 0.0,
+        jacobian_nuclear_n_samples: Optional[int] = 256,
         amplification_n_neighbors: int = 10,
         amplification_max_T: int = 5,
         optimizer: str = "AdamW",
@@ -167,6 +176,8 @@ class LitEncoderDecoder(L.LightningModule):
         self.fnn_n_samples = fnn_n_samples
         self.amplification_weight = amplification_weight
         self.decov_weight = decov_weight
+        self.jacobian_nuclear_weight = jacobian_nuclear_weight
+        self.jacobian_nuclear_n_samples = jacobian_nuclear_n_samples
         self.amplification_n_neighbors = amplification_n_neighbors
         self.amplification_max_T = amplification_max_T
 
@@ -183,10 +194,18 @@ class LitEncoderDecoder(L.LightningModule):
                 out_dim=self.k_steps_ahead * self.n_obs_pred,
             )
 
-        if not (use_same_state_decoder or use_next_state_decoder):
+        # Require at least one decoder OR at least one regularization loss
+        no_decoders = not (use_same_state_decoder or use_next_state_decoder)
+        no_reg = (
+            fnn_weight == 0
+            and amplification_weight == 0
+            and decov_weight == 0
+            and jacobian_nuclear_weight == 0
+        )
+        if no_decoders and no_reg:
             raise ValueError(
-                "At least one of use_same_state_decoder or "
-                "use_next_state_decoder must be True."
+                "At least one of use_same_state_decoder, use_next_state_decoder, "
+                "or a regularisation weight (fnn, amplification, decov, jacobian_nuclear) must be enabled."
             )
 
         self.optimizer_name = optimizer
@@ -236,6 +255,65 @@ class LitEncoderDecoder(L.LightningModule):
         entropy = -(p * torch.log(p)).sum()
         max_entropy = math.log(self.n_latent) if self.n_latent > 1 else 1.0
         return entropy / max_entropy
+
+    def _encoder_jacobian_nuclear_loss(
+        self, x_valid: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean of singular values of encoder Jacobian, averaged over points.
+
+        For each point x_i, computes the encoder Jacobian J = dz/dx, its singular
+        values, and their mean. The loss is the batch mean of these per-point
+        means (equivalent to nuclear norm / min(n_latent, n_obs) per point).
+
+        Parameters
+        ----------
+        x_valid : torch.Tensor
+            (B, T', D_obs) observation batch (after context margin).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss: mean over (subsampled) points of mean(singular values).
+        """
+        x_flat = x_valid.reshape(-1, self.n_obs)
+        N = x_flat.shape[0]
+        if N == 0:
+            return x_valid.new_zeros(1).squeeze()
+
+        if (
+            self.jacobian_nuclear_n_samples is not None
+            and N > self.jacobian_nuclear_n_samples
+        ):
+            idx = torch.randperm(N, device=x_valid.device)[
+                : self.jacobian_nuclear_n_samples
+            ]
+            x_sample = x_flat[idx]
+        else:
+            x_sample = x_flat
+
+        # Use autograd.grad to compute Jacobian (no jacfwd/vmap — avoids dropout randomness error).
+        # J[i,j] = dz[i]/dx[j]; compute row i via grad(z[i], x) with grad_outputs=e_i.
+        mean_svals_list: list[torch.Tensor] = []
+        for i in range(x_sample.shape[0]):
+            x_i = x_sample[i].requires_grad_(True)
+            z_i = self.encoder(x_i.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+            # J: (n_latent, n_obs); build row by row
+            rows: list[torch.Tensor] = []
+            for j in range(self.n_latent):
+                g_out = torch.zeros_like(z_i)
+                g_out[j] = 1.0
+                (g,) = torch.autograd.grad(
+                    z_i,
+                    x_i,
+                    grad_outputs=g_out,
+                    retain_graph=(j < self.n_latent - 1),
+                    create_graph=True,
+                )
+                rows.append(g)
+            J_i = torch.stack(rows, dim=0)  # (n_latent, n_obs)
+            svals_i = torch.linalg.svdvals(J_i)
+            mean_svals_list.append(svals_i.mean())
+        return torch.stack(mean_svals_list).mean()
 
     # ------------------------------------------------------------------
     # Forward
@@ -360,7 +438,8 @@ class LitEncoderDecoder(L.LightningModule):
         # ----------------------------------------------------------
         if self.amplification_weight > 0:
             amp_loss = loss_amplification(
-                z_valid.float(),
+                embedding=z_valid.float(),
+                data=x_valid.float(),
                 n_neighbors=self.amplification_n_neighbors,
                 max_T=self.amplification_max_T,
                 normalize=True,
@@ -376,6 +455,16 @@ class LitEncoderDecoder(L.LightningModule):
             decov_loss = loss_cov(z_flat)
             total_loss = total_loss + self.decov_weight * decov_loss
             log_dict[f"{prefix}/decov_loss"] = decov_loss.detach()
+
+        # ----------------------------------------------------------
+        # Encoder Jacobian nuclear-norm regularisation
+        # At each point: mean(singular values of dz/dx).  Penalises large
+        # singular values to encourage contractive / low-rank encoder maps.
+        # ----------------------------------------------------------
+        if self.jacobian_nuclear_weight > 0:
+            jac_nuc_loss = self._encoder_jacobian_nuclear_loss(x_valid)
+            total_loss = total_loss + self.jacobian_nuclear_weight * jac_nuc_loss
+            log_dict[f"{prefix}/jacobian_nuclear_loss"] = jac_nuc_loss.detach()
 
         # ----------------------------------------------------------
         # Latent utilization (diagnostic, no gradient)

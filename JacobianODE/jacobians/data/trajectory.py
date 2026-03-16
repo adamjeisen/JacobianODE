@@ -211,12 +211,16 @@ def make_dysts_trajectories(
     if save_dir is None:
         save_dir = cfg.training.logger.save_dir
 
-    jlog.info("make_dysts_trajectories: about to makedirs save_dir=%s", save_dir)
-    _nfs_safe_makedirs(save_dir, jlog)
-    jlog.info("make_dysts_trajectories: makedirs save_dir done")
+    _skip_mkdirs = cfg.get("dirs_precreated", False)
+    if _skip_mkdirs:
+        jlog.info("make_dysts_trajectories: dirs_precreated=True, skipping makedirs")
+    else:
+        jlog.info("make_dysts_trajectories: about to makedirs save_dir=%s", save_dir)
+        _nfs_safe_makedirs(save_dir, jlog)
+        jlog.info("make_dysts_trajectories: makedirs save_dir done")
     data_save_dir = os.path.join(save_dir, "dysts_data")
 
-    if save_file:
+    if save_file and not _skip_mkdirs:
         jlog.info("make_dysts_trajectories: about to makedirs data_save_dir=%s", data_save_dir)
         _nfs_safe_makedirs(data_save_dir, jlog)
         jlog.info("make_dysts_trajectories: makedirs data_save_dir done")
