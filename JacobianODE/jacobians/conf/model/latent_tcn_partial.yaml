@@ -1,0 +1,41 @@
+# Partial observation config: "Embed Big, Let Dynamics Prune"
+#
+# Strategy: Use a generous latent dimension with a causal sequence encoder
+# and nuclear norm regularization on the dynamics Jacobian.  The nuclear
+# norm encourages the Jacobian to be low-rank, so only the dynamically
+# relevant latent dimensions carry nonzero singular values.  After training,
+# perform tangent-space SVD to determine the effective dimension.
+#
+# Usage:
+#   1. Set n_input to the (delay-embedded) observation dimension.
+#   2. Set n_latent to a generous upper bound (e.g. 2*expected_dim + 1).
+#   3. Train with learn_jac_norm_weight=true and jac_norm_type='nuclear'.
+#   4. After training, use the encoder Jacobian SVD analysis to determine
+#      the effective latent dimension.
+#   5. Optionally retrain with n_latent set to the discovered dimension.
+
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_latent, set at runtime
+  hidden_dim: [256, 512, 512]
+  num_layers: 3
+  output_dim: null   # = n_latent * n_latent, set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.build_tcn
+  n_input: 1          # Set to observation dim (after any delay embedding)
+  n_latent: 15        # Generous: overembed, then let dynamics prune
+  n_channels: 64
+  kernel_size: 7
+  n_layers: 4
+  dropout: 0.1
+  decoder_hidden: 128
+  decoder_layers: 2
+  context_margin: 10  # Causal encoder needs warm-up for partial obs
+
+prediction_steps: 10
+encoder_warmup_epochs: 0
+jac_window_stride: null

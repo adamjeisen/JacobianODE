@@ -239,6 +239,7 @@ class LitBase(L.LightningModule):
                     k_scale=None,
                     jac_penalty=0.0,
                     jac_norm_ord='fro',
+                    jac_norm_type='fro',
                     loop_closure_training=True,
                     mix_trajectories=True,  
                     loop_closure_interp_pts=20,
@@ -304,6 +305,7 @@ class LitBase(L.LightningModule):
         self.k_scale = k_scale
         self.jac_penalty = jac_penalty
         self.jac_norm_ord = jac_norm_ord
+        self.jac_norm_type = jac_norm_type
         self.loop_closure_training = loop_closure_training
         self.loop_closure_interp_pts = loop_closure_interp_pts
         self.loop_closure_int_method = loop_closure_int_method
@@ -619,7 +621,10 @@ class LitBase(L.LightningModule):
         else:
             jacs_pred = self.get_pred_jacs(batch)
         if jacs_pred is not None:
-            jac_norm = torch.linalg.norm(jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord).mean()
+            if self.jac_norm_type == 'nuclear':
+                jac_norm = torch.linalg.svdvals(jacs_pred).sum(dim=-1).mean()
+            else:
+                jac_norm = torch.linalg.norm(jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord).mean()
             self.update_alpha_teacher_forcing(jacs_pred.detach(), batch_idx)
         else:
             jac_norm = None

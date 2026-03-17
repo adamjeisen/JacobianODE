@@ -73,10 +73,11 @@ class LitLatentJacobianODE(LitBase):
         learn_fnn_weight=False,
         learn_jac_cons_weight=False,
         learn_jac_norm_weight=False,
+        jac_norm_type='fro',
         log_var_init='naive',
         **kwargs,
     ):
-        super().__init__(model=model, **kwargs)
+        super().__init__(model=model, jac_norm_type=jac_norm_type, **kwargs)
         self.encoder = encoder
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
@@ -695,9 +696,14 @@ class LitLatentJacobianODE(LitBase):
             z_for_tf = self.encode_trajectory(batch)
             jacs_pred = self.compute_jacobians(z_for_tf)
 
-        jac_norm = torch.linalg.norm(
-            jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord
-        ).mean()
+        if self.jac_norm_type == 'nuclear':
+            # Nuclear norm = sum of singular values; encourages low-rank
+            # Jacobians, which compresses effective latent dimension.
+            jac_norm = torch.linalg.svdvals(jacs_pred).sum(dim=-1).mean()
+        else:
+            jac_norm = torch.linalg.norm(
+                jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord
+            ).mean()
         self.update_alpha_teacher_forcing(jacs_pred.detach(), batch_idx)
 
         train_rets = {}

@@ -54,6 +54,7 @@ lightning:
   # -----------------
   jac_penalty: 0.0
   jac_norm_ord: 'fro'
+  jac_norm_type: 'fro'  # 'fro' = Frobenius norm; 'nuclear' = nuclear norm (sum of singular values, encourages low-rank dynamics)
   jac_consistency_weight: 0.0  # weight for ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
   fnn_weight: 0.0  # weight for FNN latent-geometry regularizer (Gilpin NeurIPS 2020)
   fnn_normalize: false        # normalize FNN loss by activation variance

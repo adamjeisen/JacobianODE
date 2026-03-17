@@ -1,0 +1,21 @@
+# Partial observation config for dysts systems.
+#
+# Observes only a subset of state dimensions (default: x-only for Lorenz).
+# Pair with model=latent_tcn_partial for the "Embed Big, Let Dynamics Prune"
+# strategy.
+#
+# Usage:
+#   python -m JacobianODE.jacobians.run_jacobians data=dysts_partial model=latent_tcn_partial
+#
+# Override observed dimensions:
+#   data.train_test_params.delay_embedding_params.observed_indices=[0,1]
+
+defaults:
+  - dysts@_here_
+  - _self_
+
+train_test_params:
+  delay_embedding_params:
+    observed_indices: [0]  # Single variable observation (e.g., x of Lorenz)
+    n_delays: 1            # No delay embedding; let the learned encoder handle it
+    delay_spacing: 1
