@@ -20,6 +20,8 @@ Regularisation losses applied to the latent sequence z:
   - FNN   : false-nearest-neighbour (Gilpin NeurIPS 2020)
   - Ampli.: noise amplification in embedding space
   - DeCov : off-diagonal covariance penalty (Cogswell ICLR 2016)
+  - TSE   : tangent space entropy — concentrates latent dynamics along
+            fewer intrinsic dimensions of the encoder Jacobian's SVD
 """
 from __future__ import annotations
 
@@ -64,6 +66,8 @@ class LitEncoderDecoder(L.LightningModule):
         Whether to use elementwise regularization in FNN.
         If True, the loss is computed as E[W * A^2].
         If False, the loss is computed as E[W] * E[A^2].
+    fnn_sparsify : bool
+        Whether to sparsify the embedding by penalizing the L1 norm of the embedding.
     amplification_weight : float
         Loss coefficient for the noise-amplification regulariser.  0 disables it.
     decov_weight : float
@@ -75,6 +79,18 @@ class LitEncoderDecoder(L.LightningModule):
     jacobian_nuclear_n_samples : int, optional
         Max number of points to subsample when computing the Jacobian nuclear loss
         (O(N) SVDs).  If None, use all points.
+    tangent_entropy_weight : float
+        Loss coefficient for the tangent space entropy regulariser.  Projects
+        latent velocity dz = z_{t+1} - z_t onto the encoder Jacobian's left
+        singular vectors (computed at x_t, detached) and minimises the entropy
+        of the resulting per-dimension energy distribution.  0 disables it.
+    tangent_entropy_n_samples : int, optional
+        Max number of points to subsample for the tangent entropy Jacobian
+        computation.  If None, use all points.
+    tangent_entropy_mode : str
+        Entropy formula: ``'shannon'`` (-sum p log p, normalised),
+        ``'quadratic'`` (1 - sum p^2, smooth polynomial gradients),
+        or ``'renyi_half'`` (Renyi alpha=0.5, aggressive spread penalty).
     amplification_n_neighbors : int
         k-NN neighbourhood size for the amplification loss.
     amplification_max_T : int
@@ -135,10 +151,14 @@ class LitEncoderDecoder(L.LightningModule):
         fnn_elementwise_regularization: bool = False,
         fnn_use_pca: bool = False,
         fnn_n_samples: Optional[int] = None,
+        fnn_sparsify: bool = False,
         amplification_weight: float = 0.0,
         decov_weight: float = 0.0,
         jacobian_nuclear_weight: float = 0.0,
         jacobian_nuclear_n_samples: Optional[int] = 256,
+        tangent_entropy_weight: float = 0.0,
+        tangent_entropy_n_samples: Optional[int] = 256,
+        tangent_entropy_mode: str = "quadratic",
         amplification_n_neighbors: int = 10,
         amplification_max_T: int = 5,
         optimizer: str = "AdamW",
@@ -174,10 +194,14 @@ class LitEncoderDecoder(L.LightningModule):
         self.fnn_elementwise_regularization = fnn_elementwise_regularization
         self.fnn_use_pca = fnn_use_pca
         self.fnn_n_samples = fnn_n_samples
+        self.fnn_sparsify = fnn_sparsify
         self.amplification_weight = amplification_weight
         self.decov_weight = decov_weight
         self.jacobian_nuclear_weight = jacobian_nuclear_weight
-        self.jacobian_nuclear_n_samples = jacobian_nuclear_n_samples
+        self.jacobian_nuclear_n_samples = int(jacobian_nuclear_n_samples) if jacobian_nuclear_n_samples is not None and str(jacobian_nuclear_n_samples).lower() != "none" else None
+        self.tangent_entropy_weight = tangent_entropy_weight
+        self.tangent_entropy_n_samples = int(tangent_entropy_n_samples) if tangent_entropy_n_samples is not None and str(tangent_entropy_n_samples).lower() != "none" else None
+        self.tangent_entropy_mode = tangent_entropy_mode
         self.amplification_n_neighbors = amplification_n_neighbors
         self.amplification_max_T = amplification_max_T
 
@@ -201,6 +225,7 @@ class LitEncoderDecoder(L.LightningModule):
             and amplification_weight == 0
             and decov_weight == 0
             and jacobian_nuclear_weight == 0
+            and tangent_entropy_weight == 0
         )
         if no_decoders and no_reg:
             raise ValueError(
@@ -293,27 +318,143 @@ class LitEncoderDecoder(L.LightningModule):
 
         # Use autograd.grad to compute Jacobian (no jacfwd/vmap — avoids dropout randomness error).
         # J[i,j] = dz[i]/dx[j]; compute row i via grad(z[i], x) with grad_outputs=e_i.
+        # enable_grad() is needed so this works inside validation_step (which runs under no_grad).
         mean_svals_list: list[torch.Tensor] = []
-        for i in range(x_sample.shape[0]):
-            x_i = x_sample[i].requires_grad_(True)
-            z_i = self.encoder(x_i.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
-            # J: (n_latent, n_obs); build row by row
-            rows: list[torch.Tensor] = []
-            for j in range(self.n_latent):
-                g_out = torch.zeros_like(z_i)
-                g_out[j] = 1.0
-                (g,) = torch.autograd.grad(
-                    z_i,
-                    x_i,
-                    grad_outputs=g_out,
-                    retain_graph=(j < self.n_latent - 1),
-                    create_graph=True,
-                )
-                rows.append(g)
-            J_i = torch.stack(rows, dim=0)  # (n_latent, n_obs)
-            svals_i = torch.linalg.svdvals(J_i)
-            mean_svals_list.append(svals_i.mean())
+        with torch.enable_grad():
+            for i in range(x_sample.shape[0]):
+                x_i = x_sample[i].detach().requires_grad_(True)
+                z_i = self.encoder(x_i.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+                # J: (n_latent, n_obs); build row by row
+                rows: list[torch.Tensor] = []
+                for j in range(self.n_latent):
+                    g_out = torch.zeros_like(z_i)
+                    g_out[j] = 1.0
+                    (g,) = torch.autograd.grad(
+                        z_i,
+                        x_i,
+                        grad_outputs=g_out,
+                        retain_graph=(j < self.n_latent - 1),
+                        create_graph=True,
+                    )
+                    rows.append(g)
+                J_i = torch.stack(rows, dim=0)  # (n_latent, n_obs)
+                svals_i = torch.linalg.svdvals(J_i)
+                mean_svals_list.append(svals_i.mean())
         return torch.stack(mean_svals_list).mean()
+
+    def _tangent_space_entropy_loss(
+        self, x_valid: torch.Tensor, z_valid: torch.Tensor
+    ) -> torch.Tensor:
+        """Tangent space entropy loss.
+
+        Projects latent velocity ``dz = z_{t+1} - z_t`` onto the encoder
+        Jacobian's left singular vectors U (computed at x_t, **detached**),
+        then minimises the entropy of the per-dimension energy distribution
+        to concentrate dynamics along fewer intrinsic directions.
+
+        Gradients flow through ``dz`` (and thus back into the encoder) but
+        **not** through U, so the loss steers the representation without
+        reshaping the tangent basis simultaneously.
+
+        Parameters
+        ----------
+        x_valid : torch.Tensor
+            (B, T', D_obs) observation batch (after context margin).
+        z_valid : torch.Tensor
+            (B, T', N_LATENT) encoded latent batch (after context margin).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss.
+        """
+        B, T, _ = z_valid.shape
+        if T < 2:
+            return z_valid.new_zeros(1).squeeze()
+
+        # dz = z_{t+1} - z_t; Jacobian computed at x_t (first-order Taylor)
+        dz = z_valid[:, 1:, :] - z_valid[:, :-1, :]   # (B, T-1, n_latent)
+        x_for_jac = x_valid[:, :-1, :]                 # (B, T-1, n_obs)
+
+        dz_flat = dz.reshape(-1, self.n_latent)         # (N, n_latent)
+        x_flat = x_for_jac.reshape(-1, self.n_obs)      # (N, n_obs)
+        N = dz_flat.shape[0]
+        if N == 0:
+            return z_valid.new_zeros(1).squeeze()
+
+        # Subsample
+        if (
+            self.tangent_entropy_n_samples is not None
+            and N > self.tangent_entropy_n_samples
+        ):
+            idx = torch.randperm(N, device=z_valid.device)[
+                : self.tangent_entropy_n_samples
+            ]
+            x_sample = x_flat[idx]
+            dz_sample = dz_flat[idx]
+        else:
+            x_sample = x_flat
+            dz_sample = dz_flat
+
+        K = min(self.n_latent, self.n_obs)
+
+        # Vectorised Jacobian computation via vmap — no gradient needed
+        # through U, so we can use torch.no_grad() + functional transforms.
+        # Temporarily switch encoder to eval mode to disable dropout (which
+        # is incompatible with vmap's deterministic requirement) and to get
+        # a clean deterministic Jacobian.
+        def _encode_point(x: torch.Tensor) -> torch.Tensor:
+            """Single-point encoder: (n_obs,) -> (n_latent,)."""
+            return self.encoder(x.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+
+        # Pick jacrev vs jacfwd based on which dimension is smaller:
+        # jacrev is O(n_out) backward passes, jacfwd is O(n_in) forward passes.
+        if self.n_latent <= self.n_obs:
+            jac_fn = torch.func.jacrev(_encode_point)
+        else:
+            jac_fn = torch.func.jacfwd(_encode_point)
+
+        was_training = self.encoder.training
+        self.encoder.eval()
+        try:
+            with torch.no_grad():
+                # vmap over the sample dimension: (M, n_obs) -> (M, n_latent, n_obs)
+                J_all = torch.func.vmap(jac_fn)(x_sample)
+                # SVD: U is (M, n_latent, K)
+                U_all, _, _ = torch.linalg.svd(J_all, full_matrices=False)
+        finally:
+            if was_training:
+                self.encoder.train()
+
+        # Project dz onto detached U: grad flows through dz_sample only.
+        # U_all: (M, n_latent, K), dz_sample: (M, n_latent)
+        # projections: (M, K) = bmm(U^T, dz)
+        projections = torch.bmm(
+            U_all.transpose(-2, -1), dz_sample.unsqueeze(-1)
+        ).squeeze(-1)
+        squared_projections = projections ** 2
+
+        # Energy per dimension, averaged over batch
+        E = squared_projections.mean(dim=0)  # (K,)
+        p = E / (E.sum() + 1e-10)
+
+        # Entropy
+        if self.tangent_entropy_mode == "shannon":
+            eps = 1e-10
+            entropy = -(p * torch.log(p + eps)).sum()
+            max_ent = math.log(K) if K > 1 else 1.0
+            loss = entropy / max_ent
+        elif self.tangent_entropy_mode == "quadratic":
+            loss = 1.0 - (p ** 2).sum()
+        elif self.tangent_entropy_mode == "renyi_half":
+            eps = 1e-10
+            loss = 2.0 * torch.log(torch.sqrt(p + eps).sum() + eps)
+        else:
+            raise ValueError(
+                f"Unknown tangent_entropy_mode: {self.tangent_entropy_mode!r}. "
+                f"Choose from 'shannon', 'quadratic', 'renyi_half'."
+            )
+        return loss
 
     # ------------------------------------------------------------------
     # Forward
@@ -429,6 +570,7 @@ class LitEncoderDecoder(L.LightningModule):
                 elementwise_regularization=self.fnn_elementwise_regularization,
                 use_pca=self.fnn_use_pca,
                 n_samples=self.fnn_n_samples,
+                sparsify=self.fnn_sparsify,
             )
             total_loss = total_loss + self.fnn_weight * fnn_loss
             log_dict[f"{prefix}/fnn_loss"] = fnn_loss.detach()
@@ -465,6 +607,17 @@ class LitEncoderDecoder(L.LightningModule):
             jac_nuc_loss = self._encoder_jacobian_nuclear_loss(x_valid)
             total_loss = total_loss + self.jacobian_nuclear_weight * jac_nuc_loss
             log_dict[f"{prefix}/jacobian_nuclear_loss"] = jac_nuc_loss.detach()
+
+        # ----------------------------------------------------------
+        # Tangent space entropy regularisation
+        # Project latent velocity dz onto local encoder tangent basis U,
+        # then minimise entropy of the per-dimension energy distribution
+        # to concentrate dynamics along fewer intrinsic directions.
+        # ----------------------------------------------------------
+        if self.tangent_entropy_weight > 0:
+            tse_loss = self._tangent_space_entropy_loss(x_valid, z_valid)
+            total_loss = total_loss + self.tangent_entropy_weight * tse_loss
+            log_dict[f"{prefix}/tangent_entropy_loss"] = tse_loss.detach()
 
         # ----------------------------------------------------------
         # Latent utilization (diagnostic, no gradient)

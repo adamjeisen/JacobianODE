@@ -67,7 +67,7 @@ def _make_run_name(cfg: DictConfig) -> str:
         parts.append("next")
 
     # Regularisation weights (only non-zero)
-    for key in ("fnn_weight", "amplification_weight", "decov_weight", "jacobian_nuclear_weight"):
+    for key in ("fnn_weight", "amplification_weight", "decov_weight", "jacobian_nuclear_weight", "tangent_entropy_weight"):
         val = cfg.training.lightning.get(key, 0.0)
         if val and val != 0.0:
             parts.append(f"{key}_{val:.4g}")

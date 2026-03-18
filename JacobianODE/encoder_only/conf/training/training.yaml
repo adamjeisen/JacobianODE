@@ -33,10 +33,14 @@ lightning:
   fnn_elementwise_regularization: false  # Elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
   fnn_use_pca: true        # Project onto PCA before FNN for rotation invariance
   fnn_n_samples: 1024      # Max points for FNN (O(N²)); null = use all
+  fnn_sparsify: false      # Penalize L1 norm of embedding for sparse latent dimensions
   amplification_weight: 0.0 # Noise amplification regulariser
   decov_weight: 0.0         # DeCov off-diagonal covariance penalty (Cogswell ICLR 2016)
   jacobian_nuclear_weight: 0.0  # Nuclear norm of encoder Jacobian (mean of singular values per point)
   jacobian_nuclear_n_samples: 256  # Max points for Jacobian nuclear loss; null = use all
+  tangent_entropy_weight: 0.0     # Tangent space entropy: concentrate latent dynamics along fewer SVD directions
+  tangent_entropy_n_samples: 256  # Max points for tangent entropy Jacobian computation; null = use all
+  tangent_entropy_mode: 'quadratic'  # Entropy formula: 'shannon', 'quadratic', or 'renyi_half'
 
   # Advanced: amplification regulariser settings
   amplification_n_neighbors: 10

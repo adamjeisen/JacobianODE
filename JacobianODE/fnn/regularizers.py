@@ -23,6 +23,7 @@ def loss_false(
         elementwise_regularization: bool = False,
         use_pca: bool = False,
         n_samples: int | None = None,
+        sparsify: bool = False,
     ) -> torch.Tensor:
     """Activity regularizer based on the False-Nearest-Neighbor algorithm.
 
@@ -51,7 +52,8 @@ def loss_false(
     n_samples : int or None
         If not None, randomly subsample this many points to compute the loss
         (useful to cap O(N^2) pairwise cost). If None, use all points. Default None.
-
+    sparsify : bool
+        Whether to sparsify the embedding by penalizing the L1 norm of the embedding.
     Returns
     -------
     loss : torch.Tensor
@@ -171,19 +173,28 @@ def loss_false(
     if elementwise_regularization:
         # take the mean over batches and sum over latents
         # loss_j = (1/B) \sum_i ^ B W_ij * A_ij^2
-        loss = (reg_weights * (code_batch**2)).mean(dim=0).sum()
+        if sparsify:
+            loss = (reg_weights * (code_batch).abs()).mean(dim=0).sum()
+        else:
+            loss = (reg_weights * (code_batch**2)).mean(dim=0).sum()
     else:
         # take the mean activity over batches and sum over latents
-        activations_batch_averaged_squared = torch.mean(code_batch ** 2, dim=0)
-        loss = torch.sum(reg_weights * activations_batch_averaged_squared)
+        if sparsify:
+            activations_batch_averaged = torch.mean(code_batch.abs(), dim=0)
+        else:
+            activations_batch_averaged = torch.mean(code_batch ** 2, dim=0)
+        loss = torch.sum(reg_weights * activations_batch_averaged)
 
     if normalize:
         # return loss.float() / (n_latent * code_batch.var())
         epsilon = 1e-8
         if elementwise_regularization:
-            denom = (code_batch**2).mean(dim=0).sum() + epsilon
+            if sparsify:
+                denom = code_batch.abs().mean(dim=0).sum() + epsilon
+            else:
+                denom = (code_batch**2).mean(dim=0).sum() + epsilon
         else:
-            denom = activations_batch_averaged_squared.sum() + epsilon
+            denom = activations_batch_averaged.sum() + epsilon
         if return_fnn_weights:
             return loss.float() / denom, reg_weights
         else:
