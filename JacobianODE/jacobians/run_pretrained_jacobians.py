@@ -155,6 +155,8 @@ def train_pretrained_jacobians(cfg: DictConfig) -> None:
         extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
     if cfg.model.get("jac_window_stride") is not None:
         extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
+    if "decode_only_recent" in cfg.model:
+        extra_kwargs["decode_only_recent"] = cfg.model.decode_only_recent
 
     lit_model = instantiate(
         cfg.training.lightning,

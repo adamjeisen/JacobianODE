@@ -711,6 +711,7 @@ def build_transformer(
     use_positional_encoding: bool = True,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    decoder_n_output: int = None,
     context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
@@ -721,7 +722,7 @@ def build_transformer(
         use_positional_encoding=use_positional_encoding,
         **encoder_kwargs,
     )
-    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, decoder_n_output or n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
@@ -731,6 +732,7 @@ def build_ssm(
     use_positional_encoding: bool = True,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    decoder_n_output: int = None,
     context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
@@ -741,7 +743,7 @@ def build_ssm(
         use_positional_encoding=use_positional_encoding,
         **encoder_kwargs,
     )
-    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, decoder_n_output or n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
@@ -750,6 +752,7 @@ def build_tcn(
     n_latent: int,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    decoder_n_output: int = None,
     context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
@@ -759,7 +762,7 @@ def build_tcn(
         n_latent=n_latent,
         **encoder_kwargs,
     )
-    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, decoder_n_output or n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
@@ -768,6 +771,7 @@ def build_tcn_spatial(
     n_latent: int,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    decoder_n_output: int = None,
     context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
@@ -777,7 +781,7 @@ def build_tcn_spatial(
         n_latent=n_latent,
         **encoder_kwargs,
     )
-    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, decoder_n_output or n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)
 
 
@@ -786,6 +790,7 @@ def build_mlp(
     n_latent: int,
     decoder_hidden: int = 128,
     decoder_layers: int = 2,
+    decoder_n_output: int = None,
     context_margin: int = 0,
     **encoder_kwargs,
 ) -> SequenceAutoencoder:
@@ -795,5 +800,5 @@ def build_mlp(
         n_latent=n_latent,
         **encoder_kwargs,
     )
-    decoder = StepDecoder(n_latent, n_input, decoder_hidden, decoder_layers)
+    decoder = StepDecoder(n_latent, decoder_n_output or n_input, decoder_hidden, decoder_layers)
     return SequenceAutoencoder(encoder, decoder, context_margin=context_margin)

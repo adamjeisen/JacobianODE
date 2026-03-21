@@ -69,6 +69,8 @@ def make_model(
             extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
         if "jac_window_stride" in cfg.model and cfg.model.jac_window_stride is not None:
             extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
+        if "decode_only_recent" in cfg.model:
+            extra_kwargs["decode_only_recent"] = cfg.model.decode_only_recent
 
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(

@@ -74,10 +74,12 @@ class LitLatentJacobianODE(LitBase):
         learn_jac_cons_weight=False,
         learn_jac_norm_weight=False,
         log_var_init='naive',
+        decode_only_recent=False,
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
         self.encoder = encoder
+        self.decode_only_recent = decode_only_recent
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
         self.reconstruction_loss_weight = reconstruction_loss_weight
@@ -319,7 +321,10 @@ class LitLatentJacobianODE(LitBase):
                     latent_idx = s + traj_init_steps + t
                     windows.append(batch[b, latent_idx:latent_idx + w, :])
                 targets.append(torch.stack(windows))  # (prediction_steps, w, D_obs)
-            return torch.stack(targets)  # (N, prediction_steps, w, D_obs)
+            targets = torch.stack(targets)  # (N, prediction_steps, w, D_obs)
+            if self.decode_only_recent:
+                targets = targets[..., :self.encoder.decoder.n_output]
+            return targets
         else:
             # For sequence-based encoders, latent index t corresponds to
             # observation index t + context_margin (since the first
@@ -332,7 +337,10 @@ class LitLatentJacobianODE(LitBase):
                 obs_start = s + traj_init_steps + margin
                 obs_end = obs_start + prediction_steps
                 targets.append(batch[b, obs_start:obs_end, :])
-            return torch.stack(targets)  # (N, prediction_steps, D_obs)
+            targets = torch.stack(targets)  # (N, prediction_steps, D_obs)
+            if self.decode_only_recent:
+                targets = targets[..., :self.encoder.decoder.n_output]
+            return targets
 
     def trajectory_model_step(
         self,
@@ -554,6 +562,9 @@ class LitLatentJacobianODE(LitBase):
             margin = getattr(self.encoder, 'context_margin', 0)
             recon_targets = batch[:, margin:, :] if margin > 0 else batch
 
+        if self.decode_only_recent:
+            recon_targets = recon_targets[..., :self.encoder.decoder.n_output]
+
         return normalized_mse(recon_targets, recon_decoded)
 
     def _jac_consistency_loss(self, z, jacs):
@@ -666,6 +677,9 @@ class LitLatentJacobianODE(LitBase):
             targets = batch.unfold(1, w, 1).permute(0, 1, 3, 2)  # (B, T', w, D)
         else:
             targets = batch
+
+        if self.decode_only_recent:
+            targets = targets[..., :self.encoder.decoder.n_output]
 
         loss = nn.functional.mse_loss(decoded, targets)
 

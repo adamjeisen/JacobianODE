@@ -17,9 +17,11 @@ encoder:
   dropout: 0.1
   decoder_hidden: 128
   decoder_layers: 2
+  decoder_n_output: null  # null = decode full delay embedding; set to n_raw_obs to decode only most recent delay
   context_margin: 0
 
 prediction_steps: 10  # how many latent steps to predict forward
                       # JacobianODE window = traj_init_steps (15) + prediction_steps (10) = 25
 encoder_warmup_epochs: 0
 jac_window_stride: null  # defaults to prediction_steps (non-overlapping)
+decode_only_recent: false  # when true, decoder targets are only the most recent delay block
