@@ -262,6 +262,7 @@ def load_pretrained_encoder(
     save_dir: Optional[str] = None,
     freeze: bool = True,
     verbose: bool = False,
+    require_same_state_decoder: bool = True,
 ) -> Tuple[PretrainedEncoderAdapter, DictConfig, Any]:
     """Load a pre-trained encoder from a W&B run.
 
@@ -278,6 +279,11 @@ def load_pretrained_encoder(
         MLP is trainable.
     verbose : bool
         Print loading progress.
+    require_same_state_decoder : bool
+        If ``True`` (default), the pre-trained model must have
+        ``use_same_state_decoder=True`` so the adapter provides valid
+        obs-space decoding. If ``False``, load the encoder only and use
+        a placeholder decoder (e.g. for testing latent space size).
 
     Returns
     -------
@@ -291,7 +297,8 @@ def load_pretrained_encoder(
     Raises
     ------
     ValueError
-        If the loaded model does not have a ``same_state_decoder``.
+        If ``require_same_state_decoder=True`` and the loaded model does
+        not have a ``same_state_decoder``.
     """
     from ..jacobians.checkpoints import load_run
 
@@ -303,19 +310,25 @@ def load_pretrained_encoder(
         verbose=verbose,
     )
 
-    # Validate: need same_state_decoder for obs-space decoding
-    if not (
-        hasattr(lit_model, "same_state_decoder")
-        and getattr(lit_model, "use_same_state_decoder", False)
-    ):
-        raise ValueError(
-            "Pre-trained model must have use_same_state_decoder=True "
-            "to provide obs-space decoding for JacobianODE training."
-        )
-
     encoder = lit_model.encoder
-    decoder = lit_model.same_state_decoder
     context_margin = getattr(lit_model, "context_margin", 0)
+    n_latent = encoder.n_latent
+    n_obs = lit_model.n_obs
+
+    # Validate: need same_state_decoder for obs-space decoding (unless disabled)
+    if require_same_state_decoder:
+        if not (
+            hasattr(lit_model, "same_state_decoder")
+            and getattr(lit_model, "use_same_state_decoder", False)
+        ):
+            raise ValueError(
+                "Pre-trained model must have use_same_state_decoder=True "
+                "to provide obs-space decoding for JacobianODE training."
+            )
+        decoder = lit_model.same_state_decoder
+    else:
+        # Placeholder decoder for encoder-only use (e.g. latent size testing)
+        decoder = nn.Linear(n_latent, n_obs)
 
     adapter = PretrainedEncoderAdapter(encoder, decoder, context_margin)
 
