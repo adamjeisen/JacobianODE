@@ -20,6 +20,7 @@ JacobianODE/encoder_only/conf/  – Hydra configuration files
 _jupyter/Encoder-Only*/         – Example and sweep notebooks
 """
 
+from .coupling_model import LitCouplingFlow
 from .model import LitEncoderDecoder
 from .pretrained import (
     PretrainedEncoderAdapter,
@@ -29,6 +30,7 @@ from .pretrained import (
 )
 
 __all__ = [
+    "LitCouplingFlow",
     "LitEncoderDecoder",
     "PretrainedEncoderAdapter",
     "PretrainedJacRunResult",

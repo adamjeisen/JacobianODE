@@ -27,6 +27,11 @@ from .models import (
     AMIEmbedding,
     TICAEmbedding,
 )
+from .coupling_flows import (
+    AffineCouplingEncoder,
+    AffineCouplingLayer,
+    FixedPermutation,
+)
 from .sequence_networks import (
     SequenceAutoencoder,
     TransformerSequenceEncoder,

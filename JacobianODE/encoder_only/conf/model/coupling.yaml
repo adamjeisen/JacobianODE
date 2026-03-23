@@ -1,0 +1,19 @@
+# Affine coupling flow encoder (invertible, dimension-preserving).
+# n_input is injected at runtime from the observation dimension.
+
+encoder:
+  _target_: JacobianODE.fnn.coupling_flows.AffineCouplingEncoder
+  n_input: null             # set at runtime
+  n_coupling_layers: 8
+  hidden_dim: 128
+  n_hidden_layers: 2
+  scale_activation: tanh
+  scale_clamp: 3.0
+  zero_init: true           # identity-init trick
+  permutation_seed: 0       # base seed for fixed random permutations
+
+# Coupling flow training settings
+n_target_dims: 3            # number of meaningful target dimensions
+zero_penalty_weight: 1.0    # weight for zero-padding loss
+decoder_recon_weight: 0.0   # weight for decoder reconstruction loss (target → inverse → input space)
+reconstruction_mode: uniform  # 'uniform' | 'harmonic' | 'most_recent'
