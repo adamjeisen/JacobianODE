@@ -12,6 +12,8 @@ FNN regularizer based on: Kennel, Brown, and Abarbanel.
 
 DeCov regularizer based on: Cogswell et al. ICLR 2016.
 """
+import math
+
 import torch
 import torch.nn as nn
 
@@ -422,3 +424,67 @@ def loss_amplification(
         sig = sig / (1.0 / (eps_k + epsilon)).mean()
 
     return sig
+
+
+def tangent_space_entropy(
+    dz: torch.Tensor,
+    jacobians: torch.Tensor,
+    mode: str = "quadratic",
+) -> torch.Tensor:
+    """Tangent space entropy loss from pre-computed Jacobians and velocities.
+
+    Projects latent velocity ``dz`` onto the left singular vectors of the
+    (detached) Jacobians, then minimises the entropy of the per-direction
+    energy distribution so that dynamics concentrate along fewer intrinsic
+    directions.
+
+    Gradients flow through ``dz`` only — Jacobians are detached before SVD.
+
+    Parameters
+    ----------
+    dz : torch.Tensor
+        Latent velocities of shape ``(M, d)``.
+    jacobians : torch.Tensor
+        Jacobian matrices of shape ``(M, d_out, d_in)``.  Detached
+        internally before SVD.
+    mode : str
+        Entropy formula: ``'shannon'``, ``'quadratic'``, or ``'renyi_half'``.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar loss.
+    """
+    K = min(jacobians.shape[-2], jacobians.shape[-1])
+
+    with torch.no_grad():
+        U, _, _ = torch.linalg.svd(jacobians.detach(), full_matrices=False)
+        # U: (M, d_out, K)
+
+    # Project dz onto U columns: (M, K) = bmm(U^T, dz)
+    projections = torch.bmm(
+        U.transpose(-2, -1), dz.unsqueeze(-1)
+    ).squeeze(-1)
+    squared_projections = projections ** 2
+
+    # Energy per dimension, averaged over batch
+    E = squared_projections.mean(dim=0)  # (K,)
+    p = E / (E.sum() + 1e-10)
+
+    # Entropy
+    if mode == "shannon":
+        eps = 1e-10
+        entropy = -(p * torch.log(p + eps)).sum()
+        max_ent = math.log(K) if K > 1 else 1.0
+        loss = entropy / max_ent
+    elif mode == "quadratic":
+        loss = 1.0 - (p ** 2).sum()
+    elif mode == "renyi_half":
+        eps = 1e-10
+        loss = 2.0 * torch.log(torch.sqrt(p + eps).sum() + eps)
+    else:
+        raise ValueError(
+            f"Unknown tangent space entropy mode: {mode!r}. "
+            f"Choose from 'shannon', 'quadratic', 'renyi_half'."
+        )
+    return loss

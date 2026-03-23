@@ -203,13 +203,18 @@ def initialize_config(
 
     # Set model dimensions
     if "encoder" in cfg.model:
-        # Latent model: Jacobian MLP operates on n_latent, not data dim
-        n_latent = cfg.model.encoder.n_latent
         # Encoder sees delay-embedded observations (dim = n_delays * len(observed_indices))
         cfg.model.encoder.n_input = dim
+        # n_latent: explicit in config for standard encoders, equals n_input
+        # for dimension-preserving encoders (e.g. AffineCouplingEncoder).
+        n_latent = cfg.model.encoder.get("n_latent", dim)
+        # For dimension-preserving encoders with subspace splitting,
+        # the MLP Jacobian model operates on n_target_dims, not n_latent.
+        n_target_dims = cfg.model.get("n_target_dims", None)
+        mlp_dim = n_target_dims if n_target_dims is not None else n_latent
         if "input_dim" in cfg.model.params:
-            cfg.model.params.input_dim = n_latent
-        cfg.model.params.output_dim = n_latent ** 2
+            cfg.model.params.input_dim = mlp_dim
+        cfg.model.params.output_dim = mlp_dim ** 2
     else:
         # Standard model: operates on data dim
         if "input_dim" in cfg.model.params:

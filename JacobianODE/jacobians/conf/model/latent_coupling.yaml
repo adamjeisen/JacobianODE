@@ -1,0 +1,26 @@
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_target_dims, set at runtime
+  hidden_dim: [256, 512, 512]
+  num_layers: 3
+  output_dim: null   # = n_target_dims², set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.coupling_flows.AffineCouplingEncoder
+  n_input: null            # set at runtime (= n_delays * len(observed_indices))
+  n_coupling_layers: 8
+  hidden_dim: 128
+  n_hidden_layers: 2
+  scale_activation: tanh
+  scale_clamp: 3.0
+  zero_init: true
+  permutation_seed: 0
+
+n_target_dims: 3           # drives MLP dims and subspace splitting
+prediction_steps: 10
+encoder_warmup_epochs: 0
+jac_window_stride: null
+decode_only_recent: false

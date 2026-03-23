@@ -17,7 +17,7 @@ For full-featured training with Lightning/W&B/Hydra:
     >>> from JacobianODE.fnn.regularizers import FNN
 """
 
-from .regularizers import Amplification, FNN, DeCov, loss_false, loss_cov, loss_amplification
+from .regularizers import Amplification, FNN, DeCov, loss_false, loss_cov, loss_amplification, tangent_space_entropy
 from .networks import MLPAutoencoder, LSTMAutoencoder
 from .models import (
     MLPEmbedding,

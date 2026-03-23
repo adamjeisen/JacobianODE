@@ -71,6 +71,8 @@ def make_model(
             extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
         if "decode_only_recent" in cfg.model:
             extra_kwargs["decode_only_recent"] = cfg.model.decode_only_recent
+        if "n_target_dims" in cfg.model and cfg.model.n_target_dims is not None:
+            extra_kwargs["n_target_dims"] = cfg.model.n_target_dims
 
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(

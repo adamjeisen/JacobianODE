@@ -32,7 +32,7 @@ import torch
 import torch.nn as nn
 import lightning as L
 
-from ..fnn.regularizers import loss_amplification, loss_cov, loss_false
+from ..fnn.regularizers import loss_amplification, loss_cov, loss_false, tangent_space_entropy
 from ..jacobians.metrics import normalized_mse, r2_score
 
 
@@ -426,35 +426,9 @@ class LitEncoderDecoder(L.LightningModule):
             if was_training:
                 self.encoder.train()
 
-        # Project dz onto detached U: grad flows through dz_sample only.
-        # U_all: (M, n_latent, K), dz_sample: (M, n_latent)
-        # projections: (M, K) = bmm(U^T, dz)
-        projections = torch.bmm(
-            U_all.transpose(-2, -1), dz_sample.unsqueeze(-1)
-        ).squeeze(-1)
-        squared_projections = projections ** 2
-
-        # Energy per dimension, averaged over batch
-        E = squared_projections.mean(dim=0)  # (K,)
-        p = E / (E.sum() + 1e-10)
-
-        # Entropy
-        if self.tangent_entropy_mode == "shannon":
-            eps = 1e-10
-            entropy = -(p * torch.log(p + eps)).sum()
-            max_ent = math.log(K) if K > 1 else 1.0
-            loss = entropy / max_ent
-        elif self.tangent_entropy_mode == "quadratic":
-            loss = 1.0 - (p ** 2).sum()
-        elif self.tangent_entropy_mode == "renyi_half":
-            eps = 1e-10
-            loss = 2.0 * torch.log(torch.sqrt(p + eps).sum() + eps)
-        else:
-            raise ValueError(
-                f"Unknown tangent_entropy_mode: {self.tangent_entropy_mode!r}. "
-                f"Choose from 'shannon', 'quadratic', 'renyi_half'."
-            )
-        return loss
+        # Delegate projection + entropy computation to standalone utility.
+        # J_all is already detached (computed in no_grad block above).
+        return tangent_space_entropy(dz_sample, J_all, mode=self.tangent_entropy_mode)
 
     # ------------------------------------------------------------------
     # Forward
