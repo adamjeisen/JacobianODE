@@ -113,6 +113,10 @@ def compute_all_diagnostics(
             # validation_step does during training.
             if hasattr(lit_model, 'encode_trajectory'):
                 z_for_eval = lit_model.encode_trajectory(batch)
+                # For coupling encoders, Jacobian MLP and loop closure
+                # operate on the dynamic subspace only.
+                if hasattr(lit_model, '_split_latent'):
+                    z_for_eval, _ = lit_model._split_latent(z_for_eval)
             else:
                 z_for_eval = batch
 

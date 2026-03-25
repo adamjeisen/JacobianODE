@@ -73,6 +73,8 @@ def make_model(
             extra_kwargs["decode_only_recent"] = cfg.model.decode_only_recent
         if "n_target_dims" in cfg.model and cfg.model.n_target_dims is not None:
             extra_kwargs["n_target_dims"] = cfg.model.n_target_dims
+        if "n_recent_dims" in cfg.model and cfg.model.n_recent_dims is not None:
+            extra_kwargs["n_recent_dims"] = cfg.model.n_recent_dims
 
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(

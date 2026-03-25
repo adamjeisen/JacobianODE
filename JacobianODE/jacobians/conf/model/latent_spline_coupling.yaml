@@ -9,20 +9,19 @@ params:
   activation: 'silu'
 
 encoder:
-  _target_: JacobianODE.fnn.coupling_flows.AffineCouplingEncoder
+  _target_: JacobianODE.fnn.coupling_flows.CouplingEncoder
   n_input: null            # set at runtime (= n_delays * len(observed_indices))
   n_coupling_layers: 8
+  coupling_type: spline
+  use_actnorm: true
   hidden_dim: 128
   n_hidden_layers: 2
-  scale_activation: tanh
-  scale_clamp: 3.0
+  num_bins: 8              # rational quadratic spline segments
+  tail_bound: 3.0          # linear tails outside [-B, B]
   zero_init: true
   permutation_seed: 0
-  clamp_type: symmetric        # 'symmetric' | 'asymmetric' (Andrade 2024)
-  alpha_pos: 0.1               # asymmetric clamp: expansion bound
-  alpha_neg: 2.0               # asymmetric clamp: compression bound
-  use_loft: false              # LOFT layer after coupling blocks
-  loft_tau: 100.0              # LOFT threshold
+  use_loft: false
+  loft_tau: 100.0
 
 n_target_dims: 3           # drives MLP dims and subspace splitting
 prediction_steps: 10

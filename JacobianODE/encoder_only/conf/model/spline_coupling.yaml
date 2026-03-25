@@ -1,24 +1,24 @@
-# Affine coupling flow encoder (invertible, dimension-preserving).
+# Spline coupling flow encoder (invertible, dimension-preserving).
+# Uses rational-quadratic splines with optional ActNorm.
 # n_input is injected at runtime from the observation dimension.
 
 encoder:
-  _target_: JacobianODE.fnn.coupling_flows.AffineCouplingEncoder
+  _target_: JacobianODE.fnn.coupling_flows.CouplingEncoder
   n_input: null             # set at runtime
   n_coupling_layers: 8
+  coupling_type: spline
+  use_actnorm: true
   hidden_dim: 128
   n_hidden_layers: 2
-  scale_activation: tanh
-  scale_clamp: 3.0
+  num_bins: 8               # rational quadratic spline segments
+  tail_bound: 3.0           # linear tails outside [-B, B]
   zero_init: true           # identity-init trick
   permutation_seed: 0       # base seed for fixed random permutations
-  clamp_type: symmetric     # 'symmetric' | 'asymmetric' (Andrade 2024)
-  alpha_pos: 0.1            # asymmetric clamp: expansion bound
-  alpha_neg: 2.0            # asymmetric clamp: compression bound
   use_loft: false           # LOFT layer after coupling blocks
   loft_tau: 100.0           # LOFT threshold
 
 # Coupling flow training settings
 n_target_dims: 3            # number of meaningful target dimensions
 zero_penalty_weight: 1.0    # weight for zero-padding loss
-decoder_recon_weight: 0.0   # weight for decoder reconstruction loss (target → inverse → input space)
+decoder_recon_weight: 0.0   # weight for decoder reconstruction loss
 reconstruction_mode: uniform  # 'uniform' | 'harmonic' | 'most_recent'

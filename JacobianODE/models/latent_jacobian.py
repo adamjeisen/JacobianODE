@@ -78,6 +78,7 @@ class LitLatentJacobianODE(LitBase):
         decode_only_recent=False,
         # Subspace splitting (for dimension-preserving encoders)
         n_target_dims=None,
+        n_recent_dims=None,
         zero_penalty_weight=0.0,
         # Reconstruction mode
         reconstruction_mode='uniform',
@@ -110,6 +111,7 @@ class LitLatentJacobianODE(LitBase):
 
         # Subspace splitting for dimension-preserving encoders
         self.n_target_dims = n_target_dims
+        self.n_recent_dims = n_recent_dims
         self.zero_penalty_weight = zero_penalty_weight
 
         # Reconstruction mode
@@ -167,6 +169,19 @@ class LitLatentJacobianODE(LitBase):
     # ------------------------------------------------------------------
     # Encoder / decoder abstractions
     # ------------------------------------------------------------------
+
+    @property
+    def _n_recent_dims(self):
+        """Number of raw observation dims (first delay coordinate).
+
+        Derived at access time so it works with checkpoints saved before
+        this property existed.
+        """
+        if hasattr(self.encoder, 'decoder') and hasattr(self.encoder.decoder, 'n_output'):
+            return self.encoder.decoder.n_output
+        if getattr(self, 'n_recent_dims', None) is not None:
+            return self.n_recent_dims
+        return None
 
     def encode_trajectory(self, batch):
         """Encode an observation trajectory into latent space.
@@ -256,16 +271,113 @@ class LitLatentJacobianODE(LitBase):
         )
         return torch.cat([z_dyn, pad], dim=-1)
 
+    def _tangent_space_entropy_loss(self, batch, z_full):
+        """Tangent space entropy using **encoder** Jacobians (dz/dx).
+
+        Projects latent velocity ``dz = z_{t+1} - z_t`` onto the encoder
+        Jacobian's left singular vectors U (computed at x_t, **detached**),
+        then minimises the entropy of the per-dimension energy distribution.
+
+        For coupling encoders (``n_target_dims is not None``), only the
+        dynamic subspace ``z_dyn`` is used for ``dz`` and only the
+        corresponding Jacobian rows are computed.
+
+        Parameters
+        ----------
+        batch : torch.Tensor
+            Raw observations ``(B, T, D_obs)``.
+        z_full : torch.Tensor
+            Full encoded latent ``(B, T', D_latent)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss (zero if T' < 2).
+        """
+        z_dyn, _ = self._split_latent(z_full)
+        n_dyn = z_dyn.shape[-1]
+        B, T, _ = z_dyn.shape
+        if T < 2:
+            return z_dyn.new_zeros(1).squeeze()
+
+        dz = z_dyn[:, 1:, :] - z_dyn[:, :-1, :]  # (B, T-1, n_dyn)
+
+        # Build the observation tensor that aligns with each dz timestep.
+        if hasattr(self.encoder, 'time_window'):
+            w = self.encoder.time_window
+            n_obs = w * batch.shape[-1]
+            windows = batch.unfold(1, w, 1).permute(0, 1, 3, 2)  # (B, T', w, D)
+            x_for_jac = windows[:, :-1].reshape(B, T - 1, -1)    # (B, T-1, w*D)
+        else:
+            margin = getattr(self.encoder, 'context_margin', 0)
+            n_obs = batch.shape[-1]
+            x_for_jac = batch[:, margin:margin + T - 1, :]       # (B, T-1, D_obs)
+
+        dz_flat = dz.reshape(-1, n_dyn)
+        x_flat = x_for_jac.reshape(-1, n_obs)
+        N = dz_flat.shape[0]
+        if N == 0:
+            return z_dyn.new_zeros(1).squeeze()
+
+        # Subsample
+        if self.tangent_entropy_n_samples is not None and N > self.tangent_entropy_n_samples:
+            idx = torch.randperm(N, device=z_dyn.device)[:self.tangent_entropy_n_samples]
+            x_sample = x_flat[idx]
+            dz_sample = dz_flat[idx]
+        else:
+            x_sample = x_flat
+            dz_sample = dz_flat
+
+        # Single-point encoder function for autograd Jacobian computation.
+        # For coupling encoders, return only z_dyn dims so the Jacobian is
+        # (n_dyn, n_obs) rather than (n_latent, n_obs).
+        n_target = self.n_target_dims  # None for non-coupling
+        if hasattr(self.encoder, 'time_window'):
+            w = self.encoder.time_window
+            D = batch.shape[-1]
+
+            def _encode_point(x_flat_pt):
+                z = self.encoder.encode(x_flat_pt.reshape(1, w, D)).squeeze(0)
+                return z[:n_target] if n_target is not None else z
+        else:
+            def _encode_point(x_pt):
+                z = self.encoder.encode(
+                    x_pt.unsqueeze(0).unsqueeze(0)
+                ).squeeze(0).squeeze(0)
+                return z[:n_target] if n_target is not None else z
+
+        # Pick jacrev vs jacfwd based on output vs input dimension.
+        if n_dyn <= n_obs:
+            jac_fn = torch.func.jacrev(_encode_point)
+        else:
+            jac_fn = torch.func.jacfwd(_encode_point)
+
+        was_training = self.encoder.training
+        self.encoder.eval()
+        try:
+            with torch.no_grad():
+                J_all = torch.func.vmap(jac_fn)(x_sample)  # (M, n_dyn, n_obs)
+        finally:
+            if was_training:
+                self.encoder.train()
+
+        return tangent_space_entropy(dz_sample, J_all, mode=self.tangent_entropy_mode)
+
     def _weighted_obs_loss(self, targets, predictions):
         """Observation-space loss with ``reconstruction_mode`` weighting.
 
         Applied to both reconstruction and trajectory prediction losses.
         """
         if self.reconstruction_mode == 'harmonic':
-            sq_err = F.mse_loss(predictions, targets, reduction='none')
+            # sq_err = F.mse_loss(predictions, targets, reduction='none')
+            # TODO: fix this because normalized_mse doesn't support reduction='none'
+            sq_err = normalized_mse(targets, predictions)
             return (sq_err * self.recon_weights).mean()
         elif self.reconstruction_mode == 'most_recent':
-            return F.mse_loss(predictions[..., 0], targets[..., 0])
+            d = self._n_recent_dims
+            if d is not None:
+                return normalized_mse(targets[..., :d], predictions[..., :d])
+            return normalized_mse(targets, predictions)
         else:  # uniform
             return normalized_mse(targets, predictions)
 
@@ -577,8 +689,13 @@ class LitLatentJacobianODE(LitBase):
         # that the unsupervised chaotic tail doesn't corrupt diagnostics.
         metric_vals = {}
         if self.reconstruction_mode == 'most_recent':
-            obs_for_metrics = obs_targets[..., [0]]
-            dec_for_metrics = decoded_pred[..., [0]]
+            d = self._n_recent_dims
+            if d is not None:
+                obs_for_metrics = obs_targets[..., :d]
+                dec_for_metrics = decoded_pred[..., :d]
+            else:
+                obs_for_metrics = obs_targets
+                dec_for_metrics = decoded_pred
         else:
             obs_for_metrics = obs_targets
             dec_for_metrics = decoded_pred
@@ -742,10 +859,13 @@ class LitLatentJacobianODE(LitBase):
     # ------------------------------------------------------------------
 
     def _warmup_step(self, batch):
-        """Encoder warmup: reconstruction loss only, no Jacobian prediction.
+        """Encoder warmup: reconstruction + encoder-side regularisers.
 
         Encodes observation windows to latent, decodes back, and computes
-        MSE against the original windows.  Freezes the Jacobian model.
+        MSE against the original windows.  No Jacobian prediction or loop
+        closure.  Tangent-space entropy (using encoder Jacobians) and
+        zero-padding penalty (for coupling encoders) are included so
+        the latent geometry is shaped from the start.
 
         Parameters
         ----------
@@ -755,28 +875,35 @@ class LitLatentJacobianODE(LitBase):
         Returns
         -------
         torch.Tensor
-            Scalar reconstruction loss.
+            Scalar total warmup loss.
         """
         batch = batch.type(self.dtype)
 
-        z_full = self.encode_trajectory(batch)        # (B, T', D_latent)
-        decoded = self.decode_trajectory(z_full)       # (B, T', w, D_obs)
+        z_full = self.encode_trajectory(batch)
 
-        # Build targets: for each latent index t, target is batch[:, t:t+w, :]
-        if hasattr(self.encoder, 'time_window'):
-            w = self.encoder.time_window
-            B, T, D = batch.shape
-            targets = batch.unfold(1, w, 1).permute(0, 1, 3, 2)  # (B, T', w, D)
-        else:
-            targets = batch
+        recon_loss = self._reconstruction_loss(batch, z_full)
+        loss = recon_loss
 
-        if self.decode_only_recent:
-            targets = targets[..., :self.encoder.decoder.n_output]
+        # Zero-padding penalty (coupling encoders)
+        zero_penalty_loss = None
+        if self.n_target_dims is not None and self.zero_penalty_weight > 0:
+            _, z_null = self._split_latent(z_full)
+            if z_null is not None and z_null.numel() > 0:
+                zero_penalty_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
+                loss = loss + self.zero_penalty_weight * zero_penalty_loss
 
-        loss = nn.functional.mse_loss(decoded, targets)
+        # Tangent space entropy (encoder Jacobians via autograd)
+        tangent_entropy_loss = None
+        if self.tangent_entropy_weight > 0:
+            tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
+            loss = loss + self.tangent_entropy_weight * tangent_entropy_loss
 
-        self.log("warmup recon_loss", loss, on_step=False, on_epoch=True,
-                 sync_dist=True, prog_bar=True)
+        log_kwargs = dict(on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.log("warmup recon_loss", recon_loss, **log_kwargs)
+        if zero_penalty_loss is not None:
+            self.log("warmup zero_penalty_loss", zero_penalty_loss, **log_kwargs)
+        if tangent_entropy_loss is not None:
+            self.log("warmup tangent_entropy_loss", tangent_entropy_loss, **log_kwargs)
         return loss
 
     def training_step(self, batch, batch_idx=0, dataloader_idx=0):
@@ -893,25 +1020,13 @@ class LitLatentJacobianODE(LitBase):
 
         # --- Group 6: Zero-padding penalty ---
         zero_penalty_loss = None
-        if self.n_target_dims is not None and self.zero_penalty_weight > 0 and z_null is not None:
+        if self.n_target_dims is not None and self.zero_penalty_weight > 0 and z_null is not None and z_null.numel() > 0:
             zero_penalty_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
 
-        # --- Group 7: Tangent space entropy ---
+        # --- Group 7: Tangent space entropy (encoder Jacobians via autograd) ---
         tangent_entropy_loss = None
         if self.tangent_entropy_weight > 0:
-            jacs_for_entropy = jacs_for_cons if jacs_for_cons is not None else self.compute_jacobians(z_dyn)
-            B_ent, T_ent, d_ent = z_dyn.shape
-            if T_ent >= 2:
-                dz = z_dyn[:, 1:, :] - z_dyn[:, :-1, :]
-                J_for_ent = jacs_for_entropy[:, :-1, :, :]
-                dz_flat = dz.reshape(-1, d_ent)
-                J_flat = J_for_ent.reshape(-1, d_ent, d_ent)
-                N_ent = dz_flat.shape[0]
-                if self.tangent_entropy_n_samples is not None and N_ent > self.tangent_entropy_n_samples:
-                    idx = torch.randperm(N_ent, device=z_dyn.device)[:self.tangent_entropy_n_samples]
-                    dz_flat = dz_flat[idx]
-                    J_flat = J_flat[idx]
-                tangent_entropy_loss = tangent_space_entropy(dz_flat, J_flat, mode=self.tangent_entropy_mode)
+            tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
 
         # ----------------------------------------------------------------
         # Auto-initialise log_var parameters on the very first batch
@@ -1039,7 +1154,7 @@ class LitLatentJacobianODE(LitBase):
 
         # Zero-padding penalty
         val_zero_loss = None
-        if self.n_target_dims is not None and z_null is not None:
+        if self.n_target_dims is not None and z_null is not None and z_null.numel() > 0:
             with torch.no_grad():
                 val_zero_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
 

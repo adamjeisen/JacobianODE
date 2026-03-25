@@ -30,7 +30,11 @@ from .models import (
 from .coupling_flows import (
     AffineCouplingEncoder,
     AffineCouplingLayer,
+    ActNorm,
+    CouplingEncoder,
     FixedPermutation,
+    LOFTLayer,
+    SplineCouplingLayer,
 )
 from .sequence_networks import (
     SequenceAutoencoder,

@@ -201,10 +201,18 @@ def initialize_config(
     else:
         raise ValueError(f"Data type {cfg.data.data_type} not supported")
 
+    # Compute per-step observation dimension (number of coords in one delay)
+    delay_params = cfg.data.train_test_params.delay_embedding_params
+    if delay_params.observed_indices == "all":
+        n_recent_dims = int(cfg.data.flow.dim)
+    else:
+        n_recent_dims = len(delay_params.observed_indices)
+
     # Set model dimensions
     if "encoder" in cfg.model:
         # Encoder sees delay-embedded observations (dim = n_delays * len(observed_indices))
         cfg.model.encoder.n_input = dim
+        OmegaConf.update(cfg, "model.n_recent_dims", n_recent_dims, force_add=True)
         # n_latent: explicit in config for standard encoders, equals n_input
         # for dimension-preserving encoders (e.g. AffineCouplingEncoder).
         n_latent = cfg.model.encoder.get("n_latent", dim)
