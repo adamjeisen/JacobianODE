@@ -75,6 +75,12 @@ def make_model(
             extra_kwargs["n_target_dims"] = cfg.model.n_target_dims
         if "n_recent_dims" in cfg.model and cfg.model.n_recent_dims is not None:
             extra_kwargs["n_recent_dims"] = cfg.model.n_recent_dims
+        if "use_vae" in cfg.model:
+            extra_kwargs["use_vae"] = cfg.model.use_vae
+        if "vae_sample_all_losses" in cfg.model:
+            extra_kwargs["vae_sample_all_losses"] = cfg.model.vae_sample_all_losses
+        if "kl_warmup_epochs" in cfg.model:
+            extra_kwargs["kl_warmup_epochs"] = cfg.model.kl_warmup_epochs
 
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(

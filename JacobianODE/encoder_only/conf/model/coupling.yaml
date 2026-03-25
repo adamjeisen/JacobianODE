@@ -19,6 +19,9 @@ encoder:
 
 # Coupling flow training settings
 n_target_dims: 3            # number of meaningful target dimensions
-zero_penalty_weight: 1.0    # weight for zero-padding loss
+kl_divergence_weight: 1.0   # unified KL weight (null-space MSE + optional VAE KL)
+use_vae: false              # VAE reparameterization on dynamic subspace
+vae_sample_all_losses: false  # when false, only recon uses sampled z_dyn
+kl_warmup_epochs: 0         # 0 = fixed weight, >0 = linear ramp from 0
 decoder_recon_weight: 0.0   # weight for decoder reconstruction loss (target → inverse → input space)
 reconstruction_mode: uniform  # 'uniform' | 'harmonic' | 'most_recent'

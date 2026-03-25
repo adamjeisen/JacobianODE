@@ -37,8 +37,8 @@ class LitCouplingFlow(L.LightningModule):
     n_target_dims : int
         Number of meaningful dimensions in the target (e.g. 3 for Lorenz).
         The remaining ``D - n_target_dims`` dimensions are driven toward zero.
-    zero_penalty_weight : float
-        Relative weight for the zero-padding MSE loss.
+    kl_divergence_weight : float
+        Unified KL divergence weight (null-space MSE + optional VAE KL).
     decoder_recon_weight : float
         Weight for the decoder reconstruction loss.  Maps the supervised
         target back through the inverse and computes MSE against the original
@@ -76,9 +76,13 @@ class LitCouplingFlow(L.LightningModule):
         encoder: nn.Module,
         n_obs: int,
         n_target_dims: int = 3,
-        zero_penalty_weight: float = 1.0,
+        kl_divergence_weight: float = 1.0,
         decoder_recon_weight: float = 0.0,
         reconstruction_mode: str = "uniform",
+        # VAE reparameterization on dynamic subspace
+        use_vae: bool = False,
+        vae_sample_all_losses: bool = False,
+        kl_warmup_epochs: int = 0,
         # Optimizer
         optimizer: str = "AdamW",
         optimizer_kwargs: Optional[dict] = None,
@@ -95,8 +99,17 @@ class LitCouplingFlow(L.LightningModule):
         self.encoder = encoder
         self.n_obs = n_obs
         self.n_target_dims = n_target_dims
-        self.zero_penalty_weight = zero_penalty_weight
+        self.kl_divergence_weight = kl_divergence_weight
         self.decoder_recon_weight = decoder_recon_weight
+
+        # VAE reparameterization on dynamic subspace
+        self.use_vae = use_vae
+        self.vae_sample_all_losses = vae_sample_all_losses
+        self.kl_warmup_epochs = kl_warmup_epochs
+        if use_vae:
+            self.log_var_proj = nn.Linear(n_target_dims, n_target_dims)
+            nn.init.zeros_(self.log_var_proj.weight)
+            nn.init.zeros_(self.log_var_proj.bias)
 
         if reconstruction_mode not in ("uniform", "harmonic", "most_recent"):
             raise ValueError(
@@ -132,13 +145,25 @@ class LitCouplingFlow(L.LightningModule):
     # Loss computation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _kl_divergence(mu, log_var):
+        """Standard Gaussian KL divergence: KL(q(z|x) || N(0, I))."""
+        return -0.5 * torch.mean(1.0 + log_var - mu.pow(2) - log_var.exp())
+
+    def _effective_kl_weight(self):
+        """Return the effective KL weight, accounting for optional warmup."""
+        if self.kl_warmup_epochs <= 0:
+            return self.kl_divergence_weight
+        ramp = min(self.current_epoch / self.kl_warmup_epochs, 1.0)
+        return self.kl_divergence_weight * ramp
+
     def _compute_losses(
         self,
         x_input: torch.Tensor,
         target: torch.Tensor,
         prefix: str,
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute target reconstruction + zero-padding losses.
+        """Compute target reconstruction + KL losses.
 
         Parameters
         ----------
@@ -157,17 +182,33 @@ class LitCouplingFlow(L.LightningModule):
         z = self.encoder(x_input)  # (B, T, D)
 
         # Split into target dims and zero-padding dims
-        z_target = z[..., : self.n_target_dims]
+        mu_target = z[..., : self.n_target_dims]
         z_zero = z[..., self.n_target_dims :]
         y_target = target[..., : self.n_target_dims]
+
+        # VAE reparameterization on dynamic portion
+        kl_dyn_loss = torch.tensor(0.0, device=z.device)
+        if self.use_vae:
+            log_var = self.log_var_proj(mu_target)
+            if self.training:
+                std = torch.exp(0.5 * log_var)
+                z_target = mu_target + std * torch.randn_like(std)
+            else:
+                z_target = mu_target
+            kl_dyn_loss = self._kl_divergence(mu_target, log_var)
+        else:
+            z_target = mu_target
 
         # Target reconstruction loss (scale-invariant MSE)
         target_loss = normalized_mse(y_target, z_target)
 
-        # Zero-padding loss
-        zero_loss = F.mse_loss(z_zero, torch.zeros_like(z_zero))
+        # Null-space penalty (MSE to zero)
+        kl_null_loss = F.mse_loss(z_zero, torch.zeros_like(z_zero))
 
-        total_loss = target_loss + self.zero_penalty_weight * zero_loss
+        # Unified KL: null penalty + optional VAE KL
+        kl_total_loss = kl_null_loss + kl_dyn_loss
+        eff_kl_w = self._effective_kl_weight()
+        total_loss = target_loss + eff_kl_w * kl_total_loss
 
         # Decoder reconstruction loss: map the supervised target back through
         # the inverse and compare against the original input in full (B, T, D)
@@ -176,12 +217,9 @@ class LitCouplingFlow(L.LightningModule):
         if self.decoder_recon_weight > 0:
             x_recon = self.encoder.inverse(target)
             if self.reconstruction_mode == "harmonic":
-                # Weighted MSE: per-element squared error weighted by harmonic
-                # prior, then averaged.  recon_weights broadcasts over (B, T).
                 sq_err = F.mse_loss(x_recon, x_input, reduction="none")  # (B, T, D)
                 decoder_recon_loss = (sq_err * self.recon_weights).mean()
             elif self.reconstruction_mode == "most_recent":
-                # MSE only on the most-recent delay (index 0).
                 decoder_recon_loss = F.mse_loss(
                     x_recon[..., 0], x_input[..., 0]
                 )
@@ -194,7 +232,9 @@ class LitCouplingFlow(L.LightningModule):
         # Metrics
         log_dict: Dict[str, torch.Tensor] = {}
         log_dict[f"{prefix}/target_loss"] = target_loss.detach()
-        log_dict[f"{prefix}/zero_loss"] = zero_loss.detach()
+        log_dict[f"{prefix}/kl_null_loss"] = kl_null_loss.detach()
+        log_dict[f"{prefix}/kl_dyn_loss"] = kl_dyn_loss.detach()
+        log_dict[f"{prefix}/kl_total_loss"] = kl_total_loss.detach()
         log_dict[f"{prefix}/decoder_recon_loss"] = decoder_recon_loss.detach()
         log_dict[f"{prefix}/total_loss"] = total_loss.detach()
 

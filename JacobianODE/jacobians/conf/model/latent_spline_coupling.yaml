@@ -24,6 +24,9 @@ encoder:
   loft_tau: 100.0
 
 n_target_dims: 3           # drives MLP dims and subspace splitting
+use_vae: false             # VAE reparameterization on dynamic subspace
+vae_sample_all_losses: false  # when false, only recon uses sampled z_dyn
+kl_warmup_epochs: 0        # 0 = fixed weight, >0 = linear ramp from 0
 prediction_steps: 10
 encoder_warmup_epochs: 0
 jac_window_stride: null
