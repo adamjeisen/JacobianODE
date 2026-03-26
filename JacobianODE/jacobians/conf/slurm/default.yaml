@@ -11,3 +11,4 @@ hydra:
     gpus_per_node: 1
     tasks_per_node: 1
     partition: ou_bcs_normal
+    exclude: node4000

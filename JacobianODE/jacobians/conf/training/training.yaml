@@ -64,7 +64,8 @@ lightning:
   # -----------------
   # SUBSPACE SPLITTING (for dimension-preserving encoders)
   # -----------------
-  kl_divergence_weight: 0.0    # unified KL weight (null-space MSE + optional VAE KL)
+  kl_null_weight: null           # null-space MSE penalty; null = same as kl_dyn_weight
+  kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
   reconstruction_mode: 'uniform'  # 'uniform' | 'harmonic' | 'most_recent'
 
   # -----------------

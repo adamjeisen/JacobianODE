@@ -40,8 +40,13 @@ class LitCouplingFlow(L.LightningModule):
     n_target_dims : int
         Number of meaningful dimensions in the target (e.g. 3 for Lorenz).
         The remaining ``D - n_target_dims`` dimensions are driven toward zero.
-    kl_divergence_weight : float
-        Unified KL divergence weight (null-space MSE + optional VAE KL).
+    kl_null_weight : float or None
+        Weight for null-space MSE penalty (structural constraint).
+        If ``None``, defaults to ``kl_dyn_weight`` (coupled single-knob control).
+    kl_dyn_weight : float
+        Weight for dynamic subspace KL divergence (smoothness regularizer).
+    kl_divergence_weight : float or None
+        DEPRECATED — if set, maps to both kl_null_weight and kl_dyn_weight.
     decoder_recon_weight : float
         Weight for the decoder reconstruction loss.  Maps the supervised
         target back through the inverse and computes MSE against the original
@@ -79,7 +84,9 @@ class LitCouplingFlow(L.LightningModule):
         encoder: nn.Module,
         n_obs: int,
         n_target_dims: int = 3,
-        kl_divergence_weight: float = 1.0,
+        kl_null_weight: float = None,
+        kl_dyn_weight: float = 0.0,
+        kl_divergence_weight: float = None,  # DEPRECATED
         decoder_recon_weight: float = 0.0,
         reconstruction_mode: str = "uniform",
         # VAE reparameterization on dynamic subspace
@@ -102,7 +109,12 @@ class LitCouplingFlow(L.LightningModule):
         self.encoder = encoder
         self.n_obs = n_obs
         self.n_target_dims = n_target_dims
-        self.kl_divergence_weight = kl_divergence_weight
+        if kl_divergence_weight is not None:
+            self.kl_null_weight = kl_divergence_weight
+            self.kl_dyn_weight = kl_divergence_weight
+        else:
+            self.kl_dyn_weight = kl_dyn_weight
+            self.kl_null_weight = kl_dyn_weight if kl_null_weight is None else kl_null_weight
         self.decoder_recon_weight = decoder_recon_weight
 
         # VAE reparameterization on dynamic subspace
@@ -153,12 +165,12 @@ class LitCouplingFlow(L.LightningModule):
         """Standard Gaussian KL divergence: KL(q(z|x) || N(0, I))."""
         return -0.5 * torch.mean(1.0 + log_var - mu.pow(2) - log_var.exp())
 
-    def _effective_kl_weight(self):
-        """Return the effective KL weight, accounting for optional warmup."""
+    def _effective_kl_weights(self):
+        """Return (effective_null_weight, effective_dyn_weight) after warmup."""
         if self.kl_warmup_epochs <= 0:
-            return self.kl_divergence_weight
+            return self.kl_null_weight, self.kl_dyn_weight
         ramp = min(self.current_epoch / self.kl_warmup_epochs, 1.0)
-        return self.kl_divergence_weight * ramp
+        return self.kl_null_weight * ramp, self.kl_dyn_weight * ramp
 
     def _compute_losses(
         self,
@@ -208,10 +220,13 @@ class LitCouplingFlow(L.LightningModule):
         # Null-space penalty (MSE to zero)
         kl_null_loss = F.mse_loss(z_zero, torch.zeros_like(z_zero))
 
-        # Unified KL: null penalty + optional VAE KL
-        kl_total_loss = kl_null_loss + kl_dyn_loss
-        eff_kl_w = self._effective_kl_weight()
-        total_loss = target_loss + eff_kl_w * kl_total_loss
+        # Separate KL weights for null and dyn
+        eff_null_w, eff_dyn_w = self._effective_kl_weights()
+        total_loss = target_loss
+        if eff_null_w > 0:
+            total_loss = total_loss + eff_null_w * kl_null_loss
+        if eff_dyn_w > 0:
+            total_loss = total_loss + eff_dyn_w * kl_dyn_loss
 
         # Decoder reconstruction loss: map the supervised target back through
         # the inverse and compare against the original input in full (B, T, D)
@@ -237,7 +252,6 @@ class LitCouplingFlow(L.LightningModule):
         log_dict[f"{prefix}/target_loss"] = target_loss.detach()
         log_dict[f"{prefix}/kl_null_loss"] = kl_null_loss.detach()
         log_dict[f"{prefix}/kl_dyn_loss"] = kl_dyn_loss.detach()
-        log_dict[f"{prefix}/kl_total_loss"] = kl_total_loss.detach()
         log_dict[f"{prefix}/decoder_recon_loss"] = decoder_recon_loss.detach()
         log_dict[f"{prefix}/total_loss"] = total_loss.detach()
 
@@ -358,8 +372,13 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
         Input dimension D (delay-embedded observation size).
     n_target_dims : int
         Number of dynamic subspace dimensions.
-    kl_divergence_weight : float
-        Weight applied to the combined KL loss (null MSE + optional VAE KL).
+    kl_null_weight : float or None
+        Weight for null-space MSE penalty (structural constraint).
+        If ``None``, defaults to ``kl_dyn_weight`` (coupled single-knob control).
+    kl_dyn_weight : float
+        Weight for dynamic subspace KL divergence (smoothness regularizer).
+    kl_divergence_weight : float or None
+        DEPRECATED — if set, maps to both kl_null_weight and kl_dyn_weight.
     reconstruction_mode : str
         ``'uniform'``, ``'harmonic'``, or ``'most_recent'``.
     use_vae : bool
@@ -375,7 +394,9 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
         encoder: nn.Module,
         n_obs: int,
         n_target_dims: int = 3,
-        kl_divergence_weight: float = 1.0,
+        kl_null_weight: float = None,
+        kl_dyn_weight: float = 0.0,
+        kl_divergence_weight: float = None,  # DEPRECATED
         reconstruction_mode: str = "uniform",
         # VAE
         use_vae: bool = False,
@@ -397,7 +418,12 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
         self.encoder = encoder
         self.n_obs = n_obs
         self.n_target_dims = n_target_dims
-        self.kl_divergence_weight = kl_divergence_weight
+        if kl_divergence_weight is not None:
+            self.kl_null_weight = kl_divergence_weight
+            self.kl_dyn_weight = kl_divergence_weight
+        else:
+            self.kl_dyn_weight = kl_dyn_weight
+            self.kl_null_weight = kl_dyn_weight if kl_null_weight is None else kl_null_weight
 
         # VAE
         self.use_vae = use_vae
@@ -446,11 +472,12 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
         """Standard Gaussian KL divergence: KL(q(z|x) || N(0, I))."""
         return -0.5 * torch.mean(1.0 + log_var - mu.pow(2) - log_var.exp())
 
-    def _effective_kl_weight(self):
+    def _effective_kl_weights(self):
+        """Return (effective_null_weight, effective_dyn_weight) after warmup."""
         if self.kl_warmup_epochs <= 0:
-            return self.kl_divergence_weight
+            return self.kl_null_weight, self.kl_dyn_weight
         ramp = min(self.current_epoch / self.kl_warmup_epochs, 1.0)
-        return self.kl_divergence_weight * ramp
+        return self.kl_null_weight * ramp, self.kl_dyn_weight * ramp
 
     def _reconstruction_loss(self, x: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
         """Compute reconstruction loss respecting ``reconstruction_mode``."""
@@ -508,17 +535,19 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
         recon_loss = self._reconstruction_loss(x, x_hat)
 
         kl_null_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
-        kl_total_loss = kl_null_loss + kl_dyn_loss
 
-        eff_kl_w = self._effective_kl_weight()
-        total_loss = recon_loss + eff_kl_w * kl_total_loss
+        eff_null_w, eff_dyn_w = self._effective_kl_weights()
+        total_loss = recon_loss
+        if eff_null_w > 0:
+            total_loss = total_loss + eff_null_w * kl_null_loss
+        if eff_dyn_w > 0:
+            total_loss = total_loss + eff_dyn_w * kl_dyn_loss
 
         # Metrics
         log_dict: Dict[str, torch.Tensor] = {
             f"{prefix}/recon_loss": recon_loss.detach(),
             f"{prefix}/kl_null_loss": kl_null_loss.detach(),
             f"{prefix}/kl_dyn_loss": kl_dyn_loss.detach() if isinstance(kl_dyn_loss, torch.Tensor) else kl_dyn_loss,
-            f"{prefix}/kl_total_loss": kl_total_loss.detach(),
             f"{prefix}/total_loss": total_loss.detach(),
         }
 
@@ -538,6 +567,10 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         loss, log_dict = self._compute_losses(x, "train")
+        if torch.isnan(loss) or torch.isinf(loss):
+            # Spline inverse can hit numerical singularities with zero-padded
+            # inputs; skip the batch rather than corrupting the optimiser state.
+            return None
         self.log_dict(log_dict, on_step=False, on_epoch=True, sync_dist=True)
         self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
@@ -545,12 +578,15 @@ class LitUnsupervisedCouplingFlow(L.LightningModule):
     def validation_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (list, tuple)) else batch
         loss, log_dict = self._compute_losses(x, "val")
+        if torch.isnan(loss) or torch.isinf(loss):
+            return None
         self.log_dict(log_dict, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        # Aliases expected by shared train_model / trainer utilities
-        self.log("mean val loss", loss, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("trajectory val_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
-        self.current_epoch_val_losses.append(loss.detach().item())
+        # Early stopping / checkpointing / sweep selection use recon loss only
+        recon_loss = log_dict["val/recon_loss"]
+        self.log("mean val loss", recon_loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("trajectory val_loss", recon_loss, on_step=False, on_epoch=True, sync_dist=True)
+        self.current_epoch_val_losses.append(recon_loss.item())
         return loss
 
     def on_validation_epoch_end(self):

@@ -81,6 +81,10 @@ def make_model(
             extra_kwargs["vae_sample_all_losses"] = cfg.model.vae_sample_all_losses
         if "kl_warmup_epochs" in cfg.model:
             extra_kwargs["kl_warmup_epochs"] = cfg.model.kl_warmup_epochs
+        # kl_null_weight / kl_dyn_weight are set via cfg.training.lightning
+        # (the single source of truth). Model YAML values are kept as
+        # documentation defaults only — do NOT pass them here, otherwise
+        # they override the training config via extra_kwargs precedence.
 
     # Instantiate the Lightning model wrapper
     lit_model = instantiate(

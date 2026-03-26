@@ -84,8 +84,11 @@ def _make_run_name(cfg: DictConfig) -> str:
 
     # Coupling-specific info
     if is_coupling:
-        kl_w = cfg.model.get("kl_divergence_weight", 0.0)
-        parts.append(f"kl_{kl_w}")
+        kl_null = cfg.training.lightning.get("kl_null_weight", cfg.model.get("kl_null_weight", 0.0))
+        kl_dyn = cfg.training.lightning.get("kl_dyn_weight", cfg.model.get("kl_dyn_weight", 0.0))
+        parts.append(f"klN_{kl_null}")
+        if kl_dyn > 0:
+            parts.append(f"klD_{kl_dyn}")
         if cfg.model.get("use_vae", False):
             parts.append("vae")
 
@@ -205,14 +208,16 @@ def _train_encoder_impl(cfg: DictConfig) -> None:
             encoder=encoder,
             n_obs=n_obs,
             n_target_dims=int(cfg.model.get("n_target_dims", 3)),
-            kl_divergence_weight=float(cfg.model.get("kl_divergence_weight", 1.0)),
+            kl_null_weight=float(cfg.training.lightning.get("kl_null_weight", cfg.model.get("kl_null_weight", 1.0))),
+            kl_dyn_weight=float(cfg.training.lightning.get("kl_dyn_weight", cfg.model.get("kl_dyn_weight", 0.0))),
             reconstruction_mode=str(cfg.model.get("reconstruction_mode", "uniform")),
             use_vae=bool(cfg.model.get("use_vae", False)),
             kl_warmup_epochs=int(cfg.model.get("kl_warmup_epochs", 0)),
         )
         log.info(
             f"Coupling flow encoder: n_target_dims={model_kwargs['n_target_dims']}, "
-            f"kl_weight={model_kwargs['kl_divergence_weight']}, "
+            f"kl_null_weight={model_kwargs['kl_null_weight']}, "
+            f"kl_dyn_weight={model_kwargs['kl_dyn_weight']}, "
             f"use_vae={model_kwargs['use_vae']}"
         )
     else:

@@ -79,7 +79,9 @@ class LitLatentJacobianODE(LitBase):
         # Subspace splitting (for dimension-preserving encoders)
         n_target_dims=None,
         n_recent_dims=None,
-        kl_divergence_weight=0.0,
+        kl_null_weight=None,
+        kl_dyn_weight=0.0,
+        kl_divergence_weight=None,  # DEPRECATED — mapped to both kl weights for back-compat
         # VAE reparameterization on dynamic subspace
         use_vae=False,
         vae_sample_all_losses=False,
@@ -116,7 +118,16 @@ class LitLatentJacobianODE(LitBase):
         # Subspace splitting for dimension-preserving encoders
         self.n_target_dims = n_target_dims
         self.n_recent_dims = n_recent_dims
-        self.kl_divergence_weight = kl_divergence_weight
+
+        # KL weights — null (structural) and dyn (smoothness)
+        if kl_divergence_weight is not None:
+            # DEPRECATED back-compat: map old unified weight to both
+            self.kl_null_weight = kl_divergence_weight
+            self.kl_dyn_weight = kl_divergence_weight
+        else:
+            self.kl_dyn_weight = kl_dyn_weight
+            # None → couple to kl_dyn_weight (single-knob control)
+            self.kl_null_weight = kl_dyn_weight if kl_null_weight is None else kl_null_weight
 
         # VAE reparameterization on dynamic subspace
         self.use_vae = use_vae
@@ -323,12 +334,12 @@ class LitLatentJacobianODE(LitBase):
         """
         return -0.5 * torch.mean(1.0 + log_var - mu.pow(2) - log_var.exp())
 
-    def _effective_kl_weight(self):
-        """Return the effective KL weight, accounting for optional warmup."""
+    def _effective_kl_weights(self):
+        """Return (effective_null_weight, effective_dyn_weight) after warmup."""
         if self.kl_warmup_epochs <= 0:
-            return self.kl_divergence_weight
+            return self.kl_null_weight, self.kl_dyn_weight
         ramp = min(self.current_epoch / self.kl_warmup_epochs, 1.0)
-        return self.kl_divergence_weight * ramp
+        return self.kl_null_weight * ramp, self.kl_dyn_weight * ramp
 
     def _tangent_space_entropy_loss(self, batch, z_full):
         """Tangent space entropy using **encoder** Jacobians (dz/dx).
@@ -952,12 +963,11 @@ class LitLatentJacobianODE(LitBase):
         recon_loss = self._reconstruction_loss(batch, z_full_for_recon)
         loss = recon_loss
 
-        # Unified KL divergence (null penalty + optional VAE KL)
+        # KL divergence: null penalty (structural) + optional VAE KL (smoothness)
         kl_null_loss = None
         kl_dyn_loss = None
-        kl_total_loss = None
-        effective_kl_w = self._effective_kl_weight()
-        if self.n_target_dims is not None and effective_kl_w > 0:
+        eff_null_w, eff_dyn_w = self._effective_kl_weights()
+        if self.n_target_dims is not None:
             if z_null is not None and z_null.numel() > 0:
                 kl_null_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
             else:
@@ -966,8 +976,10 @@ class LitLatentJacobianODE(LitBase):
                 kl_dyn_loss = self._kl_divergence(mu_dyn, log_var)
             else:
                 kl_dyn_loss = torch.tensor(0.0, device=batch.device)
-            kl_total_loss = kl_null_loss + kl_dyn_loss
-            loss = loss + effective_kl_w * kl_total_loss
+            if eff_null_w > 0 and kl_null_loss is not None:
+                loss = loss + eff_null_w * kl_null_loss
+            if eff_dyn_w > 0 and kl_dyn_loss is not None:
+                loss = loss + eff_dyn_w * kl_dyn_loss
 
         # Tangent space entropy (encoder Jacobians via autograd)
         tangent_entropy_loss = None
@@ -981,8 +993,6 @@ class LitLatentJacobianODE(LitBase):
             self.log("warmup kl_null_loss", kl_null_loss, **log_kwargs)
         if kl_dyn_loss is not None:
             self.log("warmup kl_dyn_loss", kl_dyn_loss, **log_kwargs)
-        if kl_total_loss is not None:
-            self.log("warmup kl_total_loss", kl_total_loss, **log_kwargs)
         if tangent_entropy_loss is not None:
             self.log("warmup tangent_entropy_loss", tangent_entropy_loss, **log_kwargs)
         return loss
@@ -1108,12 +1118,11 @@ class LitLatentJacobianODE(LitBase):
         # --- Group 5: Jac norm/penalty ---
         # (jac_norm is already computed above for teacher-forcing; reused here)
 
-        # --- Group 6: KL divergence (null penalty + optional VAE) ---
+        # --- Group 6: KL divergence (null + optional VAE dyn, separate weights) ---
         kl_null_loss = None
         kl_dyn_loss = None
-        kl_total_loss = None
-        effective_kl_w = self._effective_kl_weight()
-        if self.n_target_dims is not None and effective_kl_w > 0:
+        eff_null_w, eff_dyn_w = self._effective_kl_weights()
+        if self.n_target_dims is not None:
             if z_null is not None and z_null.numel() > 0:
                 kl_null_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
             else:
@@ -1122,7 +1131,6 @@ class LitLatentJacobianODE(LitBase):
                 kl_dyn_loss = self._kl_divergence(mu_dyn, log_var)
             else:
                 kl_dyn_loss = torch.tensor(0.0, device=batch.device)
-            kl_total_loss = kl_null_loss + kl_dyn_loss
 
         # --- Group 7: Tangent space entropy (encoder Jacobians via autograd) ---
         tangent_entropy_loss = None
@@ -1179,9 +1187,11 @@ class LitLatentJacobianODE(LitBase):
             elif self.fnn_weight > 0:
                 total_loss = total_loss + self.fnn_weight * fnn_loss
 
-        # KL divergence (null penalty + optional VAE)
-        if kl_total_loss is not None:
-            total_loss = total_loss + effective_kl_w * kl_total_loss
+        # KL divergence (null + dyn, separate weights)
+        if kl_null_loss is not None and eff_null_w > 0:
+            total_loss = total_loss + eff_null_w * kl_null_loss
+        if kl_dyn_loss is not None and eff_dyn_w > 0:
+            total_loss = total_loss + eff_dyn_w * kl_dyn_loss
 
         # Tangent space entropy
         if tangent_entropy_loss is not None:
@@ -1204,7 +1214,6 @@ class LitLatentJacobianODE(LitBase):
                 latent_pred_loss=latent_pred_loss,
                 jac_cons_loss=jac_cons_loss,
                 fnn_loss=fnn_loss,
-                kl_total_loss=kl_total_loss,
                 kl_null_loss=kl_null_loss,
                 kl_dyn_loss=kl_dyn_loss,
                 tangent_entropy_loss=tangent_entropy_loss,
@@ -1259,7 +1268,6 @@ class LitLatentJacobianODE(LitBase):
         # KL divergence / null penalty
         val_kl_null_loss = None
         val_kl_dyn_loss = None
-        val_kl_total_loss = None
         if self.n_target_dims is not None:
             with torch.no_grad():
                 if z_null is not None and z_null.numel() > 0:
@@ -1270,7 +1278,6 @@ class LitLatentJacobianODE(LitBase):
                     val_kl_dyn_loss = self._kl_divergence(mu_dyn, log_var)
                 else:
                     val_kl_dyn_loss = torch.tensor(0.0, device=batch.device)
-                val_kl_total_loss = val_kl_null_loss + val_kl_dyn_loss
 
         # Latent prediction loss (already computed inside trajectory_model_step)
         val_latent_pred_loss = val_rets['trajectory']['metric_vals'].get('latent_pred_loss')
@@ -1285,7 +1292,6 @@ class LitLatentJacobianODE(LitBase):
                 val_latent_pred_loss=val_latent_pred_loss,
                 val_kl_null_loss=val_kl_null_loss,
                 val_kl_dyn_loss=val_kl_dyn_loss,
-                val_kl_total_loss=val_kl_total_loss,
             )
 
         total_loss = sum(
@@ -1384,7 +1390,7 @@ class LitLatentJacobianODE(LitBase):
     def log_training_metrics(self, train_rets, total_loss, jac_norm, l1_loss,
                               batch, jacs_pred, batch_idx, recon_loss=None,
                               latent_pred_loss=None, jac_cons_loss=None,
-                              fnn_loss=None, kl_total_loss=None,
+                              fnn_loss=None,
                               kl_null_loss=None, kl_dyn_loss=None,
                               tangent_entropy_loss=None,
                               on_step=False, on_epoch=True, sync_dist=True,
@@ -1420,8 +1426,6 @@ class LitLatentJacobianODE(LitBase):
             self.log("train/jac_cons_loss", jac_cons_loss, **log_kwargs)
         if fnn_loss is not None:
             self.log("train/fnn_loss", fnn_loss, **log_kwargs)
-        if kl_total_loss is not None:
-            self.log("train/kl_total_loss", kl_total_loss, **log_kwargs)
         if kl_null_loss is not None:
             self.log("train/kl_null_loss", kl_null_loss, **log_kwargs)
         if kl_dyn_loss is not None:
@@ -1449,7 +1453,7 @@ class LitLatentJacobianODE(LitBase):
     def log_validation_metrics(self, val_rets, batch, sync_dist=True,
                                val_loop_closure=None, val_recon_loss=None,
                                val_latent_pred_loss=None, val_kl_null_loss=None,
-                               val_kl_dyn_loss=None, val_kl_total_loss=None):
+                               val_kl_dyn_loss=None):
         """Log validation metrics.
 
         Overrides the base class to skip true-Jacobian comparison and
@@ -1494,9 +1498,6 @@ class LitLatentJacobianODE(LitBase):
                      add_dataloader_idx=False)
         if val_kl_dyn_loss is not None:
             self.log("val/kl_dyn_loss", val_kl_dyn_loss, sync_dist=sync_dist,
-                     add_dataloader_idx=False)
-        if val_kl_total_loss is not None:
-            self.log("val/kl_total_loss", val_kl_total_loss, sync_dist=sync_dist,
                      add_dataloader_idx=False)
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)
