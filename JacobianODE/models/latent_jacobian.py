@@ -127,7 +127,7 @@ class LitLatentJacobianODE(LitBase):
                 raise ValueError("use_vae=True requires n_target_dims to be set")
             self.log_var_proj = nn.Linear(n_target_dims, n_target_dims)
             nn.init.zeros_(self.log_var_proj.weight)
-            nn.init.zeros_(self.log_var_proj.bias)
+            nn.init.constant_(self.log_var_proj.bias, -6.0)  # sigma ≈ 0.05
 
         # Reconstruction mode
         if reconstruction_mode not in ('uniform', 'harmonic', 'most_recent'):

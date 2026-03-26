@@ -39,6 +39,12 @@ from ..jacobians.training.logging import (
 log = logging.getLogger("EncoderLogger")
 
 
+def _is_coupling_model(cfg: DictConfig) -> bool:
+    """Return True if the encoder is a coupling flow (invertible)."""
+    target = cfg.model.encoder.get("_target_", "")
+    return "coupling" in target.lower()
+
+
 def _make_run_name(cfg: DictConfig) -> str:
     """Derive a human-readable W&B run name from the encoder config."""
     # Data class
@@ -52,25 +58,36 @@ def _make_run_name(cfg: DictConfig) -> str:
     # Encoder type (last component of _target_)
     enc_target = cfg.model.encoder._target_.split(".")[-1]
 
-    # Key model params
-    n_latent = cfg.model.encoder.n_latent
-    parts = [
-        data_cls,
-        enc_target,
-        f"n_latent_{n_latent}",
-    ]
+    is_coupling = _is_coupling_model(cfg)
 
-    # Decoder modes
-    if cfg.model.get("use_same_state_decoder", True):
-        parts.append("same")
-    if cfg.model.get("use_next_state_decoder", False):
-        parts.append("next")
+    if is_coupling:
+        n_target = cfg.model.get("n_target_dims", "?")
+        parts = [data_cls, enc_target, f"n_target_{n_target}"]
+    else:
+        n_latent = cfg.model.encoder.n_latent
+        parts = [data_cls, enc_target, f"n_latent_{n_latent}"]
+
+    # Decoder modes (non-coupling only)
+    if not is_coupling:
+        if cfg.model.get("use_same_state_decoder", True):
+            parts.append("same")
+        if cfg.model.get("use_next_state_decoder", False):
+            parts.append("next")
 
     # Regularisation weights (only non-zero)
-    for key in ("fnn_weight", "amplification_weight", "decov_weight", "jacobian_nuclear_weight", "tangent_entropy_weight"):
+    reg_keys = ["fnn_weight", "amplification_weight", "decov_weight",
+                "jacobian_nuclear_weight", "tangent_entropy_weight"]
+    for key in reg_keys:
         val = cfg.training.lightning.get(key, 0.0)
         if val and val != 0.0:
             parts.append(f"{key}_{val:.4g}")
+
+    # Coupling-specific info
+    if is_coupling:
+        kl_w = cfg.model.get("kl_divergence_weight", 0.0)
+        parts.append(f"kl_{kl_w}")
+        if cfg.model.get("use_vae", False):
+            parts.append("vae")
 
     # Run number for replicate identification
     parts.append(f"run_{cfg.training.run_number}")
@@ -176,19 +193,42 @@ def _train_encoder_impl(cfg: DictConfig) -> None:
     # Instantiate encoder, injecting runtime n_input
     encoder = instantiate(cfg.model.encoder, n_input=n_obs)
 
-    # Collect model-level kwargs from cfg.model
-    model_kwargs = dict(
-        encoder=encoder,
-        n_obs=n_obs,
-        context_margin=int(cfg.model.get("context_margin", 0)),
-        next_state_burn_in=int(cfg.model.get("next_state_burn_in", 0)),
-        use_same_state_decoder=bool(cfg.model.get("use_same_state_decoder", True)),
-        use_next_state_decoder=bool(cfg.model.get("use_next_state_decoder", False)),
-        decoder_hidden_dim=int(cfg.model.get("decoder_hidden_dim", 128)),
-        decoder_n_layers=int(cfg.model.get("decoder_n_layers", 2)),
-        k_steps_ahead=int(cfg.model.get("k_steps_ahead", 1)),
-        n_obs_pred=cfg.model.get("n_obs_pred", None),
-    )
+    is_coupling = _is_coupling_model(cfg)
+
+    if is_coupling:
+        # Coupling flow → use LitUnsupervisedCouplingFlow (self-supervised)
+        with read_write(cfg):
+            cfg.training.lightning._target_ = (
+                "JacobianODE.encoder_only.coupling_model.LitUnsupervisedCouplingFlow"
+            )
+        model_kwargs = dict(
+            encoder=encoder,
+            n_obs=n_obs,
+            n_target_dims=int(cfg.model.get("n_target_dims", 3)),
+            kl_divergence_weight=float(cfg.model.get("kl_divergence_weight", 1.0)),
+            reconstruction_mode=str(cfg.model.get("reconstruction_mode", "uniform")),
+            use_vae=bool(cfg.model.get("use_vae", False)),
+            kl_warmup_epochs=int(cfg.model.get("kl_warmup_epochs", 0)),
+        )
+        log.info(
+            f"Coupling flow encoder: n_target_dims={model_kwargs['n_target_dims']}, "
+            f"kl_weight={model_kwargs['kl_divergence_weight']}, "
+            f"use_vae={model_kwargs['use_vae']}"
+        )
+    else:
+        # Sequence encoder → use LitEncoderDecoder
+        model_kwargs = dict(
+            encoder=encoder,
+            n_obs=n_obs,
+            context_margin=int(cfg.model.get("context_margin", 0)),
+            next_state_burn_in=int(cfg.model.get("next_state_burn_in", 0)),
+            use_same_state_decoder=bool(cfg.model.get("use_same_state_decoder", True)),
+            use_next_state_decoder=bool(cfg.model.get("use_next_state_decoder", False)),
+            decoder_hidden_dim=int(cfg.model.get("decoder_hidden_dim", 128)),
+            decoder_n_layers=int(cfg.model.get("decoder_n_layers", 2)),
+            k_steps_ahead=int(cfg.model.get("k_steps_ahead", 1)),
+            n_obs_pred=cfg.model.get("n_obs_pred", None),
+        )
 
     # Instantiate Lightning model; cfg.training.lightning provides _target_ + training HPs
     lit_model = instantiate(cfg.training.lightning, **model_kwargs)
