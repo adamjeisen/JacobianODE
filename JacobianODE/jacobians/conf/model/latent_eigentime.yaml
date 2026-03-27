@@ -28,5 +28,6 @@ encoder:
 
 prediction_steps: 10
 encoder_warmup_epochs: 0
+dynamics_warmup_epochs: 0
 jac_window_stride: null
 decode_only_recent: false

@@ -153,6 +153,8 @@ def train_pretrained_jacobians(cfg: DictConfig) -> None:
         extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
     if "encoder_warmup_epochs" in cfg.model:
         extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+    if "dynamics_warmup_epochs" in cfg.model:
+        extra_kwargs["dynamics_warmup_epochs"] = cfg.model.dynamics_warmup_epochs
     if cfg.model.get("jac_window_stride") is not None:
         extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
     if "decode_only_recent" in cfg.model:

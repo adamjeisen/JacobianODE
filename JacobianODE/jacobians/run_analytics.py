@@ -7,13 +7,25 @@ Example usage::
 
     from JacobianODE.jacobians.run_analytics import run_analytics
 
+    # Analyse a specific run:
     run_analytics(
         wandb_entity="JacobianODE",
         wandb_project="Lorenz_IND0_N25_D1_NormTrue_T3__spline_coupling__JacobianODE",
-        run_id="abc123",
         save_dir="/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs",
+        run_id="abc123",
         true_lyapunov=[0.91, 0.0, -14.57],
         output=["show"],
+    )
+
+    # Auto-select best run from a sweep group:
+    run_analytics(
+        wandb_entity="JacobianODE",
+        wandb_project="Lorenz_IND0_N25_D1_NormTrue_T3__spline_coupling__JacobianODE",
+        save_dir="/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs",
+        wandb_group="my_sweep_group",
+        true_lyapunov=[0.91, 0.0, -14.57],
+        output=["show", "html"],
+        output_dir="reports",
     )
 
 Output options
@@ -677,9 +689,10 @@ def plot_amplification(
 def run_analytics(
     wandb_entity: str,
     wandb_project: str,
-    run_id: str,
     save_dir: str,
     *,
+    run_id: str | None = None,
+    epoch: int | None = None,
     wandb_group: str | None = None,
     true_lyapunov: list[float] | None = None,
     output: str | list[str] = "show",
@@ -708,12 +721,19 @@ def run_analytics(
         W&B entity (team/user) name.
     wandb_project : str
         W&B project name (without entity prefix).
-    run_id : str
-        W&B run ID for the model to analyse.
     save_dir : str
         Directory containing Lightning checkpoints (passed to ``load_run``).
+    run_id : str, optional
+        W&B run ID for the model to analyse.  If ``None``, the best run is
+        auto-selected from the project (optionally filtered by *wandb_group*).
+    epoch : int, optional
+        Epoch checkpoint to load.  If ``None`` (default), the checkpoint with
+        the lowest validation loss is used.  Raises ``FileNotFoundError`` if
+        the requested epoch has no saved checkpoint.
     wandb_group : str, optional
-        W&B group name.  Required for the ``"sweep_overview"`` section.
+        W&B group name.  When *run_id* is ``None``, filters the auto-selection
+        to runs in this group.  If also ``None``, all runs in the project are
+        considered.  Also used by the ``"sweep_overview"`` section.
     true_lyapunov : list of float, optional
         Known ground-truth Lyapunov exponents for comparison plots (e.g.
         ``[0.91, 0.0, -14.57]`` for Lorenz).  Pass ``None`` for systems
@@ -772,6 +792,31 @@ def run_analytics(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Auto-select best run from sweep if run_id is not provided ----------
+    if run_id is None:
+        from .tuning import select_best_from_sweep
+
+        if wandb_group is not None:
+            print(f"No run_id provided — selecting best run from group '{wandb_group}' ...")
+        else:
+            print(f"No run_id provided — selecting best run from all runs in '{wandb_project}' ...")
+        run_id, _auto_sweep_result, _auto_discovered = select_best_from_sweep(
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            save_dir=save_dir,
+            wandb_group=wandb_group,
+            verbose=True,
+        )
+        print(f"Auto-selected run_id: {run_id}")
+
+        # Populate sweep precomputed args so sweep_overview doesn't re-run
+        if sweep_diagnostics is None:
+            sweep_diagnostics = _auto_sweep_result.all_diagnostics
+        if sweep_result is None:
+            sweep_result = _auto_sweep_result.selection
+        if sweep_lambdas is None:
+            sweep_lambdas = _auto_discovered.lambdas
+
     active_sections = set(sections if sections is not None else _ALL_SECTIONS)
 
     device_obj = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -800,7 +845,7 @@ def run_analytics(
         cfg, values, verbose=True, return_full_obs=True
     )
 
-    load_checkpoint(run, cfg, lit_model, save_dir=save_dir, verbose=True)
+    load_checkpoint(run, cfg, lit_model, save_dir=save_dir, epoch=epoch, verbose=True)
 
     if true_lyapunov is not None:
         lit_model.true_lyapunov_exponents = torch.tensor(true_lyapunov, dtype=torch.float32)
@@ -841,10 +886,7 @@ def run_analytics(
     _report_stem = ""
     if any(m in output for m in ("save", "pdf", "html")) and output_dir is not None:
         _date_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        _name_parts = [_date_str]
-        if wandb_group is not None:
-            _name_parts.append(wandb_group)
-        _name_parts.append(run_id)
+        _name_parts = [_date_str, wandb_project, run_id]
         _report_stem = "__".join(_name_parts)
 
     pdf_handle: PdfPages | None = None
@@ -928,54 +970,6 @@ def run_analytics(
         if "sweep_overview" in active_sections:
             if sweep_diagnostics is not None and sweep_result is not None and sweep_lambdas is not None:
                 fig = plot_sweep_overview(sweep_diagnostics, sweep_result, sweep_lambdas, n_latent)
-                _emit("sweep_overview", fig)
-            elif wandb_group is not None and run_id is None:
-                from .tuning import select_from_wandb_runs
-                import wandb as wandb_api
-                api = wandb_api.Api()
-                all_runs = api.runs(wandb_project_path, filters={"group": wandb_group})
-
-                def _get_lc(r):
-                    try:
-                        val = r.config.get("training", {}).get("lightning", {}).get("loop_closure_weight")
-                        if val is not None:
-                            return float(val)
-                    except (TypeError, AttributeError):
-                        pass
-                    return None
-
-                sweep_run_ids, sweep_lambdas_computed = [], []
-                for r in all_runs:
-                    if r.state != "finished":
-                        continue
-                    if "model" not in r.config or "encoder" not in r.config.get("model", {}):
-                        continue
-                    lc = _get_lc(r)
-                    if lc is not None:
-                        sweep_run_ids.append(r.id)
-                        sweep_lambdas_computed.append(lc)
-
-                sorted_pairs = sorted(zip(sweep_lambdas_computed, sweep_run_ids))
-                sweep_lambdas_sorted = [p[0] for p in sorted_pairs]
-                sweep_run_ids_sorted = [p[1] for p in sorted_pairs]
-
-                sweep_res = select_from_wandb_runs(
-                    run_ids=sweep_run_ids_sorted,
-                    project=wandb_project_path,
-                    dt=dt,
-                    n_dims=n_dims,
-                    n_batches=100,
-                    eigenvalue_threshold=0.001,
-                    use_loop_closure=True,
-                    lambda_values=sweep_lambdas_sorted,
-                    save_dir=save_dir,
-                    verbose=True,
-                    n_latent=n_latent,
-                )
-                fig = plot_sweep_overview(
-                    sweep_res.diagnostics, sweep_res.selection,
-                    sweep_lambdas_sorted, n_latent,
-                )
                 _emit("sweep_overview", fig)
             else:
                 print("Skipping 'sweep_overview': provide wandb_group or precomputed sweep_diagnostics.")

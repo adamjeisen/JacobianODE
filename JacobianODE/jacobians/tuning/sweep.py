@@ -359,3 +359,311 @@ def select_from_wandb_runs(
         lambda_values=lambda_values,
         run_ids=run_ids,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sweep discovery helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_jac_ode_run(run) -> bool:
+    """Return True if this W&B run has an encoder (i.e. is a JacobianODE run)."""
+    return "model" in run.config and "encoder" in run.config.get("model", {})
+
+
+def _get_loop_closure_weight(run) -> Optional[float]:
+    """Robustly extract ``loop_closure_weight`` from a W&B run config."""
+    try:
+        val = run.config.get("training", {}).get("lightning", {}).get("loop_closure_weight")
+        if val is not None:
+            return float(val)
+    except (TypeError, AttributeError):
+        pass
+    for key in (
+        "training.lightning.loop_closure_weight",
+        "training/lightning/loop_closure_weight",
+    ):
+        if hasattr(run.config, "get") and key in run.config:
+            return float(run.config[key])
+    return None
+
+
+def _get_tangent_entropy_weight(run) -> float:
+    """Robustly extract ``tangent_entropy_weight`` from a W&B run config."""
+    try:
+        val = run.config.get("training", {}).get("lightning", {}).get("tangent_entropy_weight")
+        if val is not None:
+            return float(val)
+    except (TypeError, AttributeError):
+        pass
+    for key in (
+        "training.lightning.tangent_entropy_weight",
+        "training/lightning/tangent_entropy_weight",
+    ):
+        if hasattr(run.config, "get") and key in run.config:
+            return float(run.config[key])
+    return 0.0
+
+
+def _get_kl_dyn_weight(run) -> float:
+    """Robustly extract ``kl_dyn_weight`` from a W&B run config."""
+    try:
+        val = run.config.get("training", {}).get("lightning", {}).get("kl_dyn_weight")
+        if val is not None:
+            return float(val)
+    except (TypeError, AttributeError):
+        pass
+    for key in (
+        "training.lightning.kl_dyn_weight",
+        "training/lightning/kl_dyn_weight",
+    ):
+        if hasattr(run.config, "get") and key in run.config:
+            return float(run.config[key])
+    return 0.0
+
+
+@dataclass
+class DiscoveredSweep:
+    """Result of :func:`discover_sweep_runs`.
+
+    Attributes:
+        run_ids: W&B run IDs sorted by ``loop_closure_weight``.
+        lambdas: Corresponding ``loop_closure_weight`` values.
+        tangent_entropy_weights: Corresponding ``tangent_entropy_weight`` values.
+        kl_dyn_weights: Corresponding ``kl_dyn_weight`` values.
+        crashed_ids: IDs of crashed/failed JacobianODE runs (kept or deleted).
+    """
+
+    run_ids: List[str]
+    lambdas: List[float]
+    tangent_entropy_weights: List[float]
+    kl_dyn_weights: List[float]
+    crashed_ids: List[str] = field(default_factory=list)
+
+
+def discover_sweep_runs(
+    wandb_entity: str,
+    wandb_project: str,
+    wandb_group: Optional[str] = None,
+    *,
+    delete_crashed: bool = False,
+    verbose: bool = False,
+) -> DiscoveredSweep:
+    """Query W&B for finished JacobianODE runs in a project (optionally filtered by group).
+
+    Filters to finished runs that have an encoder config and a
+    ``loop_closure_weight``, then returns them sorted by that weight.
+
+    Parameters
+    ----------
+    wandb_entity : str
+        W&B entity (team/user).
+    wandb_project : str
+        W&B project name (without entity prefix).
+    wandb_group : str, optional
+        W&B group name to filter on.  If ``None``, all runs in the project
+        are considered.
+    delete_crashed : bool
+        If True, delete crashed/failed runs from W&B.
+    verbose : bool
+        Print diagnostic information.
+
+    Returns
+    -------
+    DiscoveredSweep
+        Sorted run IDs, lambda values, tangent-entropy weights, and
+        kl-dyn weights.
+    """
+    import wandb as _wandb
+
+    api = _wandb.Api(timeout=90)
+    project_path = f"{wandb_entity}/{wandb_project}"
+    run_filters = {"group": wandb_group} if wandb_group else None
+    all_runs = api.runs(project_path, filters=run_filters)
+
+    if verbose:
+        msg = f"Found {len(all_runs)} total runs in {project_path}"
+        if wandb_group:
+            msg += f" (group={wandb_group})"
+        print(msg)
+        print("All runs (state, loop_closure_weight, tangent_entropy_weight, kl_dyn_weight):")
+        for r in all_runs:
+            lc = _get_loop_closure_weight(r)
+            te = _get_tangent_entropy_weight(r)
+            kd = _get_kl_dyn_weight(r)
+            print(f"  {r.id}: state={r.state}, lc={lc}, te={te}, kl_dyn={kd}")
+        print()
+
+    # Handle crashed/failed runs
+    crashed_ids: List[str] = []
+    for run in all_runs:
+        if run.state in ("crashed", "failed") and _is_jac_ode_run(run):
+            lam = _get_loop_closure_weight(run)
+            if delete_crashed:
+                if verbose:
+                    print(f"CRASHED: run_id={run.id} (lc={lam}) — deleting from W&B")
+                run.delete()
+                crashed_ids.append(run.id)
+            elif verbose:
+                print(f"CRASHED: run_id={run.id} (lc={lam}) — keeping")
+
+    # Collect finished sweep runs
+    run_ids: List[str] = []
+    lambdas: List[float] = []
+    te_weights: List[float] = []
+    kd_weights: List[float] = []
+
+    for run in all_runs:
+        if run.state != "finished" or not _is_jac_ode_run(run):
+            continue
+        if run.id in crashed_ids:
+            continue
+        lc = _get_loop_closure_weight(run)
+        if lc is not None:
+            run_ids.append(run.id)
+            lambdas.append(lc)
+            te_weights.append(_get_tangent_entropy_weight(run))
+            kd_weights.append(_get_kl_dyn_weight(run))
+
+    # Sort by lambda
+    sorted_tuples = sorted(zip(lambdas, te_weights, kd_weights, run_ids))
+    lambdas = [t[0] for t in sorted_tuples]
+    te_weights = [t[1] for t in sorted_tuples]
+    kd_weights = [t[2] for t in sorted_tuples]
+    run_ids = [t[3] for t in sorted_tuples]
+
+    if verbose:
+        print(f"Found {len(run_ids)} finished sweep runs:")
+        for lam, te, kd, rid in zip(lambdas, te_weights, kd_weights, run_ids):
+            print(
+                f"  loop_closure_weight={lam}, tangent_entropy_weight={te}, "
+                f"kl_dyn_weight={kd} -> run_id={rid}"
+            )
+
+    return DiscoveredSweep(
+        run_ids=run_ids,
+        lambdas=lambdas,
+        tangent_entropy_weights=te_weights,
+        kl_dyn_weights=kd_weights,
+        crashed_ids=crashed_ids,
+    )
+
+
+def select_best_from_sweep(
+    wandb_entity: str,
+    wandb_project: str,
+    save_dir: str,
+    *,
+    wandb_group: Optional[str] = None,
+    n_batches: int = 100,
+    eigenvalue_threshold: float = 0.001,
+    use_loop_closure: bool = True,
+    delete_crashed: bool = False,
+    verbose: bool = False,
+) -> tuple[str, SweepResult, DiscoveredSweep]:
+    """Discover sweep runs and select the best one.
+
+    Convenience wrapper that calls :func:`discover_sweep_runs` then
+    :func:`select_from_wandb_runs`.
+
+    Parameters
+    ----------
+    wandb_entity : str
+        W&B entity (team/user).
+    wandb_project : str
+        W&B project name (without entity prefix).
+    save_dir : str
+        Directory for checkpoints and diagnostics cache.
+    wandb_group : str, optional
+        W&B group name to filter on.  If ``None``, all runs in the project
+        are considered.
+    n_batches : int
+        Number of validation batches for diagnostics.
+    eigenvalue_threshold : float
+        Threshold for the eigenvalue criterion.
+    use_loop_closure : bool
+        Whether to apply the loop-closure criterion.
+    delete_crashed : bool
+        If True, delete crashed/failed runs from W&B.
+    verbose : bool
+        Print progress.
+
+    Returns
+    -------
+    best_run_id : str
+        The run ID of the selected best model.
+    sweep_result : SweepResult
+        Full sweep result with diagnostics and selection.
+    discovered : DiscoveredSweep
+        The discovered runs (for further inspection).
+
+    Raises
+    ------
+    RuntimeError
+        If no finished sweep runs are found or selection fails.
+    """
+    from ..checkpoints import load_run
+
+    discovered = discover_sweep_runs(
+        wandb_entity, wandb_project, wandb_group,
+        delete_crashed=delete_crashed, verbose=verbose,
+    )
+
+    if not discovered.run_ids:
+        group_msg = f" group={wandb_group}" if wandb_group else ""
+        raise RuntimeError(
+            f"No finished JacobianODE sweep runs found in "
+            f"{wandb_entity}/{wandb_project}{group_msg}"
+        )
+
+    # Load one run to determine data dimensionality and n_latent
+    project_path = f"{wandb_entity}/{wandb_project}"
+    _run0, _cfg0, _eq0, _dt0, _values0, _, _, _, _, _ = load_run(
+        project_path,
+        run_id=discovered.run_ids[0],
+        save_dir=save_dir,
+        generate_data=True,
+        verbose=False,
+    )
+    n_dims = _values0.shape[-1]
+    n_latent = OmegaConf.select(_cfg0, "model.encoder.n_latent", default=None)
+    if n_latent is None:
+        n_latent = n_dims
+    dt = _dt0
+
+    if verbose:
+        n_target_dims = OmegaConf.select(_cfg0, "model.n_target_dims", default=None)
+        n_dyn = n_target_dims if n_target_dims is not None else n_latent
+        print(f"n_dims={n_dims}, n_latent={n_latent}, n_dyn={n_dyn}, dt={dt:.4f}")
+
+    sweep_result = select_from_wandb_runs(
+        run_ids=discovered.run_ids,
+        project=project_path,
+        dt=dt,
+        n_dims=n_dims,
+        n_batches=n_batches,
+        eigenvalue_threshold=eigenvalue_threshold,
+        use_loop_closure=use_loop_closure,
+        lambda_values=discovered.lambdas,
+        save_dir=save_dir,
+        verbose=verbose,
+        n_latent=n_latent,
+    )
+
+    result = sweep_result.selection
+    if result.best_index is None:
+        raise RuntimeError("Model selection failed: no model passed all criteria.")
+
+    best_run_id = discovered.run_ids[result.best_index]
+
+    if verbose:
+        idx = result.best_index
+        print(f"\nBest run ID:              {best_run_id}")
+        print(f"Best loop_closure_weight: {discovered.lambdas[idx]}")
+        print(f"Best tangent_entropy_weight: {discovered.tangent_entropy_weights[idx]}")
+        print(f"Best kl_dyn_weight:       {discovered.kl_dyn_weights[idx]}")
+        print(f"Best traj loss:           {result.best_metrics.trajectory_val_loss:.6f}")
+        print(f"Criteria applied: {result.criteria_applied}")
+        print(f"Surviving: {len(result.surviving_indices)} / {len(sweep_result.all_diagnostics)}")
+
+    return best_run_id, sweep_result, discovered

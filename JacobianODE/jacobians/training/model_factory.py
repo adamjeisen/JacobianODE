@@ -67,6 +67,8 @@ def make_model(
         # attribute assignment after the fact.
         if "encoder_warmup_epochs" in cfg.model:
             extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+        if "dynamics_warmup_epochs" in cfg.model:
+            extra_kwargs["dynamics_warmup_epochs"] = cfg.model.dynamics_warmup_epochs
         if "jac_window_stride" in cfg.model and cfg.model.jac_window_stride is not None:
             extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
         if "decode_only_recent" in cfg.model:

@@ -56,6 +56,7 @@ class LitLatentJacobianODE(LitBase):
         encoder,
         prediction_steps=10,
         encoder_warmup_epochs=0,
+        dynamics_warmup_epochs=0,
         jac_window_stride=None,
         true_lyapunov_exponents=None,
         reconstruction_loss_weight=1.0,
@@ -99,6 +100,7 @@ class LitLatentJacobianODE(LitBase):
         self.decode_only_recent = decode_only_recent
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
+        self.dynamics_warmup_epochs = dynamics_warmup_epochs
         self.reconstruction_loss_weight = reconstruction_loss_weight
         self.latent_prediction_loss_weight = latent_prediction_loss_weight
         self.jac_consistency_weight = jac_consistency_weight
@@ -997,11 +999,46 @@ class LitLatentJacobianODE(LitBase):
             self.log("warmup tangent_entropy_loss", tangent_entropy_loss, **log_kwargs)
         return loss
 
+    def _dynamics_warmup_step(self, batch):
+        """Dynamics warmup: full training step with encoder frozen.
+
+        Runs the standard training step but with encoder parameters frozen
+        so that only the Jacobian model (dynamics) adapts to the latent
+        space discovered during encoder warmup.
+
+        Parameters
+        ----------
+        batch : torch.Tensor
+            Raw observations ``(B, T, D_obs)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar total loss (same as full training step).
+        """
+        # Freeze encoder
+        encoder_grad_state = {}
+        for name, param in self.encoder.named_parameters():
+            encoder_grad_state[name] = param.requires_grad
+            param.requires_grad = False
+
+        try:
+            loss = self._full_training_step(batch)
+        finally:
+            # Restore encoder grad state
+            for name, param in self.encoder.named_parameters():
+                param.requires_grad = encoder_grad_state[name]
+
+        return loss
+
     def training_step(self, batch, batch_idx=0, dataloader_idx=0):
         """Full training step: encode, predict, decode, loop closure.
 
         During the first ``encoder_warmup_epochs``, only the autoencoder
         reconstruction loss is used (no Jacobian prediction or loop closure).
+        During the next ``dynamics_warmup_epochs``, the encoder is frozen
+        and only the Jacobian model is trained.  Joint training begins at
+        epoch ``encoder_warmup_epochs + dynamics_warmup_epochs``.
 
         Parameters
         ----------
@@ -1012,6 +1049,14 @@ class LitLatentJacobianODE(LitBase):
         if self.current_epoch < self.encoder_warmup_epochs:
             return self._warmup_step(batch)
 
+        # Dynamics warmup phase: encoder frozen, full training step
+        if self.current_epoch < self.encoder_warmup_epochs + self.dynamics_warmup_epochs:
+            return self._dynamics_warmup_step(batch)
+
+        return self._full_training_step(batch, batch_idx, dataloader_idx)
+
+    def _full_training_step(self, batch, batch_idx=0, dataloader_idx=0):
+        """Core training logic shared by ``training_step`` and ``_dynamics_warmup_step``."""
         batch = batch.type(self.dtype)
 
         # Encode for teacher forcing update (use z_dyn for Jacobians)

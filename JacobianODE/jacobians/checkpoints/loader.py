@@ -320,6 +320,8 @@ def _load_recent_run(
             extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
         if "encoder_warmup_epochs" in cfg.model:
             extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+        if "dynamics_warmup_epochs" in cfg.model:
+            extra_kwargs["dynamics_warmup_epochs"] = cfg.model.dynamics_warmup_epochs
         if cfg.model.get("jac_window_stride") is not None:
             extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
 
@@ -372,6 +374,8 @@ def _load_recent_run(
             extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
         if "encoder_warmup_epochs" in cfg.model:
             extra_kwargs["encoder_warmup_epochs"] = cfg.model.encoder_warmup_epochs
+        if "dynamics_warmup_epochs" in cfg.model:
+            extra_kwargs["dynamics_warmup_epochs"] = cfg.model.dynamics_warmup_epochs
         if cfg.model.get("jac_window_stride") is not None:
             extra_kwargs["jac_window_stride"] = cfg.model.jac_window_stride
 
@@ -540,6 +544,8 @@ def load_checkpoint(
         epochs = [int(f.split("=")[1].split("-")[0]) for f in checkpoint_files]
         logger.info(f"Checkpoint epochs: {epochs}")
 
+    epoch_explicitly_requested = epoch is not None
+
     if epoch is None:
         # Pick the checkpoint with minimum validation loss
         mean_val_losses = [
@@ -565,6 +571,16 @@ def load_checkpoint(
     epoch_matches = [f for f in checkpoint_files if f.startswith(f"epoch={epoch_int}-")]
     if epoch_matches:
         checkpoint = epoch_matches[0]
+    elif epoch_explicitly_requested:
+        available_epochs = sorted(
+            int(f.split("=")[1].split("-")[0])
+            for f in checkpoint_files
+            if f.startswith("epoch=")
+        )
+        raise FileNotFoundError(
+            f"No checkpoint found for epoch {epoch_int} in {checkpoint_dir}. "
+            f"Available epochs: {available_epochs}."
+        )
     else:
         # Fallback: best epoch from history may not have a saved checkpoint (e.g. save_top_k=1
         # replaced it). Use the checkpoint with the highest epoch among those available.
