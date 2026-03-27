@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from .criteria import (
     DiagnosticMetrics,
     compute_all_diagnostics,
+    diagnostics_from_wandb,
 )
 from .selection import SelectionResult, select_best_model
 
@@ -190,8 +191,10 @@ def select_from_wandb_runs(
 ) -> SweepResult:
     """Select the best model from already-trained W&B runs (post-hoc mode).
 
-    For each run: calls ``load_run`` and ``load_checkpoint``, then computes
-    diagnostics and runs the selection algorithm.
+    For each run, diagnostics are resolved in priority order:
+      1. JSON file cache (``save_dir/diagnostics_cache/``)
+      2. W&B history at the best-checkpoint epoch (no model loading needed)
+      3. Full ``load_run`` + ``load_checkpoint`` + ``compute_all_diagnostics``
 
     Args:
         run_ids: List of W&B run IDs to evaluate.
@@ -215,15 +218,18 @@ def select_from_wandb_runs(
     import json
     import os
 
+    import wandb as _wandb
+
     from ..checkpoints import load_run, load_checkpoint
 
     all_diagnostics: List[DiagnosticMetrics] = []
     device = "cuda" if torch.cuda.is_available() else "cpu"
     val_dataloader = None
     data_generated = False
+    api = _wandb.Api(timeout=90)
 
     for i, run_id in enumerate(run_ids):
-        # Per-run cache: reuse diagnostics when same run appears in multiple sweeps
+        # --- Priority 1: JSON file cache ---
         if save_dir:
             cache_path = _diagnostics_cache_path(save_dir, run_id, n_batches)
             if os.path.exists(cache_path):
@@ -242,6 +248,36 @@ def select_from_wandb_runs(
                     print(msg, flush=True)
                 continue
 
+        # --- Priority 2: W&B history at best epoch (no model loading) ---
+        api_run = api.run(f"{project}/{run_id}")
+        wandb_metrics = diagnostics_from_wandb(api_run)
+        if wandb_metrics is not None:
+            all_diagnostics.append(wandb_metrics)
+            # Persist to JSON cache for future calls
+            if save_dir:
+                cache_path = _diagnostics_cache_path(save_dir, run_id, n_batches)
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "w") as f:
+                    json.dump(
+                        {
+                            "run_id": run_id,
+                            "n_batches": n_batches,
+                            "source": "wandb_history",
+                            "one_step_mase": wandb_metrics.one_step_mase,
+                            "loop_closure_loss": wandb_metrics.loop_closure_loss,
+                            "fast_eigenvalue_fraction": wandb_metrics.fast_eigenvalue_fraction,
+                            "trajectory_val_loss": wandb_metrics.trajectory_val_loss,
+                        },
+                        f,
+                        indent=2,
+                    )
+            if verbose:
+                msg = f"  run={run_id}: {wandb_metrics} (from W&B history)"
+                logger.info(msg)
+                print(msg, flush=True)
+            continue
+
+        # --- Priority 3: Full model loading + compute_all_diagnostics ---
         if verbose:
             msg = f"Loading run {run_id} ({i+1}/{len(run_ids)})"
             logger.info(msg)
@@ -251,6 +287,7 @@ def select_from_wandb_runs(
         run_obj, run_cfg, eq, run_dt, values, train_dl, val_dl, test_dl, trajs, lit_model = load_run(
             project,
             run_id=run_id,
+            run=api_run,
             save_dir=save_dir,
             generate_data=generate_data,
             dt=dt,
@@ -285,6 +322,7 @@ def select_from_wandb_runs(
                     {
                         "run_id": run_id,
                         "n_batches": n_batches,
+                        "source": "compute_all_diagnostics",
                         "one_step_mase": metrics.one_step_mase,
                         "loop_closure_loss": metrics.loop_closure_loss,
                         "fast_eigenvalue_fraction": metrics.fast_eigenvalue_fraction,

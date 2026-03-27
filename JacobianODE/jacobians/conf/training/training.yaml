@@ -22,9 +22,10 @@ lightning:
     weight_decay: 1e-4
   use_scheduler: True
   # use_scheduler: False
-  min_lr: 1e-6 # minimum learning rate for use with scheduler
+  scheduler_type: cosine  # 'cosine' (CosineAnnealingLR over max_epochs) or 'teacher_forcing' (legacy)
+  min_lr: 1e-6 # minimum learning rate (eta_min for cosine, floor for teacher_forcing)
   # ADVANCED HYPERPARAMETERS
-  k_scale: 1 # controls the slope of the learning rate scheduler
+  k_scale: 1 # controls the slope of the learning rate scheduler (teacher_forcing only)
   gradient_clip_val: 1.0
   gradient_clip_algorithm: 'norm'
 

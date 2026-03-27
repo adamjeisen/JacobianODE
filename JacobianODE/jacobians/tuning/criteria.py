@@ -211,3 +211,69 @@ def fails_eigenvalue_criterion(
         True if the model FAILS (should be excluded).
     """
     return metrics.fast_eigenvalue_fraction > eigenvalue_threshold
+
+
+# ---------------------------------------------------------------------------
+# W&B history-based diagnostics (avoids loading model checkpoints)
+# ---------------------------------------------------------------------------
+
+
+def diagnostics_from_wandb(
+    run,
+    monitor: str = "trajectory val_loss",
+) -> Optional[DiagnosticMetrics]:
+    """Extract diagnostic metrics from W&B history at the best-checkpoint epoch.
+
+    Looks up the epoch with the lowest ``monitor`` metric and reads
+    ``val/one_step_mase``, ``val/loop_closure_loss``,
+    ``val/fast_eigenvalue_fraction``, and the trajectory val loss from that row.
+
+    Returns ``None`` if any required metric is missing from the W&B history
+    (e.g., for runs trained before these metrics were logged).
+
+    Args:
+        run: A ``wandb.apis.public.Run`` object (from ``wandb.Api().run(...)``).
+        monitor: The metric name whose minimum identifies the best epoch.
+            Defaults to ``"trajectory val_loss"`` (the traj checkpoint monitor).
+
+    Returns:
+        DiagnosticMetrics populated from the W&B history, or None if the
+        required metrics are not available.
+    """
+    import pandas as pd
+
+    try:
+        hist = run.history(samples=500_000, pandas=True)
+    except Exception:
+        return None
+
+    if hist is None or hist.empty or monitor not in hist.columns:
+        return None
+
+    m = pd.to_numeric(hist[monitor], errors="coerce")
+    valid = m.notna()
+    if not valid.any():
+        return None
+
+    best_idx = m.loc[valid].idxmin()
+    row = hist.loc[best_idx]
+
+    # one_step_mase is the metric that was previously not logged — if it's
+    # missing, this is an old run and we must fall back to full computation.
+    if "val/one_step_mase" not in row.index or pd.isna(row.get("val/one_step_mase")):
+        return None
+
+    loop_closure_loss: Optional[float] = None
+    if "val/loop_closure_loss" in row.index and pd.notna(row.get("val/loop_closure_loss")):
+        loop_closure_loss = float(row["val/loop_closure_loss"])
+
+    fast_eig_frac = 0.0
+    if "val/fast_eigenvalue_fraction" in row.index and pd.notna(row.get("val/fast_eigenvalue_fraction")):
+        fast_eig_frac = float(row["val/fast_eigenvalue_fraction"])
+
+    return DiagnosticMetrics(
+        one_step_mase=float(row["val/one_step_mase"]),
+        loop_closure_loss=loop_closure_loss,
+        fast_eigenvalue_fraction=fast_eig_frac,
+        trajectory_val_loss=float(m.loc[best_idx]),
+    )

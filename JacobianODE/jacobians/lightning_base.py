@@ -186,8 +186,11 @@ class LitBase(L.LightningModule):
         min_traj_init_steps (int): Minimum initial steps for trajectories (default: 2)
         max_traj_init_steps (Optional[int]): Maximum initial steps for trajectories (default: None)
         use_scheduler (bool): Whether to use learning rate scheduler (default: False)
-        min_lr (Optional[float]): Minimum learning rate for scheduler (default: None)
-        k_scale (Optional[float]): Scaling factor for scheduler (default: None)
+        scheduler_type (str): LR scheduler to use — 'cosine' (CosineAnnealingLR, decays over
+            trainer.max_epochs to min_lr) or 'teacher_forcing' (legacy, ties LR to teacher
+            forcing coefficient) (default: 'teacher_forcing')
+        min_lr (Optional[float]): Minimum learning rate / eta_min for scheduler (default: None)
+        k_scale (Optional[float]): Scaling factor for teacher_forcing scheduler (default: None)
         jac_penalty (float): Weight for Jacobian regularization (default: 0.0)
         jac_norm_ord (str): Order of norm for Jacobian regularization (default: 'fro')
         loop_closure_training (bool): Whether to use loop closure training (default: True)
@@ -235,6 +238,7 @@ class LitBase(L.LightningModule):
                     gradient_clip_algorithm='norm',
                     jacobianODEint_kwargs={},
                     use_scheduler=False,
+                    scheduler_type='teacher_forcing',
                     min_lr=None,
                     k_scale=None,
                     jac_penalty=0.0,
@@ -300,6 +304,7 @@ class LitBase(L.LightningModule):
 
         self.jacobianODEint_kwargs = jacobianODEint_kwargs
         self.use_scheduler = use_scheduler
+        self.scheduler_type = scheduler_type
         self.min_lr = min_lr
         self.k_scale = k_scale
         self.jac_penalty = jac_penalty
@@ -620,7 +625,9 @@ class LitBase(L.LightningModule):
             jacs_pred = self.get_pred_jacs(batch)
         if jacs_pred is not None:
             jac_norm = torch.linalg.norm(jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord).mean()
-            self.update_alpha_teacher_forcing(jacs_pred.detach(), batch_idx)
+            encoder_warmup_epochs = getattr(self, 'encoder_warmup_epochs', 0)
+            if self.current_epoch >= encoder_warmup_epochs:
+                self.update_alpha_teacher_forcing(jacs_pred.detach(), batch_idx)
         else:
             jac_norm = None
         
@@ -783,6 +790,24 @@ class LitBase(L.LightningModule):
             # Clear the current epoch losses
             self.current_epoch_val_losses = []
 
+        # One-step MASE (ratio-of-means across batches for C1 diagnostic)
+        if hasattr(self, '_val_one_step_model_maes') and self._val_one_step_model_maes:
+            avg_model_mae = sum(self._val_one_step_model_maes) / len(self._val_one_step_model_maes)
+            avg_persist_mae = sum(self._val_one_step_persistence_maes) / len(self._val_one_step_persistence_maes)
+            one_step_mase = avg_model_mae / max(avg_persist_mae, 1e-8)
+            self.log("val/one_step_mase", one_step_mase, sync_dist=True)
+            self._val_one_step_model_maes = []
+            self._val_one_step_persistence_maes = []
+
+        # Fast eigenvalue fraction (C3 diagnostic)
+        if hasattr(self, '_val_eig_too_fast') and self._val_eig_total:
+            total_too_fast = sum(self._val_eig_too_fast)
+            total_eigs = sum(self._val_eig_total)
+            frac = total_too_fast / max(total_eigs, 1)
+            self.log("val/fast_eigenvalue_fraction", frac, sync_dist=True)
+            self._val_eig_too_fast = []
+            self._val_eig_total = []
+
     def log_training_metrics(self, train_rets, total_loss, jac_norm, l1_loss, batch,
                            jacs_pred=None, batch_idx=0, on_step=True, on_epoch=True,
                            sync_dist=True, prog_bar=True):
@@ -927,19 +952,33 @@ class LitBase(L.LightningModule):
             raise ValueError(f'Optimizer {self.optimizer} not recognized')
 
         if self.use_scheduler:
-            scheduler = TeacherForcingLRScheduler(
-                optimizer,
-                lit_model=self,
-                min_lr=self.min_lr,
-                k=self.k_scale
-            )
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                },
-            }
+            if self.scheduler_type == 'cosine':
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=self.trainer.max_epochs,
+                    eta_min=self.min_lr if self.min_lr is not None else 0,
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "epoch",
+                    },
+                }
+            else:  # 'teacher_forcing' (original behaviour)
+                scheduler = TeacherForcingLRScheduler(
+                    optimizer,
+                    lit_model=self,
+                    min_lr=self.min_lr,
+                    k=self.k_scale
+                )
+                return {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": scheduler,
+                        "interval": "step",
+                    },
+                }
         else:
             return {
                 "optimizer": optimizer,

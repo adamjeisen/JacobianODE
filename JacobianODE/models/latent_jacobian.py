@@ -1282,6 +1282,38 @@ class LitLatentJacobianODE(LitBase):
         # Latent prediction loss (already computed inside trajectory_model_step)
         val_latent_pred_loss = val_rets['trajectory']['metric_vals'].get('latent_pred_loss')
 
+        # One-step teacher-forced prediction (for MASE diagnostic, C1)
+        with torch.no_grad():
+            one_step_ret = self.trajectory_model_step(
+                batch, batch_idx, dataloader_idx,
+                alpha_teacher_forcing=1,
+                obs_noise_scale=0,
+                latent_noise_scale=0,
+            )
+        # Accumulate raw MAE components for ratio-of-means aggregation
+        if not hasattr(self, '_val_one_step_model_maes'):
+            self._val_one_step_model_maes = []
+            self._val_one_step_persistence_maes = []
+        self._val_one_step_model_maes.append(
+            one_step_ret['metric_vals']['model_mae'].float().item()
+        )
+        self._val_one_step_persistence_maes.append(
+            one_step_ret['metric_vals']['persistence_mae'].float().item()
+        )
+
+        # Fast eigenvalue fraction (C3 diagnostic)
+        with torch.no_grad():
+            pred_jacs = self.compute_jacobians(z_dyn)
+            eigs_real = torch.linalg.eigvals(pred_jacs).real.flatten()
+            threshold = -1.0 / self.dt
+            n_too_fast = torch.sum(eigs_real <= threshold).float().item()
+            n_total = len(eigs_real)
+        if not hasattr(self, '_val_eig_too_fast'):
+            self._val_eig_too_fast = []
+            self._val_eig_total = []
+        self._val_eig_too_fast.append(n_too_fast)
+        self._val_eig_total.append(n_total)
+
         if log_metrics:
             self.log_validation_metrics(
                 val_rets=val_rets,
@@ -1292,6 +1324,7 @@ class LitLatentJacobianODE(LitBase):
                 val_latent_pred_loss=val_latent_pred_loss,
                 val_kl_null_loss=val_kl_null_loss,
                 val_kl_dyn_loss=val_kl_dyn_loss,
+                val_one_step_loss=one_step_ret['loss'],
             )
 
         total_loss = sum(
@@ -1453,7 +1486,7 @@ class LitLatentJacobianODE(LitBase):
     def log_validation_metrics(self, val_rets, batch, sync_dist=True,
                                val_loop_closure=None, val_recon_loss=None,
                                val_latent_pred_loss=None, val_kl_null_loss=None,
-                               val_kl_dyn_loss=None):
+                               val_kl_dyn_loss=None, val_one_step_loss=None):
         """Log validation metrics.
 
         Overrides the base class to skip true-Jacobian comparison and
@@ -1498,6 +1531,9 @@ class LitLatentJacobianODE(LitBase):
                      add_dataloader_idx=False)
         if val_kl_dyn_loss is not None:
             self.log("val/kl_dyn_loss", val_kl_dyn_loss, sync_dist=sync_dist,
+                     add_dataloader_idx=False)
+        if val_one_step_loss is not None:
+            self.log("val/one_step_loss", val_one_step_loss, sync_dist=sync_dist,
                      add_dataloader_idx=False)
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)
