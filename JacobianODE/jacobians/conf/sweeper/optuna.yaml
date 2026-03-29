@@ -1,0 +1,41 @@
+# @package _global_
+#
+# Optuna-based Bayesian hyperparameter optimization.
+# Activate with:  --multirun sweeper=optuna
+#
+# Override search_space, n_trials, n_jobs, study_name via CLI or notebook.
+# Example:
+#   python -m JacobianODE.jacobians.run_jacobians --multirun \
+#     sweeper=optuna \
+#     hydra.sweeper.study_name=my_study \
+#     hydra.sweeper.n_trials=40 \
+#     hydra.sweeper.n_jobs=8
+
+defaults:
+  - override /hydra/sweeper: optuna
+
+hydra:
+  sweeper:
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: 42
+      n_startup_trials: 10  # random exploration before TPE kicks in
+
+    direction: minimize
+    n_trials: 50
+    n_jobs: 8               # parallel SLURM trials per batch
+    study_name: null         # set per experiment
+    storage: null            # set to "sqlite:///path.db" for persistence/resumability
+
+    # Default search space (loss weights, log-uniform)
+    search_space:
+      training.lightning.loop_closure_weight:
+        type: float
+        low: 1e-6
+        high: 10.0
+        log: true
+      training.lightning.kl_dyn_weight:
+        type: float
+        low: 1e-6
+        high: 10.0
+        log: true

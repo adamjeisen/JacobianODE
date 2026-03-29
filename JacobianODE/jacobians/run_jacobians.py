@@ -13,6 +13,7 @@ import random
 import sys
 import time
 import traceback
+from typing import Optional
 
 import hydra
 import torch
@@ -28,7 +29,7 @@ log = logging.getLogger("JacobianLogger")
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
-def train_jacobians(cfg: DictConfig) -> None:
+def train_jacobians(cfg: DictConfig) -> Optional[float]:
     """Train a JacobianODE model.
 
     This function orchestrates the complete training pipeline:
@@ -41,6 +42,10 @@ def train_jacobians(cfg: DictConfig) -> None:
 
     Args:
         cfg: Hydra configuration object containing all training parameters.
+
+    Returns:
+        The best trajectory validation loss (used as the Optuna objective when
+        running with ``hydra/sweeper=optuna``).  Ignored by other sweepers.
     """
     # ----------------------------------------
     # DIAGNOSTIC: Capture crashes and exceptions
@@ -54,7 +59,7 @@ def train_jacobians(cfg: DictConfig) -> None:
         faulthandler.enable(all_threads=True)  # fallback to stderr
 
     try:
-        _run_training(cfg)
+        return _run_training(cfg)
     except Exception as e:
         err_path = os.path.join(diag_dir, "error_traceback.txt")
         with open(err_path, "w") as f:
@@ -63,7 +68,7 @@ def train_jacobians(cfg: DictConfig) -> None:
         raise
 
 
-def _run_training(cfg: DictConfig) -> None:
+def _run_training(cfg: DictConfig) -> float:
     """Inner training logic (separated for diagnostic try/except)."""
     # ----------------------------------------
     # INITIAL SETUP
@@ -170,7 +175,16 @@ def _run_training(cfg: DictConfig) -> None:
     # TRAIN MODEL
     # ----------------------------------------
     wandb_group = cfg.get("wandb_group") or None
-    train_model(cfg, lit_model, train_dataloader, val_dataloader, name, project, entity=entity, group=wandb_group)
+    trainer = train_model(cfg, lit_model, train_dataloader, val_dataloader, name, project, entity=entity, group=wandb_group)
+
+    # Return objective for Optuna (silently ignored by non-sweep runs).
+    # The OptunaCoordinator reads best_so_far from the DB instead, but
+    # this return value is still used by Hydra's Optuna sweeper if active.
+    best = trainer.callback_metrics.get("trajectory val_loss")
+    if best is not None:
+        return float(best)
+    best = trainer.callback_metrics.get("mean val loss")
+    return float(best) if best is not None else float("inf")
 
 
 if __name__ == "__main__":

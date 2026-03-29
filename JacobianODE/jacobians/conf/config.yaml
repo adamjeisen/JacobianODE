@@ -12,6 +12,10 @@ wandb_entity: JacobianODE
 wandb_project: null
 wandb_group: null  # Optional: group runs into separate experiments within the same project
 
+# Optuna pruning (passed to trainer via top-level config)
+optuna_study_name: null  # set by notebook when running Optuna sweep
+optuna_storage: null      # e.g. "sqlite:///path/to/optuna.db"
+
 hydra:
   sweep:
     dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S-%f}

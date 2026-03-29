@@ -1131,3 +1131,342 @@ class PercentEarlyStopping(EarlyStopping):
             return True, None
 
         return False, None
+
+
+class _OptunaTrialMixin:
+    """Shared logic for Optuna callbacks that need to find their own trial in the DB.
+
+    Since submitit_slurm workers don't have access to the Optuna Trial object,
+    these callbacks identify their trial via a unique worker ID stored as a
+    user attribute on first contact.
+
+    **Important**: ``study.trials`` returns ``FrozenTrial`` snapshots whose
+    ``set_user_attr`` only modifies an in-memory dict — it does NOT persist to
+    the database.  All writes must go through ``study._storage`` instead.
+    """
+
+    WORKER_ID_KEY = "worker_id"
+
+    def _get_study(self):
+        """Load the Optuna study from storage (read/write)."""
+        import optuna
+        return optuna.load_study(
+            study_name=self.study_name, storage=self.storage
+        )
+
+    @staticmethod
+    def _set_trial_attr(study, trial, key, value):
+        """Persist a user attribute to the database (not just in-memory)."""
+        study._storage.set_trial_user_attr(trial._trial_id, key, value)
+
+    def _get_worker_id(self):
+        """Return a unique ID for this worker process."""
+        import os
+        return f"{os.getpid()}_{id(self)}"
+
+    def _find_own_trial(self, study):
+        """Find this worker's trial by worker_id, or claim an unclaimed RUNNING trial."""
+        import optuna
+        worker_id = self._get_worker_id()
+
+        # First, look for a trial we've already claimed
+        for trial in reversed(study.trials):
+            if trial.user_attrs.get(self.WORKER_ID_KEY) == worker_id:
+                return trial
+
+        # Claim the most recent unclaimed RUNNING trial
+        for trial in reversed(study.trials):
+            if (
+                trial.state == optuna.trial.TrialState.RUNNING
+                and self.WORKER_ID_KEY not in trial.user_attrs
+            ):
+                self._set_trial_attr(study, trial, self.WORKER_ID_KEY, worker_id)
+                return trial
+        return None
+
+
+class OptunaProgressCallback(L.Callback, _OptunaTrialMixin):
+    """Write the best-so-far validation loss to the Optuna DB every validation epoch.
+
+    If the SLURM job times out before ``run_jacobians`` returns, the sweeper
+    coordinator marks the trial as FAIL and the return value is lost.  This
+    callback ensures the DB always contains the most recent best loss as a
+    user attribute (``best_so_far``), so timed-out trials can still be analyzed
+    and their results recovered.
+
+    Args:
+        monitor: Metric name to track from ``trainer.callback_metrics``.
+        study_name: Optuna study name (must match the coordinator).
+        storage: Optuna storage URL (e.g. ``sqlite:///path.db``).
+    """
+
+    BEST_ATTR = "best_so_far"
+    EPOCH_ATTR = "best_so_far_epoch"
+
+    def __init__(self, monitor: str, study_name: str, storage: str):
+        super().__init__()
+        self.monitor = monitor
+        self.study_name = study_name
+        self.storage = storage
+        self._best = float("inf")
+
+    def on_validation_end(self, trainer, pl_module):
+        current = trainer.callback_metrics.get(self.monitor)
+        if current is None:
+            return
+        current_val = float(current)
+
+        if current_val < self._best:
+            self._best = current_val
+
+        try:
+            study = self._get_study()
+            trial = self._find_own_trial(study)
+            if trial is not None:
+                self._set_trial_attr(study, trial, self.BEST_ATTR, self._best)
+                self._set_trial_attr(study, trial, self.EPOCH_ATTR, trainer.current_epoch)
+        except Exception as e:
+            pl_module.print(f"[OptunaProgress] Could not write to study DB: {e}")
+
+
+class OptunaConstrainedProgressCallback(L.Callback, _OptunaTrialMixin):
+    """Write feasibility-aware best-so-far loss to the Optuna DB every validation epoch.
+
+    Extends the logic of :class:`OptunaProgressCallback` with a physics constraint:
+    a feasible result (constraint metric < threshold) always beats an infeasible
+    one regardless of loss.  Among results with the same feasibility, lower loss wins.
+
+    This enables Optuna's ``TPESampler(constraints_func=...)`` to steer away from
+    hyperparameter regions that produce low loss but violate physics criteria
+    (e.g. loop closure loss too high).
+
+    Args:
+        monitor: Primary objective metric (e.g. ``"trajectory val_loss"``).
+        constraint_metric: Metric to check feasibility against
+            (e.g. ``"val/loop_closure_loss"``).
+        constraint_threshold: Maximum allowed value for the constraint metric.
+            Values **at or below** this threshold are considered feasible.
+        study_name: Optuna study name (must match the coordinator).
+        storage: Optuna storage URL (e.g. ``sqlite:///path.db``).
+    """
+
+    BEST_ATTR = "best_so_far"
+    EPOCH_ATTR = "best_so_far_epoch"
+    FEASIBLE_ATTR = "best_so_far_feasible"
+    CONSTRAINT_ATTR = "best_so_far_constraint"
+
+    def __init__(
+        self,
+        monitor: str,
+        constraint_metric: str,
+        constraint_threshold: float,
+        study_name: str,
+        storage: str,
+    ):
+        super().__init__()
+        self.monitor = monitor
+        self.constraint_metric = constraint_metric
+        self.constraint_threshold = constraint_threshold
+        self.study_name = study_name
+        self.storage = storage
+        self._best = float("inf")
+        self._best_feasible = False
+
+    def on_validation_end(self, trainer, pl_module):
+        current = trainer.callback_metrics.get(self.monitor)
+        if current is None:
+            return
+        current_val = float(current)
+
+        constraint_val = trainer.callback_metrics.get(self.constraint_metric)
+        current_feasible = (
+            constraint_val is not None
+            and float(constraint_val) <= self.constraint_threshold
+        )
+
+        # Update best: feasible always beats infeasible; within same
+        # feasibility class, lower loss wins.
+        update = False
+        if current_feasible and not self._best_feasible:
+            # First feasible result replaces any infeasible best
+            update = True
+        elif current_feasible == self._best_feasible and current_val < self._best:
+            # Same feasibility class — lower loss wins
+            update = True
+
+        if update:
+            self._best = current_val
+            self._best_feasible = current_feasible
+
+        # Always write the real loss — the coordinator uses constraints_func
+        # for feasibility separation, so it needs the actual value to rank
+        # infeasible trials by quality too.
+
+        try:
+            study = self._get_study()
+            trial = self._find_own_trial(study)
+            if trial is not None:
+                self._set_trial_attr(study, trial, self.BEST_ATTR, self._best)
+                self._set_trial_attr(study, trial, self.EPOCH_ATTR, trainer.current_epoch)
+                self._set_trial_attr(study, trial, self.FEASIBLE_ATTR, self._best_feasible)
+                # Store the raw constraint value for analysis
+                if constraint_val is not None:
+                    self._set_trial_attr(study, trial, self.CONSTRAINT_ATTR, float(constraint_val))
+        except Exception as e:
+            pl_module.print(f"[OptunaConstrainedProgress] Could not write to study DB: {e}")
+
+
+class OptunaPruneCallback(L.Callback, _OptunaTrialMixin):
+    """Prune Optuna trials early by comparing against other trials at the same epoch.
+
+    At ``prune_epoch``, this callback:
+    1. Records the current trial's monitored metric at this epoch into the Optuna
+       study as a user attribute (``prune_epoch_loss``).
+    2. Reads the ``prune_epoch_loss`` values from all other trials that have
+       already passed this epoch.
+    3. If the current value is worse than the configured quantile of those
+       values, sets ``trainer.should_stop = True``.
+
+    Optionally, a physics constraint can be checked at prune epoch: if
+    ``constraint_metric`` exceeds ``constraint_threshold``, the trial is
+    stopped immediately (no need to wait for enough reference trials).
+
+    This works with the ``submitit_slurm`` launcher where the Optuna ``trial``
+    object is not available in the worker process — it reads and writes the
+    shared SQLite study DB directly.
+
+    Args:
+        prune_epoch: Epoch at which to evaluate pruning (0-indexed).
+        monitor: Metric name to read from ``trainer.callback_metrics``.
+        study_name: Optuna study name (must match the coordinator).
+        storage: Optuna storage URL (e.g. ``sqlite:///path.db``).
+        min_completed: Minimum number of trials with ``prune_epoch_loss``
+            recorded before pruning is considered.  Defaults to 5.
+        quantile: Prune if the metric is above this quantile of other trials'
+            ``prune_epoch_loss`` values.  Defaults to 0.5 (median).
+        constraint_metric: Optional metric name for physics constraint check.
+            If provided, trials that exceed ``constraint_threshold`` at
+            ``prune_epoch`` are stopped immediately.
+        constraint_threshold: Maximum allowed value for ``constraint_metric``.
+    """
+
+    # Key used to store the intermediate loss in each trial's user_attrs
+    ATTR_KEY = "prune_epoch_loss"
+
+    def __init__(
+        self,
+        prune_epoch: int,
+        monitor: str,
+        study_name: str,
+        storage: str,
+        min_completed: int = 5,
+        quantile: float = 0.5,
+        constraint_metric: str = None,
+        constraint_threshold: float = None,
+    ):
+        super().__init__()
+        self.prune_epoch = prune_epoch
+        self.monitor = monitor
+        self.study_name = study_name
+        self.storage = storage
+        self.min_completed = min_completed
+        self.quantile = quantile
+        self.constraint_metric = constraint_metric
+        self.constraint_threshold = constraint_threshold
+        self._recorded = False
+
+    def _get_reference_losses(self, study):
+        """Collect prune_epoch_loss values from all trials that have recorded one."""
+        return [
+            t.user_attrs[self.ATTR_KEY]
+            for t in study.trials
+            if self.ATTR_KEY in t.user_attrs
+        ]
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.current_epoch != self.prune_epoch:
+            return
+        if self._recorded:
+            return
+
+        current = trainer.callback_metrics.get(self.monitor)
+        if current is None:
+            return
+        current_val = float(current)
+
+        # --- Constraint check (independent of reference trials) ---
+        if self.constraint_metric and self.constraint_threshold is not None:
+            constraint_val = trainer.callback_metrics.get(self.constraint_metric)
+            if constraint_val is not None and float(constraint_val) > self.constraint_threshold:
+                trainer.should_stop = True
+                pl_module.print(
+                    f"[OptunaPrune] epoch {self.prune_epoch}: "
+                    f"constraint {self.constraint_metric}={float(constraint_val):.6f} > "
+                    f"threshold {self.constraint_threshold:.6f} — stopping (infeasible)."
+                )
+                # Still record for other trials' reference, then return
+                self._record_to_db(current_val)
+                return
+
+        # --- Standard quantile-based pruning ---
+        try:
+            study = self._get_study()
+
+            # Always record this trial's prune-epoch loss
+            trial = self._find_own_trial(study)
+            if trial is not None:
+                self._set_trial_attr(study, trial, self.ATTR_KEY, current_val)
+                self._set_trial_attr(study, trial, "prune_epoch", self.prune_epoch)
+            self._recorded = True
+
+            # Reload to see freshly written data + other trials
+            study = self._get_study()
+            reference = self._get_reference_losses(study)
+        except Exception as e:
+            pl_module.print(f"[OptunaPrune] Could not access study DB: {e}")
+            return
+
+        # Exclude our own value from the reference distribution
+        # (it was just added; we want to compare against *other* trials)
+        other_losses = [v for v in reference if v != current_val]
+        # If all values are the same as ours, fall back to full list
+        if not other_losses:
+            other_losses = reference
+
+        if len(other_losses) < self.min_completed:
+            pl_module.print(
+                f"[OptunaPrune] epoch {self.prune_epoch}: "
+                f"{self.monitor}={current_val:.6f}, "
+                f"only {len(other_losses)} reference trials "
+                f"(need {self.min_completed}) — not pruning."
+            )
+            return
+
+        threshold = float(np.quantile(other_losses, self.quantile))
+        if current_val > threshold:
+            trainer.should_stop = True
+            pl_module.print(
+                f"[OptunaPrune] epoch {self.prune_epoch}: "
+                f"{self.monitor}={current_val:.6f} > "
+                f"quantile({self.quantile})={threshold:.6f} of "
+                f"{len(other_losses)} trials at same epoch — stopping early."
+            )
+        else:
+            pl_module.print(
+                f"[OptunaPrune] epoch {self.prune_epoch}: "
+                f"{self.monitor}={current_val:.6f} <= "
+                f"quantile({self.quantile})={threshold:.6f} of "
+                f"{len(other_losses)} trials — continuing."
+            )
+
+    def _record_to_db(self, current_val):
+        """Record prune-epoch loss to the DB (used when stopping early for constraint)."""
+        try:
+            study = self._get_study()
+            trial = self._find_own_trial(study)
+            if trial is not None:
+                self._set_trial_attr(study, trial, self.ATTR_KEY, current_val)
+                self._set_trial_attr(study, trial, "prune_epoch", self.prune_epoch)
+            self._recorded = True
+        except Exception:
+            pass

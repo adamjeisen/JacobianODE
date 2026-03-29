@@ -15,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from ..core.types import in_ipython
-from ..lightning_base import PercentEarlyStopping
+from ..lightning_base import OptunaPruneCallback, OptunaProgressCallback, OptunaConstrainedProgressCallback, PercentEarlyStopping
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ def train_model(
     project: str,
     entity: Optional[str] = None,
     group: Optional[str] = None,
-) -> None:
+) -> L.Trainer:
     """Train the model using PyTorch Lightning.
 
     Sets up the training environment including callbacks, logging, and training
@@ -45,8 +45,11 @@ def train_model(
         entity: W&B entity/team name. Defaults to None.
         group: W&B group name to organize runs within the project. Defaults to None.
 
+    Returns:
+        The Lightning Trainer instance after training completes.
+
     Example:
-        >>> train_model(cfg, lit_model, train_dl, val_dl, name="run1", project="my-project")
+        >>> trainer = train_model(cfg, lit_model, train_dl, val_dl, name="run1", project="my-project")
         >>> # Training complete, model checkpoints saved
 
     Note:
@@ -101,6 +104,60 @@ def train_model(
             mode=cfg.training.early_stopping.mode,
         )
 
+    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback]
+
+    # Optuna pruning callback (only when study_name + storage are configured)
+    optuna_prune_epoch = cfg.training.get("optuna_prune_epoch", None)
+    optuna_study_name = cfg.get("optuna_study_name", None)
+    optuna_storage = cfg.get("optuna_storage", None)
+    if optuna_prune_epoch is not None and optuna_study_name and optuna_storage:
+        optuna_constraint_metric = cfg.training.get("optuna_constraint_metric", None)
+        optuna_constraint_threshold = cfg.training.get("optuna_constraint_threshold", None)
+        prune_cb = OptunaPruneCallback(
+            prune_epoch=int(optuna_prune_epoch),
+            monitor="trajectory val_loss",
+            study_name=optuna_study_name,
+            storage=optuna_storage,
+            min_completed=int(cfg.training.get("optuna_prune_min_completed", 5)),
+            quantile=float(cfg.training.get("optuna_prune_quantile", 0.5)),
+            constraint_metric=optuna_constraint_metric,
+            constraint_threshold=float(optuna_constraint_threshold) if optuna_constraint_threshold is not None else None,
+        )
+        callbacks.append(prune_cb)
+        logger.info(
+            f"Optuna pruning enabled: epoch={optuna_prune_epoch}, "
+            f"quantile={prune_cb.quantile}, min_completed={prune_cb.min_completed}"
+            + (f", constraint: {optuna_constraint_metric} <= {optuna_constraint_threshold}" if optuna_constraint_metric else "")
+        )
+
+    # Optuna progress callback — write best-so-far loss to DB every validation epoch
+    # so timed-out trials still have their results recorded.
+    if optuna_study_name and optuna_storage:
+        optuna_constraint_metric = cfg.training.get("optuna_constraint_metric", None)
+        optuna_constraint_threshold = cfg.training.get("optuna_constraint_threshold", None)
+
+        if optuna_constraint_metric and optuna_constraint_threshold is not None:
+            progress_cb = OptunaConstrainedProgressCallback(
+                monitor="trajectory val_loss",
+                constraint_metric=optuna_constraint_metric,
+                constraint_threshold=float(optuna_constraint_threshold),
+                study_name=optuna_study_name,
+                storage=optuna_storage,
+            )
+            callbacks.append(progress_cb)
+            logger.info(
+                f"Optuna constrained progress tracking enabled "
+                f"(constraint: {optuna_constraint_metric} <= {optuna_constraint_threshold})"
+            )
+        else:
+            progress_cb = OptunaProgressCallback(
+                monitor="trajectory val_loss",
+                study_name=optuna_study_name,
+                storage=optuna_storage,
+            )
+            callbacks.append(progress_cb)
+            logger.info("Optuna progress tracking enabled (best_so_far written to DB each epoch)")
+
     # Choose DDP strategy based on environment and number of GPUs.
     # DDP requires forking, which fails if CUDA is already initialized
     # (common in notebooks). Single-GPU doesn't benefit from DDP anyway.
@@ -121,7 +178,7 @@ def train_model(
 
     # Create trainer
     trainer = L.Trainer(
-        callbacks=[checkpoint_callback, traj_checkpoint, early_stopping_callback],
+        callbacks=callbacks,
         logger=experiment_logger,
         log_every_n_steps=10,
         gradient_clip_val=gradient_clip_val,
@@ -140,3 +197,5 @@ def train_model(
 
     wandb.finish()
     logger.info(f"Training complete for run: {name}")
+
+    return trainer

@@ -146,6 +146,25 @@ trainer_params:
   accumulate_grad_batches: 4
   # strategy: 'ddp_find_unused_parameters_true'
 
+# -----------------
+# OPTUNA PRUNING
+# -----------------
+# When running an Optuna sweep with SQLite storage, trials can be pruned
+# early if their validation loss at `optuna_prune_epoch` is worse than the
+# median (or configured quantile) of completed trials' final objectives.
+# Set to null to disable.  study_name and storage are passed via top-level
+# config keys (optuna_study_name, optuna_storage).
+optuna_prune_epoch: null          # epoch at which to check (e.g. 15)
+optuna_prune_min_completed: 5     # need this many completed trials before pruning
+optuna_prune_quantile: 0.5        # prune if worse than this quantile (0.5 = median)
+
+# Constrained optimization: when set, the progress callback uses
+# feasibility-aware tracking (feasible result always beats infeasible).
+# Set constraint_metric to a logged metric name and constraint_threshold
+# to the maximum acceptable value.  Set to null to disable (default).
+optuna_constraint_metric: null        # e.g. "val/loop_closure_loss"
+optuna_constraint_threshold: null     # e.g. sqrt(n_dynamic_dims)
+
 early_stopping:
   min_epochs: 0  # Training runs at least this many epochs before early stopping can trigger
   early_stopping_patience: 2
