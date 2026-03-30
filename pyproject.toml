@@ -44,6 +44,12 @@ dependencies = [
     "wmtask @ git+ssh://git@github.com/adamjeisen/wmtask.git",
 ]
 
+[project.optional-dependencies]
+marimo = ["marimo>=0.20.0"]
+
+[tool.marimo.runtime]
+auto_reload = "lazy"
+
 [dependency-groups]
 dev = [
     "ipdb",

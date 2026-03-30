@@ -31,9 +31,16 @@ from .coupling_flows import (
     AffineCouplingEncoder,
     AffineCouplingLayer,
     ActNorm,
+    AnalyticAutoregressiveEncoder,
+    AnalyticAutoregressiveLayer,
+    AnalyticCouplingLayer,
     CouplingEncoder,
     FixedPermutation,
     LOFTLayer,
+    MADE,
+    MaskedLinear,
+    SplineAutoregressiveEncoder,
+    SplineAutoregressiveLayer,
     SplineCouplingLayer,
 )
 from .sequence_networks import (

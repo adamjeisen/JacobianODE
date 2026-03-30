@@ -244,6 +244,245 @@ def rational_quadratic_spline(
 
 
 # ---------------------------------------------------------------------------
+# Analytic Bijections  (Gerdes & Cheng, arXiv:2601.10774)
+# ---------------------------------------------------------------------------
+# Three families of C-infinity, globally-defined, analytically-invertible
+# scalar bijections.  Each function takes raw unconstrained network outputs
+# and applies internal parameter constraints.  All achieve identity-init
+# when the network output is zero (enabled by zero_init on the conditioner).
+
+def _solve_cubic(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+) -> torch.Tensor:
+    """Solve a·x³ + b·x² + c·x + d = 0 via Cardano's formula.
+
+    Uses the numerically stable form that avoids catastrophic cancellation
+    by choosing the larger-magnitude branch of d₁ ± √(d₁²−4d₀³).
+    Includes one Newton refinement step for float32 precision.
+
+    Reference: Gerdes & Cheng (2026), ``bijx`` library.
+    """
+    d0 = b.pow(2) - 3.0 * a * c
+    d1 = 2.0 * b.pow(3) - 9.0 * a * b * c + 27.0 * a.pow(2) * d
+
+    disc_inner = (d1.pow(2) - 4.0 * d0.pow(3)).clamp(min=0.0)
+    sqrt_disc = torch.sqrt(disc_inner)
+
+    minus = d1 - sqrt_disc
+    plus = d1 + sqrt_disc
+    # Choose the branch with larger magnitude to avoid cancellation
+    c_arg = torch.where(minus.abs() < plus.abs(), plus, minus)
+
+    C = torch.sign(c_arg) * (c_arg.abs() / 2.0).pow(1.0 / 3.0)
+
+    # d0/C avoids division by zero when C → 0 (means d0 → 0 too)
+    d0_over_C = torch.where(
+        C.abs() > 1e-12,
+        d0 / C,
+        torch.zeros_like(C),
+    )
+    x = -(b + C + d0_over_C) / (3.0 * a)
+
+    # One Newton refinement step:  x ← x − f(x)/f'(x)
+    fx = a * x.pow(3) + b * x.pow(2) + c * x + d
+    fpx = 3.0 * a * x.pow(2) + 2.0 * b * x + c
+    x = x - fx / fpx.clamp(min=1e-12)
+
+    return x
+
+
+def cubic_rational_bijection(
+    inputs: torch.Tensor,
+    params: torch.Tensor,
+    inverse: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Cubic-rational bijection:  y = x + α·x / (1 + β·x²), centered at γ.
+
+    Parameters
+    ----------
+    inputs : Tensor (..., D)
+    params : Tensor (..., D, 3)
+        Raw unconstrained outputs ``[raw_alpha, raw_beta, raw_gamma]``.
+    inverse : bool
+
+    Returns
+    -------
+    outputs : Tensor (..., D)
+    logabsdet : Tensor (..., D)   per-dimension
+    """
+    raw_alpha = params[..., 0]
+    raw_beta = params[..., 1]
+    raw_gamma = params[..., 2]
+
+    # Constraints: α ∈ (-1, 8), β > 0.
+    # Identity-init at raw=0: sigmoid(log(1/8)) = 1/9 → α = -1 + 9·(1/9) = 0.
+    _LOG_ONE_EIGHTH = -2.0794415416798357  # log(1/8)
+    alpha = -1.0 + 9.0 * torch.sigmoid(raw_alpha + _LOG_ONE_EIGHTH)
+    beta = F.softplus(raw_beta) + 1e-6
+    gamma = raw_gamma
+
+    if not inverse:
+        u = inputs - gamma
+        bu2 = beta * u.pow(2)
+        denom = 1.0 + bu2                      # always > 0
+        outputs = inputs + alpha * u / denom
+
+        # dy/dx = 1 + α·(1 − β·u²) / (1 + β·u²)²
+        #       = ((1+β·u²)² + α·(1 − β·u²)) / (1+β·u²)²
+        numer = denom.pow(2) + alpha * (1.0 - bu2)
+        logabsdet = torch.log(numer.abs() + 1e-12) - 2.0 * torch.log(denom)
+    else:
+        # Solve for v = x − γ given w = y − γ:
+        #   w = v + α·v/(1+β·v²)
+        #   ⟹ β·v³ − βw·v² + (1+α)·v − w = 0
+        w = inputs - gamma
+        v = _solve_cubic(beta, -beta * w, 1.0 + alpha, -w)
+        outputs = v + gamma
+
+        # Log-det of the *forward* map evaluated at x=output
+        u_fwd = outputs - gamma
+        bu2 = beta * u_fwd.pow(2)
+        denom = 1.0 + bu2
+        numer = denom.pow(2) + alpha * (1.0 - bu2)
+        logabsdet = -(torch.log(numer.abs() + 1e-12) - 2.0 * torch.log(denom))
+
+    return outputs, logabsdet
+
+
+def sinh_conjugation_bijection(
+    inputs: torch.Tensor,
+    params: torch.Tensor,
+    inverse: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Sinh-conjugation bijection.
+
+    Forward: ``y = α·arcsinh(eᵘ·(eᵛ·sinh((x−γ)/α) + β)) + γ``
+    Inverse: swap μ↔−ν, negate β.
+
+    Parameters
+    ----------
+    inputs : Tensor (..., D)
+    params : Tensor (..., D, 5)
+        Raw ``[raw_alpha, raw_mu, raw_nu, raw_beta, raw_gamma]``.
+    inverse : bool
+
+    Returns
+    -------
+    outputs, logabsdet : Tensor (..., D)
+    """
+    raw_alpha = params[..., 0]
+    raw_mu = params[..., 1]
+    raw_nu = params[..., 2]
+    raw_beta = params[..., 3]
+    raw_gamma = params[..., 4]
+
+    alpha = F.softplus(raw_alpha) + 1e-6
+    gamma = raw_gamma
+
+    if not inverse:
+        mu, nu, beta = raw_mu, raw_nu, raw_beta
+    else:
+        mu, nu, beta = -raw_nu, -raw_mu, -raw_beta
+
+    THRESH = 15.0
+    a = (inputs - gamma) / alpha
+
+    # sinh with overflow protection
+    a_clamped = a.clamp(-THRESH, THRESH)
+    sinh_a = torch.sinh(a_clamped)
+    # For |a| > THRESH: sinh(a) ≈ sign(a)·exp(|a|)/2
+    sinh_a_large = torch.sign(a) * torch.exp(a.abs().clamp(max=80.0)) / 2.0
+    sinh_val = torch.where(a.abs() <= THRESH, sinh_a, sinh_a_large)
+
+    arg = torch.exp(mu) * (torch.exp(nu) * sinh_val + beta)
+    outputs = alpha * torch.arcsinh(arg) + gamma
+
+    # --- log |dy/dx| ---
+    # dy/dx = (exp(mu+nu) · cosh(a)) / sqrt(1 + arg²)
+    # log|dy/dx| = mu + nu + log(cosh(a)) − 0.5·log(1 + arg²)
+    log_cosh_a = torch.where(
+        a_clamped.abs() < THRESH,
+        torch.log(torch.cosh(a_clamped).clamp(min=1e-30)),
+        a.abs() - 0.6931471805599453,  # |a| − ln(2)
+    )
+    log_one_plus_arg2 = torch.where(
+        arg.pow(2) < 1e8,
+        torch.log1p(arg.pow(2)),
+        2.0 * torch.log(arg.abs().clamp(min=1e-30)),
+    )
+    logabsdet_fwd = mu + nu + log_cosh_a - 0.5 * log_one_plus_arg2
+
+    # When inverse=True we applied the forward formula with swapped params,
+    # which directly computes the inverse map.  logabsdet_fwd is therefore
+    # log|d(inverse)/d(y)|, which is what callers expect.
+    logabsdet = logabsdet_fwd
+
+    return outputs, logabsdet
+
+
+def cubic_conjugation_bijection(
+    inputs: torch.Tensor,
+    params: torch.Tensor,
+    inverse: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Cubic-conjugation bijection: ``g⁻¹(g(x−γ) + β) + γ`` with ``g(t) = a·t + b·t³``.
+
+    Inverse: same formula with β → −β.
+
+    Parameters
+    ----------
+    inputs : Tensor (..., D)
+    params : Tensor (..., D, 4)
+        Raw ``[raw_a, raw_b, raw_beta, raw_gamma]``.
+    inverse : bool
+
+    Returns
+    -------
+    outputs, logabsdet : Tensor (..., D)
+    """
+    raw_a = params[..., 0]
+    raw_b = params[..., 1]
+    raw_beta = params[..., 2]
+    raw_gamma = params[..., 3]
+
+    a = F.softplus(raw_a) + 1e-6
+    b = F.softplus(raw_b) + 1e-6
+    gamma = raw_gamma
+    beta = -raw_beta if inverse else raw_beta
+
+    u = inputs - gamma
+    # g(u) = a·u + b·u³
+    g_u = a * u + b * u.pow(3)
+    # g(u) + β
+    g_u_shifted = g_u + beta
+
+    # g⁻¹(g_u_shifted): solve b·v³ + a·v − g_u_shifted = 0
+    v = _solve_cubic(b, torch.zeros_like(b), a, -g_u_shifted)
+    outputs = v + gamma
+
+    # log|dy/dx| = log|g'(u)| − log|g'(v)|  where g'(t) = a + 3b·t²
+    # When inverse=True, beta was negated, so u and v are swapped relative
+    # to the forward direction.  The formula naturally produces log|dx/dy|
+    # (the inverse log-det) without extra negation.
+    gp_u = a + 3.0 * b * u.pow(2)
+    gp_v = a + 3.0 * b * v.pow(2)
+    logabsdet = torch.log(gp_u.clamp(min=1e-12)) - torch.log(gp_v.clamp(min=1e-12))
+
+    return outputs, logabsdet
+
+
+# Registry: name → (function, params_per_dim)
+_ANALYTIC_BIJECTIONS = {
+    "cubic_rational": (cubic_rational_bijection, 3),
+    "sinh": (sinh_conjugation_bijection, 5),
+    "cubic_conjugation": (cubic_conjugation_bijection, 4),
+}
+
+
+# ---------------------------------------------------------------------------
 # Affine Coupling Layer
 # ---------------------------------------------------------------------------
 
@@ -476,6 +715,87 @@ class SplineCouplingLayer(nn.Module):
         x_b, _ = rational_quadratic_spline(
             y_b, w, h, d, inverse=True, tail_bound=self.tail_bound
         )
+        return torch.cat([y_a, x_b], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Analytic Coupling Layer  (generic for all analytic bijections)
+# ---------------------------------------------------------------------------
+
+class AnalyticCouplingLayer(nn.Module):
+    """Single coupling layer using an analytic bijection.
+
+    Drop-in replacement for :class:`SplineCouplingLayer` — same split logic,
+    same ``(y, log_det)`` return signature — but uses a globally-smooth,
+    analytically-invertible bijection instead of rational-quadratic splines.
+
+    Parameters
+    ----------
+    dim : int
+        Total feature dimension.
+    bijection_type : str
+        One of ``'cubic_rational'``, ``'sinh'``, ``'cubic_conjugation'``.
+    split_dim : int | None
+        Fixed-partition size (default ``dim // 2``).
+    hidden_dim : int
+        Conditioner MLP hidden width.
+    n_hidden_layers : int
+        Conditioner MLP depth.
+    zero_init : bool
+        Zero-initialise the last conditioner layer (identity-init trick).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bijection_type: str = "cubic_rational",
+        split_dim: int | None = None,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        if split_dim is None:
+            split_dim = dim // 2
+        if bijection_type not in _ANALYTIC_BIJECTIONS:
+            raise ValueError(
+                f"Unknown bijection_type {bijection_type!r}. "
+                f"Choose from {list(_ANALYTIC_BIJECTIONS.keys())}"
+            )
+        self.dim = dim
+        self.split_dim = split_dim
+        self.transform_dim = dim - split_dim
+        self._bijection_fn, self._params_per_dim = _ANALYTIC_BIJECTIONS[bijection_type]
+
+        conditioner_out = self.transform_dim * self._params_per_dim
+        self.conditioner = _build_conditioner(
+            input_dim=split_dim,
+            output_dim=conditioner_out,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            zero_init=zero_init,
+        )
+
+    def _get_params(self, x_a: torch.Tensor) -> torch.Tensor:
+        """Run conditioner and reshape to (..., transform_dim, params_per_dim)."""
+        raw = self.conditioner(x_a)
+        return raw.reshape(raw.shape[:-1] + (self.transform_dim, self._params_per_dim))
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_a = x[..., : self.split_dim]
+        x_b = x[..., self.split_dim :]
+        params = self._get_params(x_a)
+        y_b, logabsdet = self._bijection_fn(x_b, params, inverse=False)
+        y = torch.cat([x_a, y_b], dim=-1)
+        return y, logabsdet.sum(dim=-1)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        y_a = y[..., : self.split_dim]
+        y_b = y[..., self.split_dim :]
+        params = self._get_params(y_a)  # y_a == x_a
+        x_b, _ = self._bijection_fn(y_b, params, inverse=True)
         return torch.cat([y_a, x_b], dim=-1)
 
 
@@ -809,7 +1129,8 @@ class CouplingEncoder(nn.Module):
     n_coupling_layers : int
         Number of coupling layers.
     coupling_type : str
-        ``'affine'`` or ``'spline'``.
+        ``'affine'``, ``'spline'``, ``'cubic_rational'``, ``'sinh'``, or
+        ``'cubic_conjugation'``.
     use_actnorm : bool
         Insert an :class:`ActNorm` layer after each coupling layer.
     hidden_dim : int
@@ -898,6 +1219,17 @@ class CouplingEncoder(nn.Module):
                         n_hidden_layers=n_hidden_layers,
                         num_bins=num_bins,
                         tail_bound=tail_bound,
+                        zero_init=zero_init,
+                    )
+                )
+            elif coupling_type in _ANALYTIC_BIJECTIONS:
+                self.coupling_layers.append(
+                    AnalyticCouplingLayer(
+                        dim=n_input,
+                        bijection_type=coupling_type,
+                        split_dim=split_dim,
+                        hidden_dim=hidden_dim,
+                        n_hidden_layers=n_hidden_layers,
                         zero_init=zero_init,
                     )
                 )
@@ -993,6 +1325,674 @@ class CouplingEncoder(nn.Module):
             x.shape[:-1], device=x.device, dtype=x.dtype
         )
         for i, layer in enumerate(self.coupling_layers):
+            z, ld = layer(z)
+            total_log_det = total_log_det + ld
+            if self._use_actnorm:
+                z, ld = self.actnorms[i](z)
+                total_log_det = total_log_det + ld
+            if i < len(self.permutations):
+                z = self.permutations[i](z)
+        if self.loft is not None:
+            total_log_det = total_log_det + self.loft.log_det(z)
+        return total_log_det
+
+
+# ---------------------------------------------------------------------------
+# Masked Linear Layer  (for MADE)
+# ---------------------------------------------------------------------------
+
+class MaskedLinear(nn.Module):
+    """Linear layer with a fixed binary mask on the weight matrix.
+
+    The mask zeros out specific connections, preventing information flow
+    from certain input dimensions to certain output dimensions.  Used to
+    enforce the autoregressive property in :class:`MADE`.
+
+    Parameters
+    ----------
+    in_features : int
+    out_features : int
+    mask : Tensor (out_features, in_features)
+        Binary mask.  Connections where ``mask == 0`` are blocked.
+    """
+
+    def __init__(self, in_features: int, out_features: int, mask: torch.Tensor) -> None:
+        super().__init__()
+        self.linear = nn.Linear(in_features, out_features)
+        self.register_buffer("mask", mask.float())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.linear.weight * self.mask, self.linear.bias)
+
+
+# ---------------------------------------------------------------------------
+# MADE  (Germain et al., "MADE: Masked Autoencoder for Distribution
+#         Estimation", ICML 2015)
+# ---------------------------------------------------------------------------
+
+class MADE(nn.Module):
+    """Masked Autoencoder for Distribution Estimation.
+
+    Produces ``n_features * output_dim_per_input`` outputs where output
+    group *i* (of size ``output_dim_per_input``) depends **only** on inputs
+    ``0 .. i-1``.  Output group 0 depends on no inputs (learned bias only).
+
+    This is the standard building block for Masked Autoregressive Flows
+    (MAF, Papamakarios et al. 2017).
+
+    Parameters
+    ----------
+    n_features : int
+        Input/output dimensionality (D).
+    hidden_dim : int
+        Width of each hidden layer.
+    n_hidden_layers : int
+        Number of hidden layers (minimum 1).
+    output_dim_per_input : int
+        Number of outputs per input dimension (e.g. ``3*K + 1`` for RQS
+        with *K* bins).
+    zero_init : bool
+        Zero-initialise the last layer so the network starts as identity.
+    seed : int
+        Seed for the hidden-unit ordering assignment.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        output_dim_per_input: int = 1,
+        zero_init: bool = True,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.n_features = n_features
+        self.output_dim_per_input = output_dim_per_input
+
+        # --- Assign orderings ------------------------------------------------
+        # Input ordering: 0, 1, ..., D-1
+        # Hidden ordering: each unit gets a random assignment in [0, D-1]
+        #   meaning it is allowed to see inputs 0..m[k]
+        # Output ordering: output group i must depend on inputs 0..i-1,
+        #   so its ordering value is i  (strictly less-than masking)
+        rng = torch.Generator().manual_seed(seed)
+
+        degrees: list[torch.Tensor] = []
+        # Input degrees: 0, 1, ..., D-1
+        degrees.append(torch.arange(n_features))
+
+        # Hidden degrees: uniformly in [0, D-1]
+        for _ in range(n_hidden_layers):
+            h_degrees = torch.randint(0, n_features, (hidden_dim,), generator=rng)
+            degrees.append(h_degrees)
+
+        # Output degrees: 0, 1, ..., D-1  (each repeated output_dim_per_input times)
+        degrees.append(torch.arange(n_features).repeat_interleave(output_dim_per_input))
+
+        # --- Build masked layers ---------------------------------------------
+        self.layers = nn.ModuleList()
+        self.activations = nn.ModuleList()
+
+        for l in range(n_hidden_layers + 1):
+            d_in = degrees[l]
+            d_out = degrees[l + 1]
+
+            if l < n_hidden_layers:
+                # Hidden layer: output unit j can receive from input unit i
+                # if d_in[i] <= d_out[j]  (≤ means "can see up to that index")
+                mask = (d_in.unsqueeze(0) <= d_out.unsqueeze(1)).float()
+                self.layers.append(MaskedLinear(len(d_in), len(d_out), mask))
+                self.activations.append(nn.GELU())
+            else:
+                # Output layer: strictly less-than  (d_in[i] < d_out[j])
+                # so output group i depends on inputs 0..i-1 only
+                mask = (d_in.unsqueeze(0) < d_out.unsqueeze(1)).float()
+                last = MaskedLinear(len(d_in), len(d_out), mask)
+                if zero_init:
+                    nn.init.zeros_(last.linear.weight)
+                    nn.init.zeros_(last.linear.bias)
+                self.layers.append(last)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : Tensor (..., D)
+
+        Returns
+        -------
+        out : Tensor (..., D * output_dim_per_input)
+        """
+        h = x
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            if i < len(self.activations):
+                h = self.activations[i](h)
+        return h
+
+
+# ---------------------------------------------------------------------------
+# Spline Autoregressive Layer  (Coccaro et al., arXiv:2302.12024)
+# ---------------------------------------------------------------------------
+
+class SplineAutoregressiveLayer(nn.Module):
+    """Single autoregressive layer using rational-quadratic splines.
+
+    Forward (encode): one MADE pass produces spline parameters for all
+    dimensions simultaneously, then all RQS transforms are applied in
+    parallel.  This is O(1) in the number of dimensions.
+
+    Inverse (decode): inherently sequential — dimension *i* requires the
+    already-inverted dimensions ``0..i-1`` to compute its conditioner
+    output.  This is O(D) sequential MADE passes.
+
+    Parameters
+    ----------
+    dim : int
+        Feature dimension.
+    hidden_dim : int
+        MADE hidden width.
+    n_hidden_layers : int
+        MADE depth.
+    num_bins : int
+        Number of spline segments (K).
+    tail_bound : float
+        Linear tails outside ``[-tail_bound, tail_bound]``.
+    zero_init : bool
+        Zero-initialise MADE output layer (identity-init trick).
+    seed : int
+        Seed for the MADE hidden-unit ordering.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        num_bins: int = 8,
+        tail_bound: float = 3.0,
+        zero_init: bool = True,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.num_bins = num_bins
+        self.tail_bound = tail_bound
+
+        # K widths + K heights + (K+1) derivatives per dimension
+        self._params_per_dim = 3 * num_bins + 1
+
+        self.made = MADE(
+            n_features=dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            output_dim_per_input=self._params_per_dim,
+            zero_init=zero_init,
+            seed=seed,
+        )
+
+    def _split_params(
+        self, raw: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reshape MADE output into (widths, heights, derivatives).
+
+        Parameters
+        ----------
+        raw : Tensor (..., D * params_per_dim)
+
+        Returns
+        -------
+        w : Tensor (..., D, K)
+        h : Tensor (..., D, K)
+        d : Tensor (..., D, K+1)
+        """
+        K = self.num_bins
+        # (..., D, params_per_dim)
+        raw = raw.reshape(raw.shape[:-1] + (self.dim, self._params_per_dim))
+        w = raw[..., :K]
+        h = raw[..., K : 2 * K]
+        d = raw[..., 2 * K :]
+        return w, h, d
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass (parallel).
+
+        Parameters
+        ----------
+        x : Tensor (..., D)
+
+        Returns
+        -------
+        y : Tensor (..., D)
+        log_det : Tensor (...)   summed over feature dim
+        """
+        raw = self.made(x)
+        w, h, d = self._split_params(raw)
+        y, logabsdet = rational_quadratic_spline(
+            x, w, h, d, inverse=False, tail_bound=self.tail_bound
+        )
+        return y, logabsdet.sum(dim=-1)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Inverse pass (sequential over dimensions).
+
+        Parameters
+        ----------
+        y : Tensor (..., D)
+
+        Returns
+        -------
+        x : Tensor (..., D)
+        """
+        x = torch.zeros_like(y)
+        for i in range(self.dim):
+            # Run full MADE on the partially-filled x
+            raw = self.made(x)
+            w, h, d = self._split_params(raw)
+            # Invert only dimension i
+            x_i, _ = rational_quadratic_spline(
+                y[..., i : i + 1],
+                w[..., i : i + 1, :],
+                h[..., i : i + 1, :],
+                d[..., i : i + 1, :],
+                inverse=True,
+                tail_bound=self.tail_bound,
+            )
+            x = x.clone()
+            x[..., i] = x_i.squeeze(-1)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Spline Autoregressive Encoder  (full stack)
+# ---------------------------------------------------------------------------
+
+class SplineAutoregressiveEncoder(nn.Module):
+    """Invertible encoder built from stacked autoregressive spline layers.
+
+    Implements the A-RQS architecture from Coccaro et al. (arXiv:2302.12024),
+    which demonstrates superior accuracy and stability compared to coupling-
+    based spline flows (C-RQS), especially at higher dimensionalities.
+
+    Like coupling encoders, this is **dimension-preserving**: ``n_latent ==
+    n_input``.  Fixed permutations between layers ensure all dimensions
+    participate in conditioning.
+
+    **Performance note**: the forward pass (encode) is parallel via MADE,
+    but the inverse pass (decode) is inherently sequential — O(D) MADE
+    evaluations per layer.  For typical delay-embedded dimensions (D ~
+    10-50) this is acceptable; the ODE integration is the dominant cost.
+
+    Parameters
+    ----------
+    n_input : int
+        Feature dimension (injected at runtime).
+    n_layers : int
+        Number of autoregressive layers.
+    hidden_dim : int
+        MADE hidden width.
+    n_hidden_layers : int
+        MADE depth.
+    num_bins : int
+        Number of RQS segments.
+    tail_bound : float
+        Linear tails outside ``[-tail_bound, tail_bound]``.
+    use_actnorm : bool
+        Insert :class:`ActNorm` after each autoregressive layer.
+    zero_init : bool
+        Zero-initialise MADE output layers (identity-init trick).
+    permutation_seed : int
+        Base seed for inter-layer permutations.  Layer *i* uses
+        ``permutation_seed + i``.
+    use_loft : bool
+        Append :class:`LOFTLayer` after all autoregressive layers.
+    loft_tau : float
+        LOFT threshold.
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        n_layers: int = 8,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        num_bins: int = 8,
+        tail_bound: float = 3.0,
+        use_actnorm: bool = True,
+        zero_init: bool = True,
+        permutation_seed: int = 0,
+        use_loft: bool = False,
+        loft_tau: float = 100.0,
+    ) -> None:
+        super().__init__()
+        self._n_input = n_input
+
+        self.ar_layers = nn.ModuleList()
+        self.actnorms = nn.ModuleList()
+        self.permutations = nn.ModuleList()
+        self._use_actnorm = use_actnorm
+
+        for i in range(n_layers):
+            self.ar_layers.append(
+                SplineAutoregressiveLayer(
+                    dim=n_input,
+                    hidden_dim=hidden_dim,
+                    n_hidden_layers=n_hidden_layers,
+                    num_bins=num_bins,
+                    tail_bound=tail_bound,
+                    zero_init=zero_init,
+                    seed=permutation_seed + i,
+                )
+            )
+            if use_actnorm:
+                self.actnorms.append(ActNorm(dim=n_input))
+            # Permutation between consecutive layers (not after last)
+            if i < n_layers - 1:
+                self.permutations.append(
+                    FixedPermutation(dim=n_input, seed=permutation_seed + i)
+                )
+
+        self.loft: LOFTLayer | None = LOFTLayer(tau=loft_tau) if use_loft else None
+
+    @property
+    def n_latent(self) -> int:
+        """Latent dimension (== input dimension, dimension-preserving)."""
+        return self._n_input
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode: autoregressive layers with interleaved permutations.
+
+        Parameters
+        ----------
+        x : Tensor (B, T, D) or (B, D)
+
+        Returns
+        -------
+        z : Tensor, same shape as x
+        """
+        z = x
+        for i, layer in enumerate(self.ar_layers):
+            z, _ = layer(z)
+            if self._use_actnorm:
+                z, _ = self.actnorms[i](z)
+            if i < len(self.permutations):
+                z = self.permutations[i](z)
+        if self.loft is not None:
+            z = self.loft(z)
+        return z
+
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode: undo all layers in reverse order.
+
+        Parameters
+        ----------
+        z : Tensor (B, T, D) or (B, D)
+
+        Returns
+        -------
+        x : Tensor, same shape as z
+        """
+        y = z
+        if self.loft is not None:
+            y = self.loft.inverse(y)
+        for i in reversed(range(len(self.ar_layers))):
+            if i < len(self.permutations):
+                y = self.permutations[i].inverse(y)
+            if self._use_actnorm:
+                y = self.actnorms[i].inverse(y)
+            y = self.ar_layers[i].inverse(y)
+        return y
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Alias for :meth:`forward`."""
+        return self.forward(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Alias for :meth:`inverse`."""
+        return self.inverse(z)
+
+    def log_det_jacobian(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute total log |det J| of the forward map (for diagnostics).
+
+        Parameters
+        ----------
+        x : Tensor (B, T, D) or (B, D)
+
+        Returns
+        -------
+        log_det : Tensor (B, T) or (B,)
+        """
+        z = x
+        total_log_det = torch.zeros(
+            x.shape[:-1], device=x.device, dtype=x.dtype
+        )
+        for i, layer in enumerate(self.ar_layers):
+            z, ld = layer(z)
+            total_log_det = total_log_det + ld
+            if self._use_actnorm:
+                z, ld = self.actnorms[i](z)
+                total_log_det = total_log_det + ld
+            if i < len(self.permutations):
+                z = self.permutations[i](z)
+        if self.loft is not None:
+            total_log_det = total_log_det + self.loft.log_det(z)
+        return total_log_det
+
+
+# ---------------------------------------------------------------------------
+# Analytic Autoregressive Layer  (generic for all analytic bijections)
+# ---------------------------------------------------------------------------
+
+class AnalyticAutoregressiveLayer(nn.Module):
+    """Single autoregressive layer using an analytic bijection.
+
+    Drop-in replacement for :class:`SplineAutoregressiveLayer` — same
+    ``(y, log_det)`` return signature — but uses a globally-smooth,
+    analytically-invertible bijection instead of rational-quadratic splines.
+
+    Parameters
+    ----------
+    dim : int
+        Feature dimension.
+    bijection_type : str
+        One of ``'cubic_rational'``, ``'sinh'``, ``'cubic_conjugation'``.
+    hidden_dim : int
+        MADE hidden width.
+    n_hidden_layers : int
+        MADE depth.
+    zero_init : bool
+        Zero-initialise MADE output layer (identity-init trick).
+    seed : int
+        Seed for the MADE hidden-unit ordering.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bijection_type: str = "cubic_rational",
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        zero_init: bool = True,
+        seed: int = 0,
+    ) -> None:
+        super().__init__()
+        if bijection_type not in _ANALYTIC_BIJECTIONS:
+            raise ValueError(
+                f"Unknown bijection_type {bijection_type!r}. "
+                f"Choose from {list(_ANALYTIC_BIJECTIONS.keys())}"
+            )
+        self.dim = dim
+        self._bijection_fn, self._params_per_dim = _ANALYTIC_BIJECTIONS[bijection_type]
+
+        self.made = MADE(
+            n_features=dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            output_dim_per_input=self._params_per_dim,
+            zero_init=zero_init,
+            seed=seed,
+        )
+
+    def _reshape_params(self, raw: torch.Tensor) -> torch.Tensor:
+        """Reshape MADE output to (..., D, params_per_dim)."""
+        return raw.reshape(raw.shape[:-1] + (self.dim, self._params_per_dim))
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass (parallel).
+
+        Returns
+        -------
+        y : Tensor (..., D)
+        log_det : Tensor (...)
+        """
+        raw = self.made(x)
+        params = self._reshape_params(raw)
+        y, logabsdet = self._bijection_fn(x, params, inverse=False)
+        return y, logabsdet.sum(dim=-1)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Inverse pass (sequential over dimensions).
+
+        Returns
+        -------
+        x : Tensor (..., D)
+        """
+        x = torch.zeros_like(y)
+        for i in range(self.dim):
+            raw = self.made(x)
+            params = self._reshape_params(raw)
+            x_i, _ = self._bijection_fn(
+                y[..., i : i + 1],
+                params[..., i : i + 1, :],
+                inverse=True,
+            )
+            x = x.clone()
+            x[..., i] = x_i.squeeze(-1)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Analytic Autoregressive Encoder  (full stack)
+# ---------------------------------------------------------------------------
+
+class AnalyticAutoregressiveEncoder(nn.Module):
+    """Invertible encoder built from stacked analytic autoregressive layers.
+
+    Same structure as :class:`SplineAutoregressiveEncoder` but uses analytic
+    bijections (Gerdes & Cheng, arXiv:2601.10774) instead of rational-quadratic
+    splines.
+
+    Parameters
+    ----------
+    n_input : int
+        Feature dimension (injected at runtime).
+    bijection_type : str
+        One of ``'cubic_rational'``, ``'sinh'``, ``'cubic_conjugation'``.
+    n_layers : int
+        Number of autoregressive layers.
+    hidden_dim : int
+        MADE hidden width.
+    n_hidden_layers : int
+        MADE depth.
+    use_actnorm : bool
+        Insert :class:`ActNorm` after each autoregressive layer.
+    zero_init : bool
+        Zero-initialise MADE output layers (identity-init trick).
+    permutation_seed : int
+        Base seed for inter-layer permutations.
+    use_loft : bool
+        Append :class:`LOFTLayer` after all autoregressive layers.
+    loft_tau : float
+        LOFT threshold.
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        bijection_type: str = "cubic_rational",
+        n_layers: int = 8,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        use_actnorm: bool = True,
+        zero_init: bool = True,
+        permutation_seed: int = 0,
+        use_loft: bool = False,
+        loft_tau: float = 100.0,
+    ) -> None:
+        super().__init__()
+        self._n_input = n_input
+
+        self.ar_layers = nn.ModuleList()
+        self.actnorms = nn.ModuleList()
+        self.permutations = nn.ModuleList()
+        self._use_actnorm = use_actnorm
+
+        for i in range(n_layers):
+            self.ar_layers.append(
+                AnalyticAutoregressiveLayer(
+                    dim=n_input,
+                    bijection_type=bijection_type,
+                    hidden_dim=hidden_dim,
+                    n_hidden_layers=n_hidden_layers,
+                    zero_init=zero_init,
+                    seed=permutation_seed + i,
+                )
+            )
+            if use_actnorm:
+                self.actnorms.append(ActNorm(dim=n_input))
+            if i < n_layers - 1:
+                self.permutations.append(
+                    FixedPermutation(dim=n_input, seed=permutation_seed + i)
+                )
+
+        self.loft: LOFTLayer | None = LOFTLayer(tau=loft_tau) if use_loft else None
+
+    @property
+    def n_latent(self) -> int:
+        return self._n_input
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = x
+        for i, layer in enumerate(self.ar_layers):
+            z, _ = layer(z)
+            if self._use_actnorm:
+                z, _ = self.actnorms[i](z)
+            if i < len(self.permutations):
+                z = self.permutations[i](z)
+        if self.loft is not None:
+            z = self.loft(z)
+        return z
+
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        y = z
+        if self.loft is not None:
+            y = self.loft.inverse(y)
+        for i in reversed(range(len(self.ar_layers))):
+            if i < len(self.permutations):
+                y = self.permutations[i].inverse(y)
+            if self._use_actnorm:
+                y = self.actnorms[i].inverse(y)
+            y = self.ar_layers[i].inverse(y)
+        return y
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.inverse(z)
+
+    def log_det_jacobian(self, x: torch.Tensor) -> torch.Tensor:
+        z = x
+        total_log_det = torch.zeros(
+            x.shape[:-1], device=x.device, dtype=x.dtype
+        )
+        for i, layer in enumerate(self.ar_layers):
             z, ld = layer(z)
             total_log_det = total_log_det + ld
             if self._use_actnorm:

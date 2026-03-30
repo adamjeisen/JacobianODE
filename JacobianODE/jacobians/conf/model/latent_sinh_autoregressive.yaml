@@ -1,0 +1,34 @@
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_target_dims, set at runtime
+  hidden_dim: [256, 512, 512]
+  num_layers: 3
+  output_dim: null   # = n_target_dims², set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.coupling_flows.AnalyticAutoregressiveEncoder
+  n_input: null            # set at runtime (= n_delays * len(observed_indices))
+  bijection_type: sinh
+  n_layers: 8              # number of autoregressive layers
+  hidden_dim: 128          # MADE hidden width
+  n_hidden_layers: 2       # MADE depth
+  use_actnorm: true        # ActNorm between autoregressive layers
+  zero_init: true          # identity initialization trick
+  permutation_seed: 0      # base seed for inter-layer permutations
+  use_loft: false
+  loft_tau: 100.0
+
+n_target_dims: 3           # drives MLP dims and subspace splitting
+kl_null_weight: 1.0        # null-space MSE penalty (structural constraint)
+kl_dyn_weight: 0.0         # dynamic subspace KL divergence (smoothness regularizer)
+use_vae: false             # VAE reparameterization on dynamic subspace
+vae_sample_all_losses: false  # when false, only recon uses sampled z_dyn
+kl_warmup_epochs: 0        # 0 = fixed weight, >0 = linear ramp from 0
+prediction_steps: 10
+encoder_warmup_epochs: 0
+dynamics_warmup_epochs: 0
+jac_window_stride: null
+decode_only_recent: false

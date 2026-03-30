@@ -11,6 +11,7 @@ _jupyter/*.pdf
 _jupyter/*.html
 _jupyter/_sandbox/*.html
 _jupyter/reports/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
