@@ -6,6 +6,7 @@ import copy
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+import numpy as np
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -109,6 +110,68 @@ def load_config(
     return cfg
 
 
+def resolve_observed_indices(cfg: DictConfig) -> None:
+    """Resolve ``observed_indices='random'`` into a concrete list of indices.
+
+    When ``delay_embedding_params.observed_indices`` is ``'random'``, this
+    function randomly selects ``n_observed`` dimension indices and writes
+    them back into the config in-place.  The random seed defaults to
+    ``flow.random_state`` but can be overridden with ``partial_obs_seed``.
+
+    For ``'all'`` or an explicit list, this is a no-op.
+
+    Args:
+        cfg: Configuration object (mutated in-place).
+
+    Raises:
+        ValueError: If ``n_observed`` is not set when ``observed_indices='random'``,
+            or if the total data dimensionality cannot be determined.
+    """
+    delay_params = cfg.data.train_test_params.delay_embedding_params
+    if delay_params.observed_indices != "random":
+        return
+
+    n_observed = delay_params.get("n_observed", None)
+    if n_observed is None:
+        raise ValueError(
+            "observed_indices='random' requires "
+            "data.train_test_params.delay_embedding_params.n_observed to be set."
+        )
+
+    # Determine total number of dimensions
+    if cfg.data.data_type == "dysts":
+        eq = instantiate(cfg.data.flow)
+        total_dim = eq._load_data()["embedding_dimension"]
+    elif cfg.data.data_type in ("wmtask", "custom"):
+        if cfg.data.flow.get("dim", None) is None:
+            raise ValueError(
+                f"observed_indices='random' with data_type='{cfg.data.data_type}' "
+                "requires data.flow.dim to be set."
+            )
+        total_dim = int(cfg.data.flow.dim)
+    else:
+        raise ValueError(
+            f"Cannot resolve random observed_indices for data_type={cfg.data.data_type}"
+        )
+
+    seed = delay_params.get("partial_obs_seed", None)
+    if seed is None:
+        seed = cfg.data.flow.random_state
+    rng = np.random.RandomState(int(seed))
+    indices = sorted(rng.choice(total_dim, int(n_observed), replace=False).tolist())
+
+    OmegaConf.update(
+        cfg,
+        "data.train_test_params.delay_embedding_params.observed_indices",
+        indices,
+        force_add=True,
+    )
+    logger.debug(
+        f"Resolved random observed_indices: {len(indices)} of {total_dim} dims "
+        f"(seed={seed})"
+    )
+
+
 def initialize_config(
     cfg: DictConfig,
     data_dim: Optional[int] = None,
@@ -148,6 +211,9 @@ def initialize_config(
     """
     # Create a deep copy to avoid mutation
     cfg = copy.deepcopy(cfg)
+
+    # Resolve observed_indices='random' into a concrete list before anything else
+    resolve_observed_indices(cfg)
 
     # Set the lightning module target based on model
     if "encoder" in cfg.model:

@@ -26,6 +26,8 @@ train_test_params:
   dtype: torch.FloatTensor
   verbose: true
   delay_embedding_params:
-    observed_indices: 'all'  # Which dimensions to observe ('all' or list of indices)
+    observed_indices: 'all'  # 'all', 'random', or list of indices
+    n_observed: null          # Number of dims to observe (required when observed_indices='random')
+    partial_obs_seed: null    # Seed for random index selection (defaults to flow.random_state)
     n_delays: 1              # Number of delays for delay embedding
     delay_spacing: 1         # Time steps between delays

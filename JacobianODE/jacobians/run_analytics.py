@@ -484,6 +484,7 @@ def plot_pca_kaplan_yorke(
     X_true_flat: np.ndarray,
     mean_ky_latent: float,
     mean_ky_true: float | None = None,
+    mean_ky_latent_burnin: float | None = None,
     label_true: str = "True state",
 ) -> plt.Figure:
     """Side-by-side PC1×PC2 scatter for latent space vs. true state."""
@@ -499,7 +500,10 @@ def plot_pca_kaplan_yorke(
                     c=Z_pc[:, 0], cmap="viridis", rasterized=True)
     axes[0].set_xlabel("PC 1")
     axes[0].set_ylabel("PC 2")
-    axes[0].set_title(f"Latents\nmean D_KY = {mean_ky_latent:.3f}")
+    _latent_title = f"Latents\nD_KY (full) = {mean_ky_latent:.3f}"
+    if mean_ky_latent_burnin is not None:
+        _latent_title += f",  D_KY (burn-in) = {mean_ky_latent_burnin:.3f}"
+    axes[0].set_title(_latent_title)
 
     if X_true_flat is not None:
         pca_true = PCA(n_components=2).fit(X_true_flat)
@@ -546,6 +550,8 @@ def plot_prediction_detail(
     traj_init_steps: int,
     nmse_val: float,
     title_suffix: str = "",
+    latent_nmse_val: float | None = None,
+    n_metric_dims: int | None = None,
 ) -> tuple[plt.Figure, plt.Figure]:
     """Latent and observation space plots for a single prediction window.
 
@@ -568,17 +574,21 @@ def plot_prediction_detail(
             ax.legend(fontsize=8)
     for i in range(n_latent, n_rows * n_cols):
         axes[i // n_cols, i % n_cols].set_visible(False)
+    # Show latent-space nMSE if available, otherwise fall back to obs nMSE
+    _z_nmse = latent_nmse_val if latent_nmse_val is not None else nmse_val
     fig_z.suptitle(
-        f"Latent Space: {title_suffix} (nMSE={nmse_val:.4f})", fontsize=14, y=1.02
+        f"Latent Space: {title_suffix} (nMSE={_z_nmse:.4f})", fontsize=14, y=1.02
     )
     plt.tight_layout()
 
-    # Observation space figure
-    obs_pred_phys = obs_pred * sigma + mu
-    obs_true_phys = obs_true * sigma + mu
-    D_obs = obs_pred.shape[-1]
+    # Observation space figure — slice to metric dims to match model training
+    _obs_pred = obs_pred[..., :n_metric_dims] if n_metric_dims else obs_pred
+    _obs_true = obs_true[..., :n_metric_dims] if n_metric_dims else obs_true
+    obs_pred_phys = _obs_pred * sigma + mu
+    obs_true_phys = _obs_true * sigma + mu
+    D_obs = _obs_pred.shape[-1]
     dim_labels = [chr(ord("x") + i) for i in range(26)]
-    t_pred = np.arange(obs_pred.shape[0])
+    t_pred = np.arange(_obs_pred.shape[0])
 
     fig_obs, axes_p = plt.subplots(1, min(D_obs, 3), figsize=(5 * min(D_obs, 3), 4), squeeze=False)
     for d in range(min(D_obs, 3)):
@@ -592,7 +602,8 @@ def plot_prediction_detail(
         ax.legend(fontsize=8)
     window_mase = float(mase_fn(obs_true_phys, obs_pred_phys))
     fig_obs.suptitle(
-        f"Observation Space: {title_suffix} (MASE={window_mase:.4f})", fontsize=14, y=1.02
+        f"Observation Space: {title_suffix} (nMSE={nmse_val:.4f}, MASE={window_mase:.4f})",
+        fontsize=14, y=1.02,
     )
     plt.tight_layout()
 
@@ -862,7 +873,9 @@ def run_analytics(
     mu = float(cfg.data.postprocessing.mu) if np.isscalar(cfg.data.postprocessing.mu) else np.array(cfg.data.postprocessing.mu)
     sigma = float(cfg.data.postprocessing.sigma)
     n_latent = OmegaConf.select(cfg, "model.encoder.n_latent", default=None)
-    n_dims = values.shape[-1]
+    # Use the actual delay-embedded dimensionality (from the dataloaders),
+    # not the raw pre-embedding values which may have more dimensions.
+    n_dims = trajs["test_trajs"].sequence.shape[-1]
     if n_latent is None:
         n_latent = n_dims
     is_coupling, n_target_dims = _get_coupling_info(cfg)
@@ -885,6 +898,13 @@ def run_analytics(
         decoder_n_out = lit_model.encoder.decoder.n_output
     else:
         decoder_n_out = lit_model.encoder.n_latent
+
+    # Number of obs dims to use for metrics, matching the model's behaviour:
+    # when reconstruction_mode='most_recent', metrics use only the first d dims.
+    _n_metric_dims = getattr(lit_model, '_n_recent_dims', None)
+    recon_mode = getattr(lit_model, 'reconstruction_mode', 'uniform')
+    if recon_mode != 'most_recent' or _n_metric_dims is None:
+        _n_metric_dims = None  # use all dims
 
     # ---------------------------------------------------------------- output helpers
     # Build a shared filename stem used by both PDF and HTML outputs.
@@ -1179,7 +1199,14 @@ def run_analytics(
                 traj_batched_t = torch.as_tensor(
                     test_dl.dataset.sequence
                 ).float().to(device_obj)
-                z_batched_t = lit_model.encode_trajectory(traj_batched_t)
+                # Encode in chunks to avoid OOM on large test sets
+                _enc_chunks = []
+                _chunk_size = 64
+                for _ci in range(0, traj_batched_t.shape[0], _chunk_size):
+                    _enc_chunks.append(
+                        lit_model.encode_trajectory(traj_batched_t[_ci:_ci + _chunk_size])
+                    )
+                z_batched_t = torch.cat(_enc_chunks, dim=0)
                 z_for_jac = _z_dyn(z_batched_t, n_target_dims)
                 gen = torch.Generator().manual_seed(0)
                 perm = torch.randperm(z_for_jac.shape[0], generator=gen)[:n_sample]
@@ -1368,10 +1395,21 @@ def run_analytics(
             ).reshape(-1, test_trajs_full.shape[-1])
             _mean_ky_true_pca = float(ky_emp_np_ky.mean()) if ky_emp_np_ky is not None else None
 
+            # Compute burn-in D_KY if burn-in Lyapunov exponents are available
+            _mean_ky_burnin: float | None = None
+            if "all_pred_lyap" in _state:
+                _ky_burnin = _kaplan_yorke_dim(_state["all_pred_lyap"])
+                _ky_burnin_np = np.atleast_1d(
+                    _ky_burnin.cpu().numpy() if torch.is_tensor(_ky_burnin) else np.array(_ky_burnin)
+                )
+                _mean_ky_burnin = float(_ky_burnin_np.mean())
+                print(f"Mean KY dim (burn-in):   {_mean_ky_burnin:.3f} ± {_ky_burnin_np.std():.3f}")
+
             fig_pca = plot_pca_kaplan_yorke(
                 _Z_flat_pca, _X_true_flat,
                 mean_ky_latent=float(ky_pred_np.mean()),
                 mean_ky_true=_mean_ky_true_pca,
+                mean_ky_latent_burnin=_mean_ky_burnin,
             )
             _emit("kaplan_yorke_pca", fig_pca)
 
@@ -1401,9 +1439,13 @@ def run_analytics(
                 obs_tgt = rd["targets"].cpu()
                 z_pred_i = rd["outputs"].cpu()
 
-                mean_var = obs_tgt.reshape(-1, obs_tgt.shape[-1]).var(dim=0).mean().clamp(min=1e-8)
-                for w in range(dec_pred.shape[0]):
-                    w_mse = (dec_pred[w] - obs_tgt[w]).pow(2).mean()
+                # Slice to metric dims (matches model's reconstruction_mode)
+                _dp = dec_pred[..., :_n_metric_dims] if _n_metric_dims else dec_pred
+                _ot = obs_tgt[..., :_n_metric_dims] if _n_metric_dims else obs_tgt
+
+                mean_var = _ot.reshape(-1, _ot.shape[-1]).var(dim=0).mean().clamp(min=1e-8)
+                for w in range(_dp.shape[0]):
+                    w_mse = (_dp[w] - _ot[w]).pow(2).mean()
                     all_per_window_nmse_pw.append((w_mse / mean_var).item())
 
                 z_true_np = z_true_i[0].cpu()
@@ -1443,12 +1485,23 @@ def run_analytics(
                 obs_pred_med = all_decoded_pred_pw_arr[median_idx]
                 obs_true_med = all_obs_targets_pw_arr[median_idx]
 
+                # Compute latent-space nMSE on the prediction portion only,
+                # matching dynamic-subspace dims between z_pred and z_true.
+                D_dyn = z_pred_med.shape[-1]
+                z_pred_pred = z_pred_med[traj_init_steps:]
+                z_true_pred = z_true_med[traj_init_steps:, :D_dyn]
+                _z_var = z_true_pred.var(axis=0).mean()
+                _z_mse = ((z_pred_pred - z_true_pred) ** 2).mean()
+                latent_nmse = float(_z_mse / max(_z_var, 1e-8))
+
                 fig_z, fig_obs = plot_prediction_detail(
                     z_pred_med, z_true_med, obs_pred_med, obs_true_med,
                     sigma=sigma, mu=mu,
                     traj_init_steps=traj_init_steps,
                     nmse_val=all_per_window_nmse_arr[median_idx],
                     title_suffix="Median-loss window",
+                    latent_nmse_val=latent_nmse,
+                    n_metric_dims=_n_metric_dims,
                 )
                 _emit("prediction_detail_latent", fig_z)
                 _emit("prediction_detail_obs", fig_obs)
@@ -1557,7 +1610,6 @@ def run_analytics(
         # ============================================================
         if "amplification" in active_sections:
             print("Computing amplification loss ...")
-            seq_length = 45
 
             def _extract_seqs(x: torch.Tensor, sl: int) -> torch.Tensor:
                 B, T, D = x.shape
@@ -1570,42 +1622,66 @@ def run_analytics(
             test_trajs_obs_amp = trajs["test_trajs"].sequence
             test_trajs_full_amp = trajs.get("test_trajs_full", trajs["test_trajs"]).sequence
             T_obs = test_trajs_obs_amp.shape[1]
-            x_de = _extract_seqs(test_trajs_obs_amp, seq_length)
-            x_orig = _extract_seqs(test_trajs_full_amp[:, -T_obs:], seq_length)
 
-            rng_amp = np.random.default_rng(42)
-            B_amp = x_de.shape[0]
-            idx_amp = rng_amp.choice(B_amp, min(n_amp_trajs, B_amp), replace=False)
+            # Adapt seq_length to available data: need at least max_T+1 steps
+            # after slicing, and enough points for n_neighbors.
+            seq_length = min(45, T_obs)
+            # n_pts = n_seqs * (seq_length - max_T); need n_pts >= n_neighbors
+            min_seq_length = n_amp_max_t + 1
+            if seq_length < min_seq_length:
+                print(
+                    f"  Skipping amplification: trajectory length ({T_obs}) too short "
+                    f"for max_T={n_amp_max_t}."
+                )
+            else:
+                x_de = _extract_seqs(test_trajs_obs_amp, seq_length)
+                x_orig = _extract_seqs(test_trajs_full_amp[:, -T_obs:], seq_length)
 
-            X_de_s = x_de[torch.from_numpy(idx_amp)].to(device_obj)
-            X_orig_s = x_orig[torch.from_numpy(idx_amp)].to(device_obj)
+                B_amp = x_de.shape[0]
+                if B_amp == 0:
+                    print("  Skipping amplification: no sequences could be extracted.")
+                else:
+                    rng_amp = np.random.default_rng(42)
+                    n_selected = min(n_amp_trajs, B_amp)
+                    idx_amp = rng_amp.choice(B_amp, n_selected, replace=False)
 
-            with torch.no_grad():
-                X_latent_amp = lit_model.encode_trajectory(X_de_s)
-                amp_true = loss_amplification(
-                    X_de_s, X_orig_s[..., [0]],
-                    n_neighbors=n_amp_neighbors, max_T=n_amp_max_t, normalize=True,
-                ).item()
-                amp_latent = loss_amplification(
-                    X_latent_amp, X_orig_s[..., [0]],
-                    n_neighbors=n_amp_neighbors, max_T=n_amp_max_t, normalize=True,
-                ).item()
+                    # Verify enough data points for k-NN
+                    n_pts = n_selected * (seq_length - n_amp_max_t)
+                    if n_pts < n_amp_neighbors:
+                        print(
+                            f"  Skipping amplification: only {n_pts} data points "
+                            f"but n_neighbors={n_amp_neighbors}."
+                        )
+                    else:
+                        X_de_s = x_de[torch.from_numpy(idx_amp)].to(device_obj)
+                        X_orig_s = x_orig[torch.from_numpy(idx_amp)].to(device_obj)
 
-            print(f"Amplification loss — True state: {amp_true:.6f}")
-            print(f"Amplification loss — Latent:     {amp_latent:.6f}")
+                        with torch.no_grad():
+                            X_latent_amp = lit_model.encode_trajectory(X_de_s)
+                            amp_true = loss_amplification(
+                                X_de_s, X_orig_s[..., [0]],
+                                n_neighbors=n_amp_neighbors, max_T=n_amp_max_t, normalize=True,
+                            ).item()
+                            amp_latent = loss_amplification(
+                                X_latent_amp, X_orig_s[..., [0]],
+                                n_neighbors=n_amp_neighbors, max_T=n_amp_max_t, normalize=True,
+                            ).item()
 
-            fig = plot_amplification(
-                amp_true, amp_latent,
-                n_obs_dims=X_orig_s.shape[-1],
-                n_latent_dims=X_de_s.shape[-1],
-            )
-            _amp_lines = [
-                f"True state (D={X_orig_s.shape[-1]}): {amp_true:.6f}",
-                f"Latent     (D={X_de_s.shape[-1]}):   {amp_latent:.6f}",
-            ]
-            _html_section("Amplification Loss", _amp_lines)
-            _emit("amplification", fig)
-            _summary_lines += ["", "=== Amplification Loss ==="] + _amp_lines
+                        print(f"Amplification loss — True state: {amp_true:.6f}")
+                        print(f"Amplification loss — Latent:     {amp_latent:.6f}")
+
+                        fig = plot_amplification(
+                            amp_true, amp_latent,
+                            n_obs_dims=X_orig_s.shape[-1],
+                            n_latent_dims=X_de_s.shape[-1],
+                        )
+                        _amp_lines = [
+                            f"True state (D={X_orig_s.shape[-1]}): {amp_true:.6f}",
+                            f"Latent     (D={X_de_s.shape[-1]}):   {amp_latent:.6f}",
+                        ]
+                        _html_section("Amplification Loss", _amp_lines)
+                        _emit("amplification", fig)
+                        _summary_lines += ["", "=== Amplification Loss ==="] + _amp_lines
 
         # ============================================================
         # Final: consolidated summary section (HTML only — always last)

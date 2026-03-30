@@ -625,7 +625,13 @@ def select_best_from_sweep(
         generate_data=True,
         verbose=False,
     )
-    n_dims = _values0.shape[-1]
+    # Compute delay-embedded dimensionality (not raw pre-embedding dims).
+    _delay_params = _cfg0.data.train_test_params.delay_embedding_params
+    _n_delays = int(_delay_params.n_delays)
+    if _delay_params.observed_indices == "all":
+        n_dims = int(_values0.shape[-1]) * _n_delays
+    else:
+        n_dims = len(_delay_params.observed_indices) * _n_delays
     n_latent = OmegaConf.select(_cfg0, "model.encoder.n_latent", default=None)
     if n_latent is None:
         n_latent = n_dims
