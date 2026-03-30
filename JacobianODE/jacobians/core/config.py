@@ -204,7 +204,7 @@ def initialize_config(
     # Compute per-step observation dimension (number of coords in one delay)
     delay_params = cfg.data.train_test_params.delay_embedding_params
     if delay_params.observed_indices == "all":
-        n_recent_dims = int(cfg.data.flow.dim)
+        n_recent_dims = dim // int(delay_params.n_delays)
     else:
         n_recent_dims = len(delay_params.observed_indices)
 

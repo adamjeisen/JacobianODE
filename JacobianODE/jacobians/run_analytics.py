@@ -712,7 +712,8 @@ def run_analytics(
     sweep_diagnostics: list | None = None,
     sweep_result: Any | None = None,
     sweep_lambdas: list[float] | None = None,
-) -> dict[str, plt.Figure] | None:
+    return_model: bool = False,
+) -> dict[str, plt.Figure] | tuple | None:
     """Run the full analytics suite on a trained LitLatentJacobianODE model.
 
     Parameters
@@ -774,12 +775,16 @@ def run_analytics(
         Pre-computed ``SelectionResult`` from ``select_from_wandb_runs``.
     sweep_lambdas : list of float, optional
         Loop-closure weight values corresponding to ``sweep_diagnostics``.
+    return_model : bool
+        If ``True``, append the loaded ``LitLatentJacobianODE`` model and its
+        W&B run ID to the return value.
 
     Returns
     -------
-    dict[str, Figure] or None
-        If ``"return"`` is in *output*, returns ``{section_name: figure}``.
-        Otherwise returns ``None``.
+    dict[str, Figure] or tuple or None
+        * Default (``return_model=False``): returns ``{section: figure}`` when
+          ``"return"`` is in *output*, else ``None``.
+        * ``return_model=True``: returns ``(figures_or_none, lit_model, run_id)``.
     """
     # ------------------------------------------------------------------ setup
     if isinstance(output, str):
@@ -1646,6 +1651,9 @@ def run_analytics(
             html_path.write_text(_html_doc, encoding="utf-8")
             print(f"HTML report saved to: {html_path}")
 
+    if return_model:
+        result = figures if "return" in output else None
+        return result, lit_model, run_id
     if "return" in output:
         return figures
     return None
