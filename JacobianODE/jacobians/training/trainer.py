@@ -20,15 +20,28 @@ from ..lightning_base import OptunaPruneCallback, OptunaProgressCallback, Optuna
 logger = logging.getLogger(__name__)
 
 
+class _WandbFlushCallback(L.Callback):
+    """Flush W&B metrics to the server at the end of each validation epoch.
+
+    By default W&B syncs on a background thread whose interval may be too long
+    for cluster environments with restricted network access.  Calling
+    ``experiment.log({})`` forces the background sender to drain its queue,
+    giving live metric streaming without waiting for ``wandb.finish()``.
+    """
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        logger_ = trainer.logger
+        if logger_ is not None and hasattr(logger_, "experiment"):
+            logger_.experiment.log({})
+
+
 def train_model(
     cfg: DictConfig,
     lit_model: L.LightningModule,
     train_dataloaders: Union[DataLoader, List[DataLoader]],
     val_dataloaders: Union[DataLoader, List[DataLoader]],
-    name: str,
-    project: str,
-    entity: Optional[str] = None,
-    group: Optional[str] = None,
+    name: Optional[str] = None,
+    extra_callbacks: Optional[List[L.Callback]] = None,
 ) -> L.Trainer:
     """Train the model using PyTorch Lightning.
 
@@ -40,8 +53,8 @@ def train_model(
         lit_model: The PyTorch Lightning model to train.
         train_dataloaders: Training data loader(s).
         val_dataloaders: Validation data loader(s).
-        name: Name of the training run.
-        project: W&B project name.
+        name: Name of the training run. Defaults to None.
+        project: W&B project name. Defaults to None.
         entity: W&B entity/team name. Defaults to None.
         group: W&B group name to organize runs within the project. Defaults to None.
 
@@ -57,15 +70,17 @@ def train_model(
         The training strategy is automatically set to 'ddp_notebook' if running
         in a Jupyter environment.
     """
-    # Set up logger
+    entity  = cfg.wandb_entity
+    project = cfg.wandb_project
+    group   = cfg.wandb_group
+    name    = name or cfg.get("run_name", None)
+
     logger_kwargs = {
         "name": name,
         "project": project,
+        "entity": entity,
+        "group": group,
     }
-    if entity is not None:
-        logger_kwargs["entity"] = entity
-    if group is not None:
-        logger_kwargs["group"] = group
 
     experiment_logger = instantiate(cfg.training.logger, **logger_kwargs)
 
@@ -104,7 +119,9 @@ def train_model(
             mode=cfg.training.early_stopping.mode,
         )
 
-    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback]
+    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback()]
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
 
     # Optuna pruning callback (only when study_name + storage are configured)
     optuna_prune_epoch = cfg.training.get("optuna_prune_epoch", None)

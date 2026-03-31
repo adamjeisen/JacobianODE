@@ -4,7 +4,7 @@ defaults:
   - data: dysts
   - model: mlp
   - slurm: default
-  - override hydra/sweeper: list  # required for --multirun with comma-separated values
+  - optional experiment: null     # e.g. +experiment=wmtask_spline_coupling_sweep
 
 
 logger: wandb
@@ -22,10 +22,3 @@ hydra:
   # mode: MULTIRUN
   job:
     chdir: True
-  # sweeper:
-    # grid_params:
-    #   ++data.postprocessing.obs_noise: 0.05,0.1
-    # list_params:
-    #   data: wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask, wmtask
-    #   model: neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode, neuralode
-    #   ++training.lightning.jac_penalty: 0, 1e-06, 1e-05, 0.0001, 0.001, 0.01, 0.1, 1, 10, 0, 1e-06, 1e-05, 0.0001, 0.001, 0.01, 0.1, 1, 10

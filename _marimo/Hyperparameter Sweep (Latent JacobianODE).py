@@ -786,10 +786,18 @@ def _(
     JAC_NUM_LAYERS = 4
     JAC_ACTIVATION = 'silu'
 
+    N_EIGVAL_JACOBIANS = 128
+
     _display_latent = N_LATENT if N_LATENT is not None else f"n_input (coupling, n_target_dims={N_TARGET_DIMS})"
     print(f"N_LATENT: {_display_latent}")
     print(f"Jacobian MLP: {JAC_NUM_LAYERS} layers, hidden_dim={JAC_HIDDEN_DIM}")
-    return JAC_ACTIVATION, JAC_HIDDEN_DIM, JAC_NUM_LAYERS, N_LATENT
+    return (
+        JAC_ACTIVATION,
+        JAC_HIDDEN_DIM,
+        JAC_NUM_LAYERS,
+        N_EIGVAL_JACOBIANS,
+        N_LATENT,
+    )
 
 
 @app.cell
@@ -1047,6 +1055,7 @@ def _(
     N_AR_LAYERS,
     N_COUPLING_LAYERS,
     N_DELAYS,
+    N_EIGVAL_JACOBIANS,
     N_HIDDEN_LAYERS,
     N_LATENT,
     N_PERIODS,
@@ -1215,6 +1224,7 @@ def _(
                 f'model.kl_warmup_epochs={KL_WARMUP_EPOCHS}',
                 f'training.lightning.kl_null_weight={KL_NULL_WEIGHT}',
                 f'training.lightning.reconstruction_mode={RECONSTRUCTION_MODE}',
+                f'training.lightning.n_eigval_jacobians={N_EIGVAL_JACOBIANS}',
                 f'training.lightning.tangent_entropy_weight={TANGENT_ENTROPY_WEIGHT}',
                 f'training.lightning.tangent_entropy_mode={TANGENT_ENTROPY_MODE}',
                 f'training.lightning.tangent_entropy_n_samples={TANGENT_ENTROPY_N_SAMPLES}',
@@ -1526,7 +1536,7 @@ def _(mo):
 
 @app.cell
 def _():
-    def _get_sweep_param_from_run(run, key):
+    def get_sweep_param_from_run(run, key):
         """Extract a sweep parameter value from a W&B run config."""
         parts = key.split('.')
         val = run.config
@@ -1536,10 +1546,10 @@ def _():
             val = val[p]
         return val
 
-    def _combo_matches_run(combo, run):
+    def combo_matches_run(combo, run):
         """Check if a parameter combination matches a finished W&B run."""
-        for key, target_val in _combo.items():
-            run_val = _get_sweep_param_from_run(run, key)
+        for key, target_val in combo.items():
+            run_val = get_sweep_param_from_run(run, key)
             if run_val is None:
                 return False
             if isinstance(target_val, bool):
@@ -1552,15 +1562,22 @@ def _():
                 return False
         return True
 
-    def _is_jac_ode_run(run):
+    def is_jac_ode_run(run):
         """Return True if this run has an encoder (i.e. is a JacobianODE run)."""
         return 'model' in run.config and 'encoder' in run.config.get('model', {})
 
-    return
+    return combo_matches_run, is_jac_ode_run
 
 
 @app.cell
-def _(WANDB_GROUP, WANDB_PROJECT_PATH, all_sweep_combos, wandb):
+def _(
+    WANDB_GROUP,
+    WANDB_PROJECT_PATH,
+    all_sweep_combos,
+    combo_matches_run,
+    is_jac_ode_run,
+    wandb,
+):
     api = wandb.Api()
     try:
         run_filters = {'group': WANDB_GROUP} if WANDB_GROUP else None
@@ -1572,16 +1589,16 @@ def _(WANDB_GROUP, WANDB_PROJECT_PATH, all_sweep_combos, wandb):
     except Exception as e:
         print(f'Could not query project (may not exist yet): {e}')
         existing_runs = []
-    finished_runs = [r for r in existing_runs if r.state == 'finished' and _is_jac_ode_run(r)]
+    finished_runs = [r for r in existing_runs if r.state == 'finished' and is_jac_ode_run(r)]
     already_done = []
     remaining_combos = []
-    for _combo in all_sweep_combos:
-        if any((_combo_matches_run(_combo, r) for r in finished_runs)):
-            already_done.append(_combo)
-            run_match = next((r for r in finished_runs if _combo_matches_run(_combo, r)))
-            print(f'  Already done: {_combo} (run_id={run_match.id})')
+    for combo in all_sweep_combos:
+        if any((combo_matches_run(combo, r) for r in finished_runs)):
+            already_done.append(combo)
+            run_match = next((r for r in finished_runs if combo_matches_run(combo, r)))
+            print(f'  Already done: {combo} (run_id={run_match.id})')
         else:
-            remaining_combos.append(_combo)
+            remaining_combos.append(combo)
     if already_done:
         print(f'\nSkipping {len(already_done)} already-completed combinations')
     if remaining_combos:
@@ -1607,7 +1624,7 @@ def _(
     # Build the Hydra --multirun sweep command(s)
     ENTRY_POINT = f'{sys.executable} -m JacobianODE.jacobians.run_jacobians' if MODE == 'from_scratch' else f'{sys.executable} -m JacobianODE.jacobians.run_pretrained_jacobians'
 
-    def _hydra_val(val):
+    def hydra_val(val):
         """Format a Python value for a Hydra command-line override."""
         if val is None:
             return 'null'
@@ -1628,7 +1645,7 @@ def _(
         if use_subset_sweep:
             sweep_cmds = []
             for _combo in remaining_combos:
-                combo_overrides = [f'{key}={_hydra_val(val)}' for key, val in _combo.items()]
+                combo_overrides = [f'{key}={hydra_val(val)}' for key, val in _combo.items()]
                 sweep_overrides = fixed_overrides + combo_overrides + [f'wandb_entity={WANDB_ENTITY}', f'wandb_project={WANDB_PROJECT}', 'slurm=default']
                 if WANDB_GROUP:
                     sweep_overrides.append(f'wandb_group={WANDB_GROUP}')
@@ -1636,7 +1653,7 @@ def _(
         else:
             sweep_param_overrides = []  # One command per remaining combo
             for key, vals in SWEEP_PARAMS.items():
-                val_str = ','.join((str(_hydra_val(_v)) for _v in vals))
+                val_str = ','.join((str(hydra_val(_v)) for _v in vals))
                 sweep_param_overrides.append(f'{key}={val_str}')
             sweep_overrides = fixed_overrides + sweep_param_overrides + [f'wandb_entity={WANDB_ENTITY}', f'wandb_project={WANDB_PROJECT}', 'slurm=default']
             if WANDB_GROUP:
@@ -1649,6 +1666,39 @@ def _(
         sweep_cmds = []
         print('No sweep to launch -- all runs already completed.')  # Full grid sweep: comma-separated values
     return ENTRY_POINT, sweep_cmds
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Timing analysis
+
+    | Label | What it measures |
+    |---|---|
+    | `train/1.encode_tf+compute_jacs` | No-grad encode + compute Jacobians for teacher forcing update |
+    | `train/2.trajectory_step` | Full `trajectory_model_step` (encode → ODE → decode → loss) |
+    | `train/3.encode_recon` | Second encode pass shared by recon, FNN, loop closure, KL |
+    | `train/4.loop_closure` | Loop closure step in latent space |
+    | `train/5.reconstruction_loss` | decode(encode(x)) ≈ x loss |
+    | `train/6.fnn_loss` | False nearest-neighbor regularizer |
+    | `train/7.jac_consistency` | Jacobian consistency loss ($‖e^{Jdt} dz_t − dz_{t+1}‖²)$|
+    | `train/8.tangent_entropy` | Tangent space entropy via autograd Jacobians (0 if weight=0) |
+    | `traj/1.encode` | Encoder forward pass inside `trajectory_model_step` |
+    | `traj/2.window_gather` | Sub-window parameter computation |
+    | `traj/2b.window_stack` | Python loop to gather and stack latent sub-windows |
+    | `traj/3.jacobianODEint` | JacobianODE integration (likely dominant cost) |
+    | `traj/4.decode` | Crop predicted latent + decoder forward pass |
+    | `traj/5.obs_targets` | Extract observation-space targets from raw batch |
+    | `traj/6.loss_and_metrics` | Obs-space loss + MASE/R²/MAE metrics |
+    | `val/1.trajectory_step` | Full `trajectory_model_step` at validation (no noise, fixed α) |
+    | `val/2.encode` | Second encode pass for loop closure / recon / eigval diagnostics |
+    | `val/3.loop_closure` | Loop closure step |
+    | `val/4.reconstruction_loss` | Reconstruction loss (no grad) |
+    | `val/5.one_step_traj` | **Second full trajectory pass** with α=1 for MASE diagnostic |
+    | `val/6.eigvals` | `compute_jacobians` + `torch.linalg.eigvals` on all B×T Jacobians |
+    | `val/7.log_metrics` | W&B / Lightning metric logging |
+    """)
+    return
 
 
 @app.cell
@@ -1667,6 +1717,14 @@ def _(
     RUN_DIAG_LOCAL = False
     # Set to True to run; uses all_sweep_combos[DIAG_COMBO_IX]
     DIAG_COMBO_IX = 0  # <-- Set True to diagnose
+
+    def _hydra_val(val):
+        if val is None:
+            return 'null'
+        if isinstance(val, bool):
+            return str(val).lower()
+        return val
+
     if RUN_DIAG_LOCAL:
         _swept_keys = set(SWEEP_PARAMS.keys())
 
@@ -1681,7 +1739,8 @@ def _(
         _local_overrides = _fixed + _combo_ov + [f'wandb_entity={WANDB_ENTITY}', f'wandb_project={WANDB_PROJECT}', 'slurm=none']
         if WANDB_GROUP:
             _local_overrides.append(f'wandb_group={WANDB_GROUP}')
-        _cmd = f'{ENTRY_POINT} ' + ' '.join(_local_overrides)
+        _ENTRY_POINT = ENTRY_POINT
+        _cmd = f'{_ENTRY_POINT} ' + ' '.join(_local_overrides)
         print('Running locally (no SLURM). Any exception will appear below:\n')  # No SLURM launcher — runs in-process (Hydra default)
         print(_cmd[:300] + '...\n')
         subprocess.run(_cmd, shell=True)

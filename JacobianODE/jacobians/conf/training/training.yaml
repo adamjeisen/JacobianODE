@@ -57,9 +57,9 @@ lightning:
   jac_norm_ord: 'fro'
   jac_consistency_weight: 0.0  # weight for ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
   fnn_weight: 0.0  # weight for FNN latent-geometry regularizer (Gilpin NeurIPS 2020)
-  fnn_normalize: false        # normalize FNN loss by activation variance
-  fnn_elementwise_regularization: false  # elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
-  fnn_use_pca: false         # project onto PCA before FNN for rotation invariance
+  fnn_normalize: true        # normalize FNN loss by activation variance
+  fnn_elementwise_regularization: true  # elementwise FNN: E[W*A^2] vs E[W]*E[A^2]
+  fnn_use_pca: true         # project onto PCA before FNN for rotation invariance
   fnn_n_samples: 1024        # max points for FNN (O(N²)); null = use all
 
   # -----------------
@@ -67,7 +67,7 @@ lightning:
   # -----------------
   kl_null_weight: null           # null-space MSE penalty; null = same as kl_dyn_weight
   kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
-  reconstruction_mode: 'uniform'  # 'uniform' | 'harmonic' | 'most_recent'
+  reconstruction_mode: 'most_recent'  # 'uniform' | 'harmonic' | 'most_recent'
 
   # -----------------
   # TANGENT SPACE ENTROPY
@@ -75,6 +75,11 @@ lightning:
   tangent_entropy_weight: 0.0
   tangent_entropy_mode: 'quadratic'   # 'shannon' | 'quadratic' | 'renyi_half'
   tangent_entropy_n_samples: 256
+
+  # Number of B×T Jacobian matrices to randomly sample for eigenvalue
+  # computation during validation. Reduces val cost when B*T is large.
+  # Set to null to use all B*T matrices.
+  n_eigval_jacobians: null
 
   # -----------------
   # HOMOSCEDASTIC UNCERTAINTY WEIGHTING (Kendall et al. 2018)
@@ -90,7 +95,7 @@ lightning:
   learn_fnn_weight: false           # learn weight for FNN regularization loss
   learn_jac_cons_weight: false      # learn weight for Jacobian consistency loss
   learn_jac_norm_weight: false      # learn weight for Jacobian norm penalty
-  log_var_init: 'naive'             # 'naive' or 'auto'
+  log_var_init: 'auto'             # 'naive' or 'auto'
   
   # -----------------
   # LOOP CLOSURE TRAINING
@@ -99,7 +104,7 @@ lightning:
   # RECONSTRUCTION LOSS
   # -----------------
   reconstruction_loss_weight: 1.0  # weight for decode(encode(x)) ≈ x loss in obs space
-  latent_prediction_loss_weight: 0.0  # weight for JacobianODE(z_t) ≈ z_{t+k} loss in latent space
+  latent_prediction_loss_weight: 1.0  # weight for JacobianODE(z_t) ≈ z_{t+k} loss in latent space
 
   loop_closure_training: True # whether to train on loop closure integrals
   loop_closure_weight: 0.0
@@ -130,6 +135,12 @@ lightning:
   direct: True
   loss_func: mse
   data_type: null
+
+  # -----------------
+  # W&B PROFILING
+  # -----------------
+  profile_output: null
+  profile_steps: 1
   
 logger_save_dirs: null
 

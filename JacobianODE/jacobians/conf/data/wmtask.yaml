@@ -8,7 +8,8 @@ name: WMTask
 dataset_loader:
   _target_: wmtask.trajectories.load_wmtask_for_jacobianode
   project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
-  name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1"
+  # name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1"
+  name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
   model_to_load: "final"
   dataloader_to_use: "all"
   traj_window: "delay2"

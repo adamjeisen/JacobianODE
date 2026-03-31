@@ -174,8 +174,7 @@ def _run_training(cfg: DictConfig) -> float:
     # ----------------------------------------
     # TRAIN MODEL
     # ----------------------------------------
-    wandb_group = cfg.get("wandb_group") or None
-    trainer = train_model(cfg, lit_model, train_dataloader, val_dataloader, name, project, entity=entity, group=wandb_group)
+    trainer = train_model(cfg, lit_model, train_dataloader, val_dataloader, name=name)
 
     # Return objective for Optuna (silently ignored by non-sweep runs).
     # The OptunaCoordinator reads best_so_far from the DB instead, but

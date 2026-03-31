@@ -1,8 +1,8 @@
 params:
   _target_: JacobianODE.models.mlp.MLP
   input_dim: null    # = n_target_dims, set at runtime
-  hidden_dim: [256, 512, 512]
-  num_layers: 3
+  hidden_dim: [256, 1024, 2048, 2048]
+  num_layers: 4
   output_dim: null   # = n_target_dims², set at runtime
   residuals: False
   dropout: 0.0
@@ -18,17 +18,17 @@ encoder:
   tail_bound: 3.0          # linear tails outside [-B, B]
   use_actnorm: true        # ActNorm between autoregressive layers
   zero_init: true          # identity initialization trick
-  permutation_seed: 0      # base seed for inter-layer permutations
+  permutation_seed: 42      # base seed for inter-layer permutations
   use_loft: false
   loft_tau: 100.0
 
 n_target_dims: 3           # drives MLP dims and subspace splitting
-kl_null_weight: 1.0        # null-space MSE penalty (structural constraint)
+kl_null_weight: null        # null-space MSE penalty (structural constraint)
 kl_dyn_weight: 0.0         # dynamic subspace KL divergence (smoothness regularizer)
-use_vae: false             # VAE reparameterization on dynamic subspace
+use_vae: true             # VAE reparameterization on dynamic subspace
 vae_sample_all_losses: false  # when false, only recon uses sampled z_dyn
 kl_warmup_epochs: 0        # 0 = fixed weight, >0 = linear ramp from 0
-prediction_steps: 10
+prediction_steps: 30
 encoder_warmup_epochs: 0
 dynamics_warmup_epochs: 0
 jac_window_stride: null

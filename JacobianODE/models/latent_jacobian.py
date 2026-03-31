@@ -16,6 +16,8 @@ Architecture:
 """
 
 import math
+import time
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -93,6 +95,14 @@ class LitLatentJacobianODE(LitBase):
         tangent_entropy_weight=0.0,
         tangent_entropy_mode='quadratic',
         tangent_entropy_n_samples=256,
+        # Eigenvalue diagnostics
+        n_eigval_jacobians=None,
+        # Step profiling.  profile_output=None disables entirely.
+        # profile_output="stdout"        → print table to terminal / SLURM log
+        # profile_output="wandb"         → log each component via self.log_dict()
+        # profile_output="<path>.csv"    → append CSV rows to that file
+        profile_output=None,
+        profile_steps=1,   # print/log every N steps
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
@@ -160,6 +170,16 @@ class LitLatentJacobianODE(LitBase):
         self.tangent_entropy_mode = tangent_entropy_mode
         self.tangent_entropy_n_samples = tangent_entropy_n_samples
 
+        # Number of B×T Jacobian matrices to randomly sample for eigenvalue
+        # computation during validation. None means use all.
+        self.n_eigval_jacobians = n_eigval_jacobians
+
+        # Step profiling
+        self.profile_output = profile_output
+        self.profile_steps = max(1, profile_steps)
+        self._profile_log: list = []
+        self._profile_step_count = 0
+
         # Store precomputed true Lyapunov exponents for logging.
         # In partially observed settings, true Jacobians can't be computed
         # from the batch, but Lyapunov exponents are coordinate-invariant
@@ -193,6 +213,78 @@ class LitLatentJacobianODE(LitBase):
             self.log_var_jac_cons = nn.Parameter(torch.zeros(1))
         if learn_jac_norm_weight:
             self.log_var_jac_norm = nn.Parameter(torch.zeros(1))
+
+    # ------------------------------------------------------------------
+    # Step profiling helpers
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def _timed(self, name: str):
+        """Time a code block with GPU synchronization.
+
+        A no-op when ``self.profile_output is None``.  Results accumulate in
+        ``self._profile_log`` as ``(name, ms)`` pairs and are emitted by
+        :meth:`_maybe_emit_profile` at the end of each step.
+        """
+        if self.profile_output is None:
+            yield
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        yield
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._profile_log.append((name, (time.perf_counter() - t0) * 1000.0))
+
+    def _maybe_emit_profile(self, label: str):
+        """Emit a timing summary to the configured destination.
+
+        Called at the end of each training/validation step.  Routes to:
+        - ``"stdout"``      — formatted table printed to terminal / SLURM log
+        - ``"wandb"``       — per-component ms logged via ``self.log_dict()``
+        - any other string  — CSV rows appended to that file path
+        """
+        if self.profile_output is None or not self._profile_log:
+            self._profile_log.clear()
+            return
+        self._profile_step_count += 1
+        if self._profile_step_count % self.profile_steps != 0:
+            self._profile_log.clear()
+            return
+
+        log = self._profile_log
+        total = sum(dt for _, dt in log)
+
+        if self.profile_output == "stdout":
+            w = max(len(n) for n, _ in log)
+            print(f"\n[PROFILE {label} | step {self._profile_step_count}]")
+            for name, dt in log:
+                pct = 100.0 * dt / total if total > 0 else 0.0
+                print(f"  {name:<{w}s}  {dt:8.1f} ms  ({pct:4.1f}%)")
+            print(f"  {'TOTAL':<{w}s}  {total:8.1f} ms")
+
+        elif self.profile_output == "wandb":
+            metrics = {f"profile/{label}/{name}": dt for name, dt in log}
+            metrics[f"profile/{label}/TOTAL"] = total
+            self.log_dict(metrics, on_step=True, on_epoch=False)
+
+        else:  # treat as a file path
+            import csv
+            import os
+            write_header = not os.path.exists(self.profile_output)
+            with open(self.profile_output, "a", newline="") as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(["step", "label", "component", "ms", "pct"])
+                for name, dt in log:
+                    pct = 100.0 * dt / total if total > 0 else 0.0
+                    writer.writerow([self._profile_step_count, label, name,
+                                     f"{dt:.3f}", f"{pct:.2f}"])
+                writer.writerow([self._profile_step_count, label, "TOTAL",
+                                 f"{total:.3f}", "100.00"])
+
+        self._profile_log.clear()
 
     # ------------------------------------------------------------------
     # Encoder / decoder abstractions
@@ -643,163 +735,160 @@ class LitLatentJacobianODE(LitBase):
         batch = batch.type(self.dtype)
         label = batch.detach().clone()
 
-        # Add observation noise during training
-        scaled_noise = obs_noise_scale * self.noise_scale_factor
-        batch_noisy = batch + (torch.randn_like(batch) * scaled_noise)
-
         # 1. Encode full observation sequence
-        z_full = self.encode_trajectory(batch_noisy)  # (B, T', D_latent)
+        with self._timed("traj/1.encode"):
+            # Add observation noise during training
+            scaled_noise = obs_noise_scale * self.noise_scale_factor
+            batch_noisy = batch + (torch.randn_like(batch) * scaled_noise)
 
-        # Split into dynamic subspace and null subspace
-        mu_dyn, _z_null = self._split_latent(z_full)
-        z_dyn_sampled, _ = self._vae_reparameterize(mu_dyn)
-        z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
-        z_dyn_clean = z_dyn  # save before latent noise
+            z_full = self.encode_trajectory(batch_noisy)  # (B, T', D_latent)
 
-        # Add isotropic noise in latent space before propagation.
-        # Noise is applied to z_dyn only (z_null is driven to zero).
-        # per_step=False (default): same noise offset for all timesteps in
-        #   each trajectory, displacing off-manifold without corrupting
-        #   consecutive-point differences (velocities).
-        # per_step=True: independent noise at each timestep.
-        if latent_noise_scale > 0:
-            if self._latent_noise_scale_factor is not None:
-                factor = self._latent_noise_scale_factor
-            else:
-                factor = z_dyn.detach().norm(dim=-1).mean() / math.sqrt(z_dyn.shape[-1])
-            if latent_noise_per_step:
-                noise = torch.randn_like(z_dyn) * latent_noise_scale * factor
-            else:
-                noise = torch.randn(
-                    z_dyn.shape[0], 1, z_dyn.shape[-1],
-                    device=z_dyn.device, dtype=z_dyn.dtype,
-                ) * latent_noise_scale * factor
-            z_dyn = z_dyn + noise
+            # Split into dynamic subspace and null subspace
+            mu_dyn, _z_null = self._split_latent(z_full)
+            z_dyn_sampled, _ = self._vae_reparameterize(mu_dyn)
+            z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
+            z_dyn_clean = z_dyn  # save before latent noise
 
-        # 2. Determine sub-window parameters
-        traj_init_steps = jacobianODEint_kwargs.get('traj_init_steps', 15)
-        B, T_prime, D_dyn = z_dyn.shape
+            # Add isotropic noise in latent space before propagation.
+            if latent_noise_scale > 0:
+                if self._latent_noise_scale_factor is not None:
+                    factor = self._latent_noise_scale_factor
+                else:
+                    factor = z_dyn.detach().norm(dim=-1).mean() / math.sqrt(z_dyn.shape[-1])
+                if latent_noise_per_step:
+                    noise = torch.randn_like(z_dyn) * latent_noise_scale * factor
+                else:
+                    noise = torch.randn(
+                        z_dyn.shape[0], 1, z_dyn.shape[-1],
+                        device=z_dyn.device, dtype=z_dyn.dtype,
+                    ) * latent_noise_scale * factor
+                z_dyn = z_dyn + noise
 
-        if strided:
-            jac_window_len = traj_init_steps + self.prediction_steps
-            prediction_steps_actual = self.prediction_steps
-            if T_prime < jac_window_len:
-                raise ValueError(
-                    f"Latent trajectory length ({T_prime}) is shorter than "
-                    f"required JacobianODE window ({jac_window_len} = "
-                    f"traj_init_steps={traj_init_steps} + "
-                    f"prediction_steps={self.prediction_steps}). "
-                    f"Increase observation sequence length or reduce prediction_steps."
+        # 2. Determine sub-window parameters and gather windows
+        with self._timed("traj/2.window_gather"):
+            traj_init_steps = jacobianODEint_kwargs.get('traj_init_steps', 15)
+            B, T_prime, D_dyn = z_dyn.shape
+
+            if strided:
+                jac_window_len = traj_init_steps + self.prediction_steps
+                prediction_steps_actual = self.prediction_steps
+                if T_prime < jac_window_len:
+                    raise ValueError(
+                        f"Latent trajectory length ({T_prime}) is shorter than "
+                        f"required JacobianODE window ({jac_window_len} = "
+                        f"traj_init_steps={traj_init_steps} + "
+                        f"prediction_steps={self.prediction_steps}). "
+                        f"Increase observation sequence length or reduce prediction_steps."
+                    )
+                # Extract strided sub-windows from each trajectory
+                stride = self.jac_window_stride
+                n_windows = max(1, (T_prime - jac_window_len) // stride + 1)
+                all_starts = []
+                for b in range(B):
+                    for w_idx in range(n_windows):
+                        start = w_idx * stride
+                        if start + jac_window_len <= T_prime:
+                            all_starts.append(start)
+                n_windows_actual = len(all_starts) // B
+                start_indices = torch.tensor(
+                    all_starts, device=z_dyn.device, dtype=torch.long
                 )
-            # Extract strided sub-windows from each trajectory
-            stride = self.jac_window_stride
-            n_windows = max(1, (T_prime - jac_window_len) // stride + 1)
-            all_starts = []
-            for b in range(B):
-                for w_idx in range(n_windows):
-                    start = w_idx * stride
-                    if start + jac_window_len <= T_prime:
-                        all_starts.append(start)
-            n_windows_actual = len(all_starts) // B
-            start_indices = torch.tensor(
-                all_starts, device=z_dyn.device, dtype=torch.long
-            )
-        else:
-            # Non-strided: one full-length window per batch element
-            jac_window_len = T_prime
-            prediction_steps_actual = T_prime - traj_init_steps
-            if prediction_steps_actual <= 0:
-                raise ValueError(
-                    f"Latent trajectory length ({T_prime}) too short for "
-                    f"traj_init_steps={traj_init_steps}. Need T' > traj_init_steps."
-                )
-            n_windows_actual = 1
-            start_indices = torch.zeros(B, device=z_dyn.device, dtype=torch.long)
+            else:
+                # Non-strided: one full-length window per batch element
+                jac_window_len = T_prime
+                prediction_steps_actual = T_prime - traj_init_steps
+                if prediction_steps_actual <= 0:
+                    raise ValueError(
+                        f"Latent trajectory length ({T_prime}) too short for "
+                        f"traj_init_steps={traj_init_steps}. Need T' > traj_init_steps."
+                    )
+                n_windows_actual = 1
+                start_indices = torch.zeros(B, device=z_dyn.device, dtype=torch.long)
 
-        # Gather sub-windows from z_dyn: (N, jac_window_len, D_dyn)
-        z_windows_list = []
-        z_clean_windows_list = []
-        for idx in range(start_indices.shape[0]):
-            b = idx // n_windows_actual
-            s = start_indices[idx]
-            z_windows_list.append(z_dyn[b, s:s + jac_window_len])
-            z_clean_windows_list.append(z_dyn_clean[b, s:s + jac_window_len])
-        z_windows = torch.stack(z_windows_list)  # (N, jac_window_len, D_dyn)
-        z_clean_windows = torch.stack(z_clean_windows_list)
+        # traj/2.window_gather continues — stack the sub-windows
+        with self._timed("traj/2b.window_stack"):
+            z_windows_list = []
+            z_clean_windows_list = []
+            for idx in range(start_indices.shape[0]):
+                b = idx // n_windows_actual
+                s = start_indices[idx]
+                z_windows_list.append(z_dyn[b, s:s + jac_window_len])
+                z_clean_windows_list.append(z_dyn_clean[b, s:s + jac_window_len])
+            z_windows = torch.stack(z_windows_list)  # (N, jac_window_len, D_dyn)
+            z_clean_windows = torch.stack(z_clean_windows_list)
 
         # 3. Run JacobianODEint on z_dyn sub-windows
-        jacobian_odeint = JacobianODEint(self.compute_jacobians, self.dt)
-        z_pred = jacobian_odeint.generate_dynamics(
-            z_windows,
-            alpha_teacher_forcing=alpha_teacher_forcing,
-            teacher_forcing_steps=teacher_forcing_steps,
-            fast_mode=True,
-            scale_interp_pts=True,
-            **{k: v for k, v in jacobianODEint_kwargs.items()
-               if k != 'traj_init_steps'},
-            traj_init_steps=traj_init_steps,
-        )  # (N, jac_window_len, D_dyn)
+        with self._timed("traj/3.jacobianODEint"):
+            jacobian_odeint = JacobianODEint(self.compute_jacobians, self.dt)
+            z_pred = jacobian_odeint.generate_dynamics(
+                z_windows,
+                alpha_teacher_forcing=alpha_teacher_forcing,
+                teacher_forcing_steps=teacher_forcing_steps,
+                fast_mode=True,
+                scale_interp_pts=True,
+                **{k: v for k, v in jacobianODEint_kwargs.items()
+                   if k != 'traj_init_steps'},
+                traj_init_steps=traj_init_steps,
+            )  # (N, jac_window_len, D_dyn)
 
-        # 4. Crop to prediction portion (use clean targets for latent loss)
-        z_pred_crop = z_pred[..., traj_init_steps:, :]  # (N, prediction_steps, D_dyn)
-        z_true_crop = z_clean_windows[:, traj_init_steps:, :]
+        # 4 & 5. Crop, decode, extract obs targets, compute losses
+        with self._timed("traj/4.decode"):
+            z_pred_crop = z_pred[..., traj_init_steps:, :]  # (N, prediction_steps, D_dyn)
+            z_true_crop = z_clean_windows[:, traj_init_steps:, :]
+            z_pred_padded = self._pad_to_full_dim(z_pred_crop)
+            decoded_pred = self.decode_trajectory(z_pred_padded)
 
-        # 5. Pad z_dyn back to full dim, decode, and compare to obs targets
-        z_pred_padded = self._pad_to_full_dim(z_pred_crop)
-        decoded_pred = self.decode_trajectory(z_pred_padded)
-        # Window-based: (N, prediction_steps, w, D_obs)
-        # Sequence-based: (N, prediction_steps, D_obs)
+        with self._timed("traj/5.obs_targets"):
+            obs_targets = self._extract_obs_targets(
+                label, start_indices, n_windows_actual, traj_init_steps,
+                prediction_steps=prediction_steps_actual,
+            )  # same shape as decoded_pred
 
-        # Build observation-space targets from the original (clean) batch
-        obs_targets = self._extract_obs_targets(
-            label, start_indices, n_windows_actual, traj_init_steps,
-            prediction_steps=prediction_steps_actual,
-        )  # same shape as decoded_pred
+        with self._timed("traj/6.loss_and_metrics"):
+            # Observation-space loss with reconstruction_mode weighting
+            loss = self._weighted_obs_loss(obs_targets, decoded_pred)
 
-        # Observation-space loss with reconstruction_mode weighting
-        loss = self._weighted_obs_loss(obs_targets, decoded_pred)
-
-        # Metrics — when most_recent mode, evaluate on index 0 only so
-        # that the unsupervised chaotic tail doesn't corrupt diagnostics.
-        metric_vals = {}
-        if self.reconstruction_mode == 'most_recent':
-            d = self._n_recent_dims
-            if d is not None:
-                obs_for_metrics = obs_targets[..., :d]
-                dec_for_metrics = decoded_pred[..., :d]
+            # Metrics — when most_recent mode, evaluate on index 0 only so
+            # that the unsupervised chaotic tail doesn't corrupt diagnostics.
+            metric_vals = {}
+            if self.reconstruction_mode == 'most_recent':
+                d = self._n_recent_dims
+                if d is not None:
+                    obs_for_metrics = obs_targets[..., :d]
+                    dec_for_metrics = decoded_pred[..., :d]
+                else:
+                    obs_for_metrics = obs_targets
+                    dec_for_metrics = decoded_pred
             else:
                 obs_for_metrics = obs_targets
                 dec_for_metrics = decoded_pred
-        else:
-            obs_for_metrics = obs_targets
-            dec_for_metrics = decoded_pred
 
-        with torch.no_grad():
-            # Flatten window dims for scalar metrics: (N, T, w, D) → (N, T, w*D)
-            obs_m = obs_for_metrics.reshape(obs_for_metrics.shape[0], obs_for_metrics.shape[1], -1) if obs_for_metrics.dim() > 3 else obs_for_metrics
-            dec_m = dec_for_metrics.reshape(dec_for_metrics.shape[0], dec_for_metrics.shape[1], -1) if dec_for_metrics.dim() > 3 else dec_for_metrics
-            metric_vals['mase'] = mase(obs_m, dec_m)
-            # Store raw MAE components so callers can aggregate correctly
-            # (ratio-of-means instead of mean-of-ratios).
-            metric_vals['model_mae'] = torch.mean(torch.abs(obs_m - dec_m))
-            if obs_m.dim() == 3:
-                metric_vals['persistence_mae'] = torch.mean(
-                    torch.abs(obs_m[:, 1:] - obs_m[:, :-1]))
-            else:
-                metric_vals['persistence_mae'] = torch.mean(
-                    torch.abs(obs_m[1:] - obs_m[:-1]))
-            pred_flat = dec_m.reshape(dec_m.shape[0], -1)
-            tgt_flat = obs_m.reshape(obs_m.shape[0], -1)
-            metric_vals['r2_score'] = r2_score(tgt_flat, pred_flat)
+            with torch.no_grad():
+                # Flatten window dims for scalar metrics: (N, T, w, D) → (N, T, w*D)
+                obs_m = obs_for_metrics.reshape(obs_for_metrics.shape[0], obs_for_metrics.shape[1], -1) if obs_for_metrics.dim() > 3 else obs_for_metrics
+                dec_m = dec_for_metrics.reshape(dec_for_metrics.shape[0], dec_for_metrics.shape[1], -1) if dec_for_metrics.dim() > 3 else dec_for_metrics
+                metric_vals['mase'] = mase(obs_m, dec_m)
+                # Store raw MAE components so callers can aggregate correctly
+                # (ratio-of-means instead of mean-of-ratios).
+                metric_vals['model_mae'] = torch.mean(torch.abs(obs_m - dec_m))
+                if obs_m.dim() == 3:
+                    metric_vals['persistence_mae'] = torch.mean(
+                        torch.abs(obs_m[:, 1:] - obs_m[:, :-1]))
+                else:
+                    metric_vals['persistence_mae'] = torch.mean(
+                        torch.abs(obs_m[1:] - obs_m[:-1]))
+                pred_flat = dec_m.reshape(dec_m.shape[0], -1)
+                tgt_flat = obs_m.reshape(obs_m.shape[0], -1)
+                metric_vals['r2_score'] = r2_score(tgt_flat, pred_flat)
 
-        # Latent prediction loss in z_dyn space (computed outside no_grad so
-        # gradients flow back through the encoder).
-        latent_pred_loss = normalized_mse(z_true_crop, z_pred_crop)
-        metric_vals['latent_pred_loss'] = latent_pred_loss
-        with torch.no_grad():
-            z_pred_flat = z_pred_crop.reshape(z_pred_crop.shape[0], -1)
-            z_true_flat = z_true_crop.reshape(z_true_crop.shape[0], -1)
-            metric_vals['latent_pred_r2'] = r2_score(z_true_flat, z_pred_flat)
+            # Latent prediction loss in z_dyn space (computed outside no_grad so
+            # gradients flow back through the encoder).
+            latent_pred_loss = normalized_mse(z_true_crop, z_pred_crop)
+            metric_vals['latent_pred_loss'] = latent_pred_loss
+            with torch.no_grad():
+                z_pred_flat = z_pred_crop.reshape(z_pred_crop.shape[0], -1)
+                z_true_flat = z_true_crop.reshape(z_true_crop.shape[0], -1)
+                metric_vals['latent_pred_r2'] = r2_score(z_true_flat, z_pred_flat)
 
         if return_decoded:
             return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
@@ -1060,37 +1149,39 @@ class LitLatentJacobianODE(LitBase):
         batch = batch.type(self.dtype)
 
         # Encode for teacher forcing update (use z_dyn for Jacobians)
-        with torch.no_grad():
-            z_for_tf = self.encode_trajectory(batch)
-            z_for_tf_dyn, _ = self._split_latent(z_for_tf)
-            jacs_pred = self.compute_jacobians(z_for_tf_dyn)
-
-        jac_norm = torch.linalg.norm(
-            jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord
-        ).mean()
-        self.update_alpha_teacher_forcing(jacs_pred.detach(), batch_idx)
+        with self._timed("train/1.encode_tf+compute_jacs"):
+            with torch.no_grad():
+                z_for_tf = self.encode_trajectory(batch)
+                z_for_tf_dyn, _ = self._split_latent(z_for_tf)
+                jacs_pred = self.compute_jacobians(z_for_tf_dyn)
+            jac_norm = torch.linalg.norm(
+                jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord
+            ).mean()
+            self.update_alpha_teacher_forcing(jacs_pred.detach(), batch_idx)
 
         train_rets = {}
 
         # Trajectory prediction loss
-        if self.trajectory_training:
-            train_rets['trajectory'] = self.trajectory_model_step(
-                batch, batch_idx, dataloader_idx
-            )
+        with self._timed("train/2.trajectory_step"):
+            if self.trajectory_training:
+                train_rets['trajectory'] = self.trajectory_model_step(
+                    batch, batch_idx, dataloader_idx
+                )
 
         # Encode once for loop closure, reconstruction, and regularizers
-        z_full = self.encode_trajectory(batch)
-        mu_dyn, z_null = self._split_latent(z_full)
-        z_dyn_sampled, log_var = self._vae_reparameterize(mu_dyn)
-
-        # Choose which z_dyn downstream losses see
-        z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
+        with self._timed("train/3.encode_recon"):
+            z_full = self.encode_trajectory(batch)
+            mu_dyn, z_null = self._split_latent(z_full)
+            z_dyn_sampled, log_var = self._vae_reparameterize(mu_dyn)
+            # Choose which z_dyn downstream losses see
+            z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
 
         # Loop closure in latent space (operates on z_dyn)
-        if self.loop_closure_training:
-            train_rets['loop_closure'] = self.loop_closure_model_step(
-                z_dyn, batch_idx, dataloader_idx
-            )
+        with self._timed("train/4.loop_closure"):
+            if self.loop_closure_training:
+                train_rets['loop_closure'] = self.loop_closure_model_step(
+                    z_dyn, batch_idx, dataloader_idx
+                )
 
         # ----------------------------------------------------------------
         # Compute per-group losses
@@ -1109,15 +1200,15 @@ class LitLatentJacobianODE(LitBase):
                 r2_loss = r2_loss + traj_loss
 
         # Reconstruction loss: decode(encode(x)) ≈ x in observation space
-        # When VAE is active, reconstruction uses sampled z_dyn
         recon_loss = None
-        if self.reconstruction_loss_weight > 0:
-            if self.use_vae and z_null is not None:
-                z_full_for_recon = torch.cat([z_dyn_sampled, z_null], dim=-1)
-            else:
-                z_full_for_recon = z_full
-            recon_loss = self._reconstruction_loss(batch, z_full=z_full_for_recon)
-            r2_loss = r2_loss + self.reconstruction_loss_weight * recon_loss
+        with self._timed("train/5.reconstruction_loss"):
+            if self.reconstruction_loss_weight > 0:
+                if self.use_vae and z_null is not None:
+                    z_full_for_recon = torch.cat([z_dyn_sampled, z_null], dim=-1)
+                else:
+                    z_full_for_recon = z_full
+                recon_loss = self._reconstruction_loss(batch, z_full=z_full_for_recon)
+                r2_loss = r2_loss + self.reconstruction_loss_weight * recon_loss
 
         # Latent prediction loss: JacobianODE(z_t) ≈ z_{t+k} in latent space
         latent_pred_loss = None
@@ -1139,26 +1230,25 @@ class LitLatentJacobianODE(LitBase):
                 loop_loss = lc
 
         # --- Group 3: FNN regularization (on z_dyn) ---
-        # Penalize false nearest neighbors in latent space to encourage a
-        # geometrically well-structured embedding (Gilpin NeurIPS 2020 / Kennel 1992).
         fnn_loss = None
-        if self.fnn_weight > 0 or self.learn_fnn_weight:
-            z_flat = z_dyn.reshape(-1, z_dyn.shape[-1])
-            fnn_loss = loss_false(
-                z_flat,
-                normalize=self.fnn_normalize,
-                elementwise_regularization=self.fnn_elementwise_regularization,
-                use_pca=self.fnn_use_pca,
-                n_samples=self.fnn_n_samples,
-            )
+        with self._timed("train/6.fnn_loss"):
+            if self.fnn_weight > 0 or self.learn_fnn_weight:
+                z_flat = z_dyn.reshape(-1, z_dyn.shape[-1])
+                fnn_loss = loss_false(
+                    z_flat,
+                    normalize=self.fnn_normalize,
+                    elementwise_regularization=self.fnn_elementwise_regularization,
+                    use_pca=self.fnn_use_pca,
+                    n_samples=self.fnn_n_samples,
+                )
 
         # --- Group 4: Jac-consistency (on z_dyn) ---
-        # ||e^{J dt}(z_{t+1}-z_t) - (z_{t+2}-z_{t+1})||^2 / var(z)
         jac_cons_loss = None
         jacs_for_cons = None
-        if self.jac_consistency_weight > 0 or self.learn_jac_cons_weight:
-            jacs_for_cons = self.compute_jacobians(z_dyn)
-            jac_cons_loss = self._jac_consistency_loss(z_dyn, jacs_for_cons)
+        with self._timed("train/7.jac_consistency"):
+            if self.jac_consistency_weight > 0 or self.learn_jac_cons_weight:
+                jacs_for_cons = self.compute_jacobians(z_dyn)
+                jac_cons_loss = self._jac_consistency_loss(z_dyn, jacs_for_cons)
 
         # --- Group 5: Jac norm/penalty ---
         # (jac_norm is already computed above for teacher-forcing; reused here)
@@ -1179,8 +1269,9 @@ class LitLatentJacobianODE(LitBase):
 
         # --- Group 7: Tangent space entropy (encoder Jacobians via autograd) ---
         tangent_entropy_loss = None
-        if self.tangent_entropy_weight > 0:
-            tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
+        with self._timed("train/8.tangent_entropy"):
+            if self.tangent_entropy_weight > 0:
+                tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
 
         # ----------------------------------------------------------------
         # Auto-initialise log_var parameters on the very first batch
@@ -1268,6 +1359,7 @@ class LitLatentJacobianODE(LitBase):
                 prog_bar=True,
             )
 
+        self._maybe_emit_profile("train")
         return total_loss
 
     # ------------------------------------------------------------------
@@ -1291,24 +1383,28 @@ class LitLatentJacobianODE(LitBase):
         }
 
         val_rets = {}
-        val_rets['trajectory'] = self.trajectory_model_step(
-            batch, batch_idx, dataloader_idx, **model_step_kwargs
-        )
+        with self._timed("val/1.trajectory_step"):
+            val_rets['trajectory'] = self.trajectory_model_step(
+                batch, batch_idx, dataloader_idx, **model_step_kwargs
+            )
 
         # Encode once for loop closure, reconstruction, and diagnostics
-        z_full = self.encode_trajectory(batch)
-        mu_dyn, z_null = self._split_latent(z_full)
-        z_dyn, log_var = self._vae_reparameterize(mu_dyn)  # deterministic in eval
+        with self._timed("val/2.encode"):
+            z_full = self.encode_trajectory(batch)
+            mu_dyn, z_null = self._split_latent(z_full)
+            z_dyn, log_var = self._vae_reparameterize(mu_dyn)  # deterministic in eval
 
-        val_loop_closure = self.loop_closure_model_step(
-            z_dyn, batch_idx, dataloader_idx
-        )
+        with self._timed("val/3.loop_closure"):
+            val_loop_closure = self.loop_closure_model_step(
+                z_dyn, batch_idx, dataloader_idx
+            )
 
         # Reconstruction loss
         val_recon_loss = None
-        if self.reconstruction_loss_weight > 0:
-            with torch.no_grad():
-                val_recon_loss = self._reconstruction_loss(batch, z_full=z_full)
+        with self._timed("val/4.reconstruction_loss"):
+            if self.reconstruction_loss_weight > 0:
+                with torch.no_grad():
+                    val_recon_loss = self._reconstruction_loss(batch, z_full=z_full)
 
         # KL divergence / null penalty
         val_kl_null_loss = None
@@ -1328,13 +1424,14 @@ class LitLatentJacobianODE(LitBase):
         val_latent_pred_loss = val_rets['trajectory']['metric_vals'].get('latent_pred_loss')
 
         # One-step teacher-forced prediction (for MASE diagnostic, C1)
-        with torch.no_grad():
-            one_step_ret = self.trajectory_model_step(
-                batch, batch_idx, dataloader_idx,
-                alpha_teacher_forcing=1,
-                obs_noise_scale=0,
-                latent_noise_scale=0,
-            )
+        with self._timed("val/5.one_step_traj"):
+            with torch.no_grad():
+                one_step_ret = self.trajectory_model_step(
+                    batch, batch_idx, dataloader_idx,
+                    alpha_teacher_forcing=1,
+                    obs_noise_scale=0,
+                    latent_noise_scale=0,
+                )
         # Accumulate raw MAE components for ratio-of-means aggregation
         if not hasattr(self, '_val_one_step_model_maes'):
             self._val_one_step_model_maes = []
@@ -1347,30 +1444,37 @@ class LitLatentJacobianODE(LitBase):
         )
 
         # Fast eigenvalue fraction (C3 diagnostic)
-        with torch.no_grad():
-            pred_jacs = self.compute_jacobians(z_dyn)
-            eigs_real = torch.linalg.eigvals(pred_jacs).real.flatten()
-            threshold = -1.0 / self.dt
-            n_too_fast = torch.sum(eigs_real <= threshold).float().item()
-            n_total = len(eigs_real)
+        with self._timed("val/6.eigvals"):
+            with torch.no_grad():
+                pred_jacs = self.compute_jacobians(z_dyn)  # (B, T, D, D)
+                B, T, D, _ = pred_jacs.shape
+                jacs_flat = pred_jacs.reshape(B * T, D, D)
+                if self.n_eigval_jacobians is not None and self.n_eigval_jacobians < B * T:
+                    idx = torch.randperm(B * T, device=jacs_flat.device)[:self.n_eigval_jacobians]
+                    jacs_flat = jacs_flat[idx]
+                eigs_real = torch.linalg.eigvals(jacs_flat).real.flatten()
+                threshold = -1.0 / self.dt
+                n_too_fast = torch.sum(eigs_real <= threshold).float().item()
+                n_total = len(eigs_real)
         if not hasattr(self, '_val_eig_too_fast'):
             self._val_eig_too_fast = []
             self._val_eig_total = []
         self._val_eig_too_fast.append(n_too_fast)
         self._val_eig_total.append(n_total)
 
-        if log_metrics:
-            self.log_validation_metrics(
-                val_rets=val_rets,
-                batch=batch,
-                sync_dist=True,
-                val_loop_closure=val_loop_closure,
-                val_recon_loss=val_recon_loss,
-                val_latent_pred_loss=val_latent_pred_loss,
-                val_kl_null_loss=val_kl_null_loss,
-                val_kl_dyn_loss=val_kl_dyn_loss,
-                val_one_step_loss=one_step_ret['loss'],
-            )
+        with self._timed("val/7.log_metrics"):
+            if log_metrics:
+                self.log_validation_metrics(
+                    val_rets=val_rets,
+                    batch=batch,
+                    sync_dist=True,
+                    val_loop_closure=val_loop_closure,
+                    val_recon_loss=val_recon_loss,
+                    val_latent_pred_loss=val_latent_pred_loss,
+                    val_kl_null_loss=val_kl_null_loss,
+                    val_kl_dyn_loss=val_kl_dyn_loss,
+                    val_one_step_loss=one_step_ret['loss'],
+                )
 
         total_loss = sum(
             val_rets[pred_type]['loss'] for pred_type in val_rets
@@ -1388,6 +1492,7 @@ class LitLatentJacobianODE(LitBase):
             self.current_epoch_val_losses = []
         self.current_epoch_val_losses.append(mean_val_loss.item())
 
+        self._maybe_emit_profile("val")
         return total_loss
 
     # ------------------------------------------------------------------
