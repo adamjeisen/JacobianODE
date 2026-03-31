@@ -1,11 +1,3 @@
-# /// script
-# requires-python = ">=3.13"
-# dependencies = [
-#     "marimo>=0.21.1",
-#     "pyzmq>=27.1.0",
-# ]
-# ///
-
 import marimo
 
 __generated_with = "0.20.4"
@@ -14,11 +6,19 @@ app = marimo.App()
 
 @app.cell
 def _():
-    import marimo as mo
+    # magic command not supported in marimo; please file an issue to add support
+    # %load_ext autoreload
+    # '%autoreload 2' command supported automatically in marimo
+    return
+
+
+@app.cell
+def _():
     import matplotlib.pyplot as plt
     import numpy as np
     import os
     import torch
+    from tqdm.auto import tqdm
 
     from JacobianODE.jacobians import (
         load_config,
@@ -29,7 +29,6 @@ def _():
     )
     from JacobianODE.fnn import loss_amplification, loss_false
     from JacobianODE.jacobians.data import embed_signal_torch
-    from JacobianODE.plotting import marimo_figure
 
     return (
         embed_signal_torch,
@@ -37,14 +36,13 @@ def _():
         load_config,
         loss_amplification,
         make_trajectories,
-        marimo_figure,
-        mo,
         np,
         os,
         plt,
         postprocess_data,
         seed_everything,
         torch,
+        tqdm,
     )
 
 
@@ -88,14 +86,6 @@ def _(np):
         WMTASK_PROJECT,
         WMTASK_TRAJ_WINDOW,
     )
-
-
-@app.cell(hide_code=True)
-def _(mo):
-    mo.md(r"""
-    ## Testing out markdown
-    """)
-    return
 
 
 @app.cell
@@ -155,7 +145,13 @@ def _(
 
 
 @app.cell
-def _(DATA_SOURCE, embed_signal_torch, loss_amplification, mo, np, torch, x):
+def _(x):
+    x.shape
+    return
+
+
+@app.cell
+def _(DATA_SOURCE, embed_signal_torch, loss_amplification, np, torch, tqdm, x):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     amplification_losses = {}
     fnn_losses = {}
@@ -209,46 +205,42 @@ def _(DATA_SOURCE, embed_signal_torch, loss_amplification, mo, np, torch, x):
     if DATA_SOURCE == 'wmtask':
         N_DELAYS_VALS = np.arange(1, 16)
         INTERVAL_VALS = [1]
-        MAX_T = 30
+        MAX_T = 10
     else:
         N_DELAYS_VALS = np.arange(1, 101)
         INTERVAL_VALS = [1]
         MAX_T = 30
-    import itertools
-    combos = list(itertools.product(N_DELAYS_VALS, INTERVAL_VALS))
+    iterator = tqdm(total=len(N_DELAYS_VALS) * len(INTERVAL_VALS))
     x_prev = None
-    for _n_delays, _delay_interval in mo.status.progress_bar(combos):
-        if x.shape[1] - (_n_delays - 1) * _delay_interval <= 0:
-            print(f'Skipping n_delays={_n_delays}, delay_interval={_delay_interval} because x.shape[1] - (n_delays - 1) * delay_interval <= 0')
-            continue
-        x_embedded = embed_signal_torch(x, _n_delays, _delay_interval)
-        x_embedded = x_embedded.to(device)
-        x_data = x_embedded[..., :x.shape[-1]]
-        if x_embedded.shape[1] < x.shape[1] * 0.5:
-            print(f'Skipping n_delays={_n_delays}, delay_interval={_delay_interval} because x_embedded.shape[1] < x.shape[1]*(0.5)')
-            continue
-        _loss = loss_amplification(x_embedded, x_data.to(device), max_T=MAX_T, n_neighbors=10, normalize=True)
-        amplification_losses[_n_delays, _delay_interval] = _loss.item()
-        obs_dim = x.shape[-1]
-        x_test_flat = x_embedded.reshape(-1, x_embedded.shape[-1])
-        if _n_delays == 1:
-            fnn_losses[_n_delays, _delay_interval] = 1.0
-        else:
-            x_prev_flat = x_test_flat[:, obs_dim:]
-            fnn_losses[_n_delays, _delay_interval] = compute_fnn_metric(x_prev=x_prev_flat, x_test=x_test_flat, k=10, n_samples=4096)
+    for _n_delays in N_DELAYS_VALS:
+        for _delay_interval in INTERVAL_VALS:
+            if x.shape[1] - (_n_delays - 1) * _delay_interval <= 0:
+                print(f'Skipping n_delays={_n_delays}, delay_interval={_delay_interval} because x.shape[1] - (n_delays - 1) * delay_interval <= 0')
+                iterator.update(1)
+                continue
+            x_embedded = embed_signal_torch(x, _n_delays, _delay_interval)
+            x_embedded = x_embedded.to(device)
+            x_data = x_embedded[..., :x.shape[-1]]
+            if x_embedded.shape[1] < x.shape[1] * 0.5:
+                print(f'Skipping n_delays={_n_delays}, delay_interval={_delay_interval} because x_embedded.shape[1] < x.shape[1]*(0.5)')
+                iterator.update(1)
+                continue
+            _loss = loss_amplification(x_embedded, x_data.to(device), max_T=MAX_T, n_neighbors=10, normalize=True)
+            amplification_losses[_n_delays, _delay_interval] = _loss.item()
+            obs_dim = x.shape[-1]
+            x_test_flat = x_embedded.reshape(-1, x_embedded.shape[-1])
+            if _n_delays == 1:
+                fnn_losses[_n_delays, _delay_interval] = 1.0
+            else:
+                x_prev_flat = x_test_flat[:, obs_dim:]
+                fnn_losses[_n_delays, _delay_interval] = compute_fnn_metric(x_prev=x_prev_flat, x_test=x_test_flat, k=10, n_samples=4096)
+            iterator.update(1)
+    iterator.close()
     return INTERVAL_VALS, N_DELAYS_VALS, amplification_losses, fnn_losses
 
 
 @app.cell
-def _(
-    INTERVAL_VALS,
-    N_DELAYS_VALS,
-    amplification_losses,
-    fnn_losses,
-    marimo_figure,
-    np,
-    plt,
-):
+def _(INTERVAL_VALS, N_DELAYS_VALS, amplification_losses, fnn_losses, np, plt):
     from matplotlib.colors import LogNorm
     n_delays_max = max(N_DELAYS_VALS)
     _interval_max = max(INTERVAL_VALS)
@@ -258,7 +250,8 @@ def _(
         amplification_loss_matrix[_n_delays - 1, _delay_interval - 1] = float(_loss)
     for (_n_delays, _delay_interval), _loss in fnn_losses.items():
         fnn_loss_matrix[_n_delays - 1, _delay_interval - 1] = float(_loss)
-    cmap = plt.get_cmap('viridis').copy()
+    from matplotlib import cm
+    cmap = cm.get_cmap('viridis').copy()
     cmap.set_bad(color='white')
     non_nan_amp = np.isfinite(amplification_loss_matrix)
     if np.any(non_nan_amp):
@@ -292,27 +285,24 @@ def _(
     _axs[0].set_title('Amplification Losses\n(rows=n_delays, cols=delay_interval)\nLog color scale, missing=white')
     _axs[1].set_title('FNN Losses\n(rows=n_delays, cols=delay_interval)\nLog color scale (if positive), missing=white')
     plt.tight_layout()
-
-    marimo_figure(_fig, "heatmap")
+    plt.show()
     return amplification_loss_matrix, fnn_loss_matrix
 
 
 @app.cell
-def _(amplification_loss_matrix, fnn_loss_matrix, marimo_figure, plt):
-    _fig, _ax = plt.subplots()
-    _ax.plot(amplification_loss_matrix)
-    _ax.set_ylabel('Amplification Loss')
-    _ax.set_xlabel('# Delays')
-    _ax.set_yscale('log')
-    ax2 = _ax.twinx()
+def _(amplification_loss_matrix, fnn_loss_matrix, plt):
+    plt.plot(amplification_loss_matrix)
+    plt.ylabel('Amplification Loss')
+    plt.xlabel('# Delays')
+    plt.yscale('log')
+    ax2 = plt.gca().twinx()
     ax2.plot(fnn_loss_matrix, c="C1")
     ax2.set_ylabel('FNN Loss')
-    marimo_figure(_fig, "dual_axis")
     return
 
 
 @app.cell
-def _(amplification_loss_matrix, fnn_loss_matrix, marimo_figure, np, plt):
+def _(amplification_loss_matrix, fnn_loss_matrix, np, plt):
     # Color the scatter plot by delay number (y-axis index) AND by delay interval (x-axis index)
     _n_delays, _interval_max = amplification_loss_matrix.shape
     _delay_numbers = np.arange(1, _n_delays + 1)
@@ -335,7 +325,8 @@ def _(amplification_loss_matrix, fnn_loss_matrix, marimo_figure, np, plt):
     _axs[0].set_title('Colored by Delay Number (row in matrix)')
     _axs[1].set_title('Colored by Delay Interval (column in matrix)')
     # RIGHT: colored by delay interval
-    marimo_figure(_fig, "scatter_delays")
+    # build 2D colors for each point:
+    plt.show()
     return
 
 
@@ -414,24 +405,18 @@ def _(amp_scores, fnn_scores, np):
 
 
 @app.cell
-def _(
-    amplification_loss_matrix,
-    fnn_loss_matrix,
-    marimo_figure,
-    np,
-    optimal_idx,
-    plt,
-):
+def _(amplification_loss_matrix, fnn_loss_matrix, np, optimal_idx, plt):
     # Color the scatter plot by delay number (y-axis index)
     _n_delays = amplification_loss_matrix.shape[0]
     _delay_numbers = np.arange(1, _n_delays + 1)
-    _fig, _ax = plt.subplots()
-    sc = _ax.scatter(amplification_loss_matrix.flatten(), fnn_loss_matrix.flatten(), c=np.repeat(_delay_numbers, amplification_loss_matrix.shape[1]), cmap='viridis', alpha=0.8)
-    _ax.set_xlabel('Amplification Loss')
-    _ax.set_ylabel('FNN Loss')
-    _ax.scatter(amplification_loss_matrix[optimal_idx], fnn_loss_matrix[optimal_idx], c='magenta', s=100)
-    plt.colorbar(sc, ax=_ax, label='Delay Number')
-    marimo_figure(_fig, "scatter_optimal")
+    colors = _delay_numbers[:, None] * np.ones_like(amplification_loss_matrix)
+    plt.scatter(amplification_loss_matrix.flatten(), fnn_loss_matrix.flatten(), c=np.repeat(_delay_numbers, amplification_loss_matrix.shape[1]), cmap='viridis', alpha=0.8)
+    plt.xlabel('Amplification Loss')
+    plt.ylabel('FNN Loss')
+    plt.scatter(amplification_loss_matrix[optimal_idx], fnn_loss_matrix[optimal_idx], c='magenta', s=100)
+    cbar = plt.colorbar(label='Delay Number')
+    # plt.xscale('log')
+    plt.show()
     return
 
 
@@ -489,7 +474,6 @@ def _(
     best_amp_x_embedded_delay1,
     best_fnn_x_embedded,
     embed_signal_torch,
-    marimo_figure,
     np,
     optimal_idx,
     plt,
@@ -587,7 +571,7 @@ def _(
         else:
             axs_scree[i].set_visible(False)
     plt.tight_layout()
-    marimo_figure(fig_scree, "scree")
+    plt.show()
     return amp_emb_pca, amp_emb_pca_delay1, fnn_emb_pca, opt_emb_pca
 
 
@@ -596,7 +580,6 @@ def _(
     amp_emb_pca,
     amp_emb_pca_delay1,
     fnn_emb_pca,
-    marimo_figure,
     np,
     opt_emb_pca,
     plt,
@@ -667,7 +650,7 @@ def _(
     # 5. Optimal (auto_optimal_delay) embedding PCA (if available)
         _axs[4].set_title('No Optimal Embedding')
     plt.tight_layout()
-    marimo_figure(_fig, "pca")
+    plt.show()
     return
 
 

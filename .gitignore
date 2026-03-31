@@ -11,7 +11,12 @@ _jupyter/*.pdf
 _jupyter/*.html
 _jupyter/_sandbox/*.html
 _jupyter/reports/
+_marimo/reports/
+_marimo/example_data/
+_marimo/_sandbox/dysts_data/
+_marimo/_sandbox/example_data/
 .vscode/
+_marimo/__marimo__/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
