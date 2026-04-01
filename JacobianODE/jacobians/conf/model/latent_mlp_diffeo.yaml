@@ -1,0 +1,44 @@
+# Dimension-preserving MLP encoder with soft diffeomorphism penalty.
+#
+# Unlike CouplingEncoder (exact bijection), this uses standard MLPs for
+# both encoder and decoder, with a cycle-consistency loss that encourages
+# approximate invertibility:
+#   diffeomorphism_weight * [normalized_mse(x, D(E(x))) + normalized_mse(z, E(D(z)))]
+#
+# Combined with n_target_dims / kl_null_weight subspace splitting, this
+# provides the same z_dyn / z_null structure as coupling-flow configs but
+# with a more flexible (and faster-to-train) encoder.
+
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_target_dims, set at runtime
+  hidden_dim: [256, 1024, 2048, 2048]
+  num_layers: 4
+  output_dim: null   # = n_target_dims^2, set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.sequence_networks.build_mlp
+  n_input: null       # set at runtime (= n_delays * len(observed_indices))
+  n_latent: null      # null = dimension-preserving (resolved to n_input at runtime)
+  hidden_dim: 256
+  n_layers: 3
+  dropout: 0.1
+  decoder_hidden: 256
+  decoder_layers: 3
+  decoder_n_output: null  # null = decode full delay embedding (needed for diffeomorphism loss)
+  context_margin: 0
+
+n_target_dims: 3           # dynamic subspace dimensionality
+kl_null_weight: null        # null-space MSE penalty (null = same as kl_dyn_weight)
+kl_dyn_weight: 0.0         # dynamic subspace KL divergence
+use_vae: true
+vae_sample_all_losses: false
+kl_warmup_epochs: 0
+prediction_steps: 30
+encoder_warmup_epochs: 5
+dynamics_warmup_epochs: 0
+jac_window_stride: null
+decode_only_recent: false

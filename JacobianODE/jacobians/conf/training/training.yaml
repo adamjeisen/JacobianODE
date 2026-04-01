@@ -76,6 +76,11 @@ lightning:
   tangent_entropy_mode: 'quadratic'   # 'shannon' | 'quadratic' | 'renyi_half'
   tangent_entropy_n_samples: 256
 
+  # -----------------
+  # DIFFEOMORPHISM CYCLE-CONSISTENCY (for non-bijective encoders)
+  # -----------------
+  diffeomorphism_weight: 0.0  # soft penalty on E∘D ≈ id and D∘E ≈ id
+
   # Number of B×T Jacobian matrices to randomly sample for eigenvalue
   # computation during validation. Reduces val cost when B*T is large.
   # Set to null to use all B*T matrices.

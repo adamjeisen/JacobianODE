@@ -281,6 +281,9 @@ def initialize_config(
         OmegaConf.update(cfg, "model.n_recent_dims", n_recent_dims, force_add=True)
         # n_latent: explicit in config for standard encoders, equals n_input
         # for dimension-preserving encoders (e.g. AffineCouplingEncoder).
+        # null → dimension-preserving (resolve to n_input).
+        if "n_latent" in cfg.model.encoder and cfg.model.encoder.n_latent is None:
+            cfg.model.encoder.n_latent = dim
         n_latent = cfg.model.encoder.get("n_latent", dim)
         # For dimension-preserving encoders with subspace splitting,
         # the MLP Jacobian model operates on n_target_dims, not n_latent.
