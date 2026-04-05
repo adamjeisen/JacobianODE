@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.21.1"
+__generated_with = "0.22.0"
 app = marimo.App()
 
 
@@ -9,14 +9,6 @@ def _():
     import marimo as mo
 
     return (mo,)
-
-
-@app.cell
-def _():
-    # magic command not supported in marimo; please file an issue to add support
-    # %load_ext autoreload
-    # '%autoreload 2' command supported automatically in marimo
-    return
 
 
 @app.cell
@@ -48,8 +40,13 @@ def _():
     # WANDB_PROJECT = "WMTask_INDall_N1_D1_NormTrue_T17__spline_coupling__JacobianODE"
     # WANDB_GROUP = None
 
-    WANDB_PROJECT = "WMTask_IND1926273140555669819498104_N10_D1_NormTrue_T10__spline_coupling__JacobianODE"
-    WANDB_GROUP = None
+    # WANDB_PROJECT = "WMTask_IND1926273140555669819498104_N10_D1_NormTrue_T10__spline_coupling__JacobianODE"
+    # WANDB_GROUP = None
+
+    WANDB_PROJECT = "WMTask_INDall_N1_D1_NormTrue_T128__JacobianODE"
+    # WANDB_GROUP = None
+    # WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_vae_sample_all_losses"
+    WANDB_GROUP = "mlp_diffeo__sweep_lc_x_kl_dyn_vae_sample_all_losses"
 
     SAVE_DIR = "/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs"
     # TRUE_LYAPUNOV = [0.91, 0.0, -14.57]  # None for wmtask (overridden from config)a\
@@ -66,21 +63,23 @@ def _(
     WANDB_PROJECT,
     run_analytics,
 ):
-    _result, lit_model, run_id = run_analytics(wandb_entity=WANDB_ENTITY, wandb_project=WANDB_PROJECT, run_id='71dtnbjq', save_dir=SAVE_DIR, wandb_group=WANDB_GROUP, true_lyapunov=TRUE_LYAPUNOV, lyapunov_burn_in_steps=1000, lyapunov_burn_in_drop=200, output=['show', 'html'], output_dir='reports', return_model=True)  # output=["show"],
-    return
-
-
-@app.cell
-def _(
-    SAVE_DIR,
-    TRUE_LYAPUNOV,
-    WANDB_ENTITY,
-    WANDB_GROUP,
-    WANDB_PROJECT,
-    run_analytics,
-):
-    _result, lit_model_1, run_id_1 = run_analytics(wandb_entity=WANDB_ENTITY, wandb_project=WANDB_PROJECT, save_dir=SAVE_DIR, wandb_group=WANDB_GROUP, true_lyapunov=TRUE_LYAPUNOV, output=['show', 'html'], output_dir='reports', return_model=True)
-    return lit_model_1, run_id_1
+    # Implementation is typed as dict | tuple | None; marimo/pyright need a runtime
+    # narrow before unpacking when return_model=True (always a 3-tuple then).
+    _analytics_out = run_analytics(
+        wandb_entity=WANDB_ENTITY,
+        wandb_project=WANDB_PROJECT,
+        save_dir=SAVE_DIR,
+        wandb_group=WANDB_GROUP,
+        true_lyapunov=TRUE_LYAPUNOV,
+        lyapunov_burn_in_steps=1000,
+        lyapunov_burn_in_drop=200,
+        output=['html'],
+        output_dir='reports',
+        return_model=True,
+    )
+    assert isinstance(_analytics_out, tuple) and len(_analytics_out) == 3
+    _result, lit_model, run_id = _analytics_out
+    return lit_model, run_id
 
 
 @app.cell(hide_code=True)
@@ -92,27 +91,20 @@ def _(mo):
 
 
 @app.cell
-def _(
-    SAVE_DIR,
-    TRUE_LYAPUNOV,
-    WANDB_ENTITY,
-    WANDB_PROJECT,
-    lit_model_1,
-    run_id_1,
-):
+def _(SAVE_DIR, TRUE_LYAPUNOV, WANDB_ENTITY, WANDB_PROJECT, lit_model, run_id):
     import torch
     from JacobianODE.jacobians import load_run, create_dataloaders, load_checkpoint
     wandb_project_path = f'{WANDB_ENTITY}/{WANDB_PROJECT}'
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    run, cfg, eq, dt, values, _, _, _, _, _ = load_run(wandb_project_path, run_id=run_id_1, save_dir=SAVE_DIR, generate_data=True, verbose=True)
+    run, cfg, eq, dt, values, _, _, _, _, _ = load_run(wandb_project_path, run_id=run_id, save_dir=SAVE_DIR, generate_data=True, verbose=True)
     train_dl, val_dl, test_dl, trajs = create_dataloaders(cfg, values, verbose=True, return_full_obs=True)
     # Load run config, equation, data, and model scaffold
-    load_checkpoint(run, cfg, lit_model_1, save_dir=SAVE_DIR, verbose=True)
+    load_checkpoint(run, cfg, lit_model, save_dir=SAVE_DIR, verbose=True)
     if TRUE_LYAPUNOV is not None:
-        lit_model_1.true_lyapunov_exponents = torch.tensor(TRUE_LYAPUNOV, dtype=torch.float32)
-    lit_model_2 = lit_model_1.to(device)
+        lit_model.true_lyapunov_exponents = torch.tensor(TRUE_LYAPUNOV, dtype=torch.float32)
+    lit_model_2 = lit_model.to(device)
     lit_model_2.eval()
-    print(f'\nrun_id: {run_id_1}')
+    print(f'\nrun_id: {run_id}')
     print(f'device: {device}')
     print(f'cfg.model: {(cfg.model._target_ if hasattr(cfg.model, '_target_') else type(cfg.model))}')
     # Create dataloaders (with full obs for analysis)

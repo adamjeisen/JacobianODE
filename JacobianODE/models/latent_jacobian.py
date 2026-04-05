@@ -1129,10 +1129,10 @@ class LitLatentJacobianODE(LitBase):
             tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
             loss = loss + self.tangent_entropy_weight * tangent_entropy_loss
 
-        # Diffeomorphism cycle-consistency (uses full z, not split/padded)
+        # Diffeomorphism cycle-consistency (uses sampled z when VAE is active)
         diffeo_loss = None
         if self.diffeomorphism_weight > 0:
-            diffeo_loss = self._diffeomorphism_loss(batch, z_full)
+            diffeo_loss = self._diffeomorphism_loss(batch, z_full_for_recon)
             loss = loss + self.diffeomorphism_weight * diffeo_loss
 
         log_kwargs = dict(on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
@@ -1258,14 +1258,16 @@ class LitLatentJacobianODE(LitBase):
             else:
                 r2_loss = r2_loss + traj_loss
 
+        # Build z_full with sampled z_dyn for reconstruction & diffeomorphism
+        if self.use_vae and z_null is not None:
+            z_full_for_recon = torch.cat([z_dyn_sampled, z_null], dim=-1)
+        else:
+            z_full_for_recon = z_full
+
         # Reconstruction loss: decode(encode(x)) ≈ x in observation space
         recon_loss = None
         with self._timed("train/5.reconstruction_loss"):
             if self.reconstruction_loss_weight > 0:
-                if self.use_vae and z_null is not None:
-                    z_full_for_recon = torch.cat([z_dyn_sampled, z_null], dim=-1)
-                else:
-                    z_full_for_recon = z_full
                 recon_loss = self._reconstruction_loss(batch, z_full=z_full_for_recon)
                 r2_loss = r2_loss + self.reconstruction_loss_weight * recon_loss
 
@@ -1336,7 +1338,7 @@ class LitLatentJacobianODE(LitBase):
         diffeo_loss = None
         with self._timed("train/9.diffeomorphism"):
             if self.diffeomorphism_weight > 0:
-                diffeo_loss = self._diffeomorphism_loss(batch, z_full)
+                diffeo_loss = self._diffeomorphism_loss(batch, z_full_for_recon)
 
         # ----------------------------------------------------------------
         # Auto-initialise log_var parameters on the very first batch

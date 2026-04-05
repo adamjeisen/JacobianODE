@@ -65,7 +65,7 @@ import math
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -146,9 +146,12 @@ def _z_dyn(z: torch.Tensor, n_target_dims: int | None) -> torch.Tensor:
 
 
 def _z_null(z: torch.Tensor, n_target_dims: int | None) -> torch.Tensor | None:
-    if n_target_dims is not None:
-        return z[..., n_target_dims:]
-    return None
+    """Return the null (non-dynamics) latent slice, or ``None`` if there is no null subspace."""
+    if n_target_dims is None:
+        return None
+    if n_target_dims >= z.shape[-1]:
+        return None
+    return z[..., n_target_dims:]
 
 
 def _save_or_show(fig: plt.Figure, name: str, output: list[str],
@@ -270,7 +273,9 @@ def plot_reconstruction(
 
     title = f"True vs. Decoded (no prediction)\n$R^2 = {r2_val:.4f}$,  recon nMSE = {recon_nmse:.6f}"
     if is_coupling and inv_err is not None:
-        title += f"\nInverse consistency MSE = {inv_err:.2e},  null RMS = {null_rms:.2e}"
+        title += f"\nInverse consistency MSE = {inv_err:.2e}"
+        if null_rms is not None:
+            title += f",  null RMS = {null_rms:.2e}"
     ax.set_title(title)
     ax.legend(fontsize=7, ncol=4)
     plt.tight_layout()
@@ -331,32 +336,22 @@ def plot_latent_utilization(
     return fig
 
 
-def plot_lyapunov_spectrum(
+def _plot_lyapunov_bars(
+    ax: plt.Axes,
+    n_lyaps: int,
     pred_np: np.ndarray,
     pred_std_np: np.ndarray,
-    emp_np: np.ndarray | None = None,
-    emp_std_np: np.ndarray | None = None,
-    true_lyapunov: list[float] | None = None,
-    loop_closure_weight: float | None = None,
-    full_lyap_np: np.ndarray | None = None,
-    full_lyap_std_np: np.ndarray | None = None,
-) -> plt.Figure:
-    """Bar chart of predicted vs empirical vs literature Lyapunov spectrum.
-
-    ``pred_np`` / ``pred_std_np`` are the batch+burn-in estimates.
-    ``full_lyap_np`` / ``full_lyap_std_np`` are the full-trajectory estimates.
-    """
-    n_lyaps = len(pred_np)
-    if full_lyap_np is not None and len(full_lyap_np) > 0:
-        n_lyaps = min(n_lyaps, len(full_lyap_np))
-    if emp_np is not None and len(emp_np) > 0:
-        n_lyaps = min(n_lyaps, len(emp_np))
-    if true_lyapunov is not None:
-        n_lyaps = min(n_lyaps, 10)  # cap for readability
-
+    emp_np: np.ndarray | None,
+    emp_std_np: np.ndarray | None,
+    true_lyapunov: list[float] | None,
+    full_lyap_np: np.ndarray | None,
+    full_lyap_std_np: np.ndarray | None,
+    loop_closure_weight: float | None,
+    title_suffix: str = "",
+) -> None:
+    """Draw grouped Lyapunov bar chart on *ax* for exponent indices 0..n_lyaps-1."""
     x_idx = np.arange(n_lyaps)
 
-    # Dynamic bar width so bars don't overlap regardless of how many groups we have
     n_groups = sum([
         1,  # batch+burn-in always present
         full_lyap_np is not None and len(full_lyap_np) > 0,
@@ -367,7 +362,6 @@ def plot_lyapunov_spectrum(
     offsets = np.linspace(-(n_groups - 1) / 2, (n_groups - 1) / 2, n_groups) * bar_w
 
     bar_idx = 0
-    fig, ax = plt.subplots(figsize=(10, 4))
     ax.bar(x_idx + offsets[bar_idx], pred_np[:n_lyaps], width=bar_w,
            yerr=pred_std_np[:n_lyaps], capsize=3, label="Predicted (batch + burn-in)", alpha=0.8)
     bar_idx += 1
@@ -393,12 +387,59 @@ def plot_lyapunov_spectrum(
     ax.set_xlabel("Exponent index")
     ax.set_ylabel("Lyapunov exponent")
     title = "Lyapunov Spectrum"
+    if title_suffix:
+        title += f" ({title_suffix})"
     if loop_closure_weight is not None:
         title += f" (loop_closure_weight={loop_closure_weight})"
     ax.set_title(title)
     ax.legend()
+
+
+def plot_lyapunov_spectrum(
+    pred_np: np.ndarray,
+    pred_std_np: np.ndarray,
+    emp_np: np.ndarray | None = None,
+    emp_std_np: np.ndarray | None = None,
+    true_lyapunov: list[float] | None = None,
+    loop_closure_weight: float | None = None,
+    full_lyap_np: np.ndarray | None = None,
+    full_lyap_std_np: np.ndarray | None = None,
+) -> plt.Figure | list[plt.Figure]:
+    """Bar chart of predicted vs empirical vs literature Lyapunov spectrum.
+
+    ``pred_np`` / ``pred_std_np`` are the batch+burn-in estimates.
+    ``full_lyap_np`` / ``full_lyap_std_np`` are the full-trajectory estimates.
+
+    If there are more than 20 exponents, returns a list of two figures:
+    one with all exponents and one zoomed into the first 10.
+    """
+    n_lyaps = len(pred_np)
+    if full_lyap_np is not None and len(full_lyap_np) > 0:
+        n_lyaps = min(n_lyaps, len(full_lyap_np))
+    if emp_np is not None and len(emp_np) > 0:
+        n_lyaps = min(n_lyaps, len(emp_np))
+    if true_lyapunov is not None:
+        n_lyaps = min(n_lyaps, len(true_lyapunov))
+
+    # --- main figure (all exponents) ---
+    fig_all, ax_all = plt.subplots(figsize=(14, 5))
+    _plot_lyapunov_bars(ax_all, n_lyaps, pred_np, pred_std_np, emp_np, emp_std_np,
+                        true_lyapunov, full_lyap_np, full_lyap_std_np,
+                        loop_closure_weight, title_suffix="all exponents" if n_lyaps > 20 else "")
     plt.tight_layout()
-    return fig
+
+    if n_lyaps <= 20:
+        return fig_all
+
+    # --- zoomed figure (first 10) ---
+    n_zoom = 10
+    fig_zoom, ax_zoom = plt.subplots(figsize=(14, 5))
+    _plot_lyapunov_bars(ax_zoom, n_zoom, pred_np, pred_std_np, emp_np, emp_std_np,
+                        true_lyapunov, full_lyap_np, full_lyap_std_np,
+                        loop_closure_weight, title_suffix="first 10")
+    plt.tight_layout()
+
+    return [fig_all, fig_zoom]
 
 
 def plot_kaplan_yorke(
@@ -697,6 +738,67 @@ def plot_amplification(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+@overload
+def run_analytics(
+    wandb_entity: str,
+    wandb_project: str,
+    save_dir: str,
+    *,
+    run_id: str | None = None,
+    epoch: int | None = None,
+    wandb_group: str | None = None,
+    true_lyapunov: list[float] | None = None,
+    output: str | list[str] = "show",
+    output_dir: str | Path | None = None,
+    sections: list[str] | None = None,
+    device: str | None = None,
+    n_sample: int = 128,
+    n_mase_batches: int = 10,
+    n_amp_trajs: int = 64,
+    n_amp_neighbors: int = 10,
+    n_amp_max_t: int = 10,
+    n_pred_trajs: int = 3,
+    lyapunov_burn_in_steps: int = 400,
+    lyapunov_burn_in_drop: int = 100,
+    sweep_diagnostics: list | None = None,
+    sweep_result: Any | None = None,
+    sweep_lambdas: list[float] | None = None,
+    return_model: Literal[True],
+) -> tuple[dict[str, plt.Figure] | None, Any, str]: ...
+
+
+@overload
+def run_analytics(
+    wandb_entity: str,
+    wandb_project: str,
+    save_dir: str,
+    *,
+    run_id: str | None = None,
+    epoch: int | None = None,
+    wandb_group: str | None = None,
+    true_lyapunov: list[float] | None = None,
+    output: str | list[str] = "show",
+    output_dir: str | Path | None = None,
+    sections: list[str] | None = None,
+    device: str | None = None,
+    n_sample: int = 128,
+    n_mase_batches: int = 10,
+    n_amp_trajs: int = 64,
+    n_amp_neighbors: int = 10,
+    n_amp_max_t: int = 10,
+    n_pred_trajs: int = 3,
+    lyapunov_burn_in_steps: int = 400,
+    lyapunov_burn_in_drop: int = 100,
+    sweep_diagnostics: list | None = None,
+    sweep_result: Any | None = None,
+    sweep_lambdas: list[float] | None = None,
+    return_model: Literal[False] = False,
+) -> dict[str, plt.Figure] | None: ...
+
+
+# Implementation uses ``Any`` so checkers use the ``@overload`` signatures above;
+# a single union return would include ``None`` and confuse unpacking when
+# ``return_model=True``.
 def run_analytics(
     wandb_entity: str,
     wandb_project: str,
@@ -724,7 +826,7 @@ def run_analytics(
     sweep_result: Any | None = None,
     sweep_lambdas: list[float] | None = None,
     return_model: bool = False,
-) -> dict[str, plt.Figure] | tuple | None:
+) -> Any:
     """Run the full analytics suite on a trained LitLatentJacobianODE model.
 
     Parameters
@@ -1024,7 +1126,11 @@ def run_analytics(
                     x_rt = lit_model.decode_trajectory(z_enc)
                     inv_err_val = float(F.mse_loss(x_rt, batch).item())
                     z_n = _z_null(z_enc, n_target_dims)
-                    null_rms_val = float(z_n.pow(2).mean().sqrt().item()) if z_n is not None else 0.0
+                    null_rms_val = (
+                        float(z_n.pow(2).mean().sqrt().item())
+                        if z_n is not None and z_n.numel() > 0
+                        else None
+                    )
 
                 # Build decoded trajectory for first test trajectory
                 latent_full = lit_model.encode_trajectory(test_trajs_obs.to(device_obj))
@@ -1067,7 +1173,8 @@ def run_analytics(
             ]
             if is_coupling and inv_err_val is not None:
                 _recon_lines.append(f"Inverse consistency MSE: {inv_err_val:.2e}")
-                _recon_lines.append(f"Null subspace RMS:       {null_rms_val:.2e}")
+                if null_rms_val is not None:
+                    _recon_lines.append(f"Null subspace RMS:       {null_rms_val:.2e}")
             _html_section("Reconstruction", _recon_lines)
             fig = plot_reconstruction(
                 plot_targets_np[..., plot_dims], traj_decoded_np[..., plot_dims],
@@ -1145,21 +1252,22 @@ def run_analytics(
             print(f"Entropy-based utilization: {utilization:.3f}")
 
             null_rms_per_t: np.ndarray | None = None
+            null_mean_rms: float | None = None
             if is_coupling:
                 Z_null_arr = _z_null(torch.from_numpy(Z), n_target_dims)
-                if Z_null_arr is not None:
-                    null_rms_per_t = np.sqrt((Z_null_arr.numpy() ** 2).mean(axis=(0, 2)))
-                    print(f"Null subspace mean RMS: {np.sqrt((Z_null_arr.numpy() ** 2).mean()):.6e}")
+                if Z_null_arr is not None and Z_null_arr.numel() > 0:
+                    Zn_np = Z_null_arr.numpy()
+                    null_rms_per_t = np.sqrt((Zn_np ** 2).mean(axis=(0, 2)))
+                    null_mean_rms = float(np.sqrt((Zn_np ** 2).mean()))
+                    print(f"Null subspace mean RMS: {null_mean_rms:.6e}")
 
             _util_lines = [
                 f"Entropy-based utilization: {utilization:.4f}  (1.0 = uniform)",
                 f"n_dyn: {n_dyn}",
                 "Per-dim fractional variance:",
             ] + [f"  dim {i:2d}: {v / dim_var.sum():.4f}" for i, v in enumerate(dim_var)]
-            if is_coupling and null_rms_per_t is not None:
-                _util_lines.append(
-                    f"Null subspace mean RMS: {np.sqrt((Z_null_arr.numpy() ** 2).mean()):.6e}"
-                )
+            if is_coupling and null_mean_rms is not None:
+                _util_lines.append(f"Null subspace mean RMS: {null_mean_rms:.6e}")
             _html_section("Latent Utilization", _util_lines)
             fig = plot_latent_utilization(dim_var, utilization, n_dyn, null_rms_per_t)
             _emit("latent_utilization", fig)
@@ -1306,12 +1414,16 @@ def run_analytics(
             _html_section("Lyapunov Spectrum", _lyap_lines)
             _summary_lines += ["", "=== Lyapunov Spectrum ==="] + _lyap_lines
 
-            fig = plot_lyapunov_spectrum(
+            result = plot_lyapunov_spectrum(
                 pred_np, pred_std_np, emp_np, emp_std_np,
                 true_lyapunov=true_lyapunov, loop_closure_weight=best_lambda,
                 full_lyap_np=pred_full_np, full_lyap_std_np=pred_full_std_np,
             )
-            _emit("lyapunov", fig)
+            if isinstance(result, list):
+                _emit("lyapunov", result[0])
+                _emit("lyapunov_top10", result[1])
+            else:
+                _emit("lyapunov", result)
 
         # ============================================================
         # 6. Kaplan-Yorke dimension

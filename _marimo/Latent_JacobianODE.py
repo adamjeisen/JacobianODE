@@ -88,13 +88,13 @@ def _(EXPERIMENT_DIR, mo):
 
     experiment_picker = mo.ui.dropdown(
         options=_names,
-        value=_names[0] if _names else None,
+        value=_names[1] if _names else None,
         label="Experiment",
     )
 
     # OFF → submit remaining combos via SLURM (Section 4)
     # ON  → run one combo locally with progress bar (Section 5)
-    run_locally_toggle = mo.ui.switch(label="Run locally", value=True)
+    run_locally_toggle = mo.ui.switch(label="Run locally", value=False)
 
     mo.vstack([experiment_picker, run_locally_toggle])
     return experiment_picker, run_locally_toggle

@@ -13,7 +13,7 @@
 
 defaults:
   - override /data: wmtask
-  - override /model: latent_spline_coupling
+  - override /model: latent_mlp_diffeo
   - _self_
 
 # ── W&B / logging ─────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ wandb_entity: JacobianODE
 wandb_project: "WMTask_INDall_N${data.train_test_params.delay_embedding_params.n_delays}_D${data.train_test_params.delay_embedding_params.delay_spacing}_Norm${data.postprocessing.normalize}_T${model.n_target_dims}__JacobianODE"
 
 # Group encodes: what is swept + key fixed hyperparams
-wandb_group: "spline_coupling__sweep_lc_x_kl_dyn_vae_sample_all_losses"
+wandb_group: "mlp_diffeo__sweep_lc_x_kl_dyn_vae_sample_all_losses"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
@@ -55,6 +55,7 @@ training:
     # loop_closure_weight: 0.001
     # kl_dyn_weight: 0.001
     # n_eigval_jacobians: 128      # default null
+    diffeomorphism_weight: 1.0
     n_eigval_jacobians: 8
   early_stopping:
     early_stopping_patience: 5    # default 2

@@ -50,12 +50,21 @@ training:
     max_epochs: 150
     limit_train_batches: 200
     limit_val_batches: 50
+    accumulate_grad_batches: 1
   lightning:
     diffeomorphism_weight: 1.0
-    reconstruction_loss_weight: 1.0
-    loop_closure_weight: 0.001
-    kl_dyn_weight: 0.001
+    # loop_closure_weight: 0.001
+    # kl_dyn_weight: 0.001
+    # loop_closure_weight: 0
+    # kl_dyn_weight: 0
     n_eigval_jacobians: 8
   early_stopping:
     early_stopping_patience: 5
     min_epochs: 10
+
+# ── Sweep grid ────────────────────────────────────────────────────────────────
+hydra:
+  sweeper:
+    params:
+      training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+      training.lightning.kl_dyn_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"

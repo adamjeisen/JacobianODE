@@ -17,6 +17,8 @@ _marimo/_sandbox/dysts_data/
 _marimo/_sandbox/example_data/
 .vscode/
 _marimo/__marimo__/
+_marimo/results/
+papers/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
