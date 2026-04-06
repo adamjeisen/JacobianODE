@@ -8,7 +8,7 @@ from typing import Any, Optional, Union
 import numpy as np
 import torch
 from hydra.utils import instantiate
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,10 @@ def make_model(
             extra_kwargs["vae_sample_all_losses"] = cfg.model.vae_sample_all_losses
         if "kl_warmup_epochs" in cfg.model:
             extra_kwargs["kl_warmup_epochs"] = cfg.model.kl_warmup_epochs
+        if "geometric_noise" in cfg.model:
+            extra_kwargs["geometric_noise"] = OmegaConf.to_container(
+                cfg.model.geometric_noise, resolve=True
+            )
         # kl_null_weight / kl_dyn_weight are set via cfg.training.lightning
         # (the single source of truth). Model YAML values are kept as
         # documentation defaults only — do NOT pass them here, otherwise

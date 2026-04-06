@@ -1,0 +1,66 @@
+# @package _global_
+#
+# Experiment: Lorenz × SplineCoupling BASELINE (no geometric noise) — sweep
+# ---------------------------------------------------------------------------------
+# Identical to lorenz_spline_coupling_geometric_noise_sweep but with
+# geometric_noise.enabled: false.  Serves as the control for comparison.
+#
+# Launch:
+#   python -m JacobianODE.jacobians.run_jacobians --multirun \
+#     experiment=lorenz_spline_coupling_baseline_sweep
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_spline_coupling
+  - _self_
+
+# ── W&B / logging ─────────────────────────────────────────────────────────────
+wandb_entity: JacobianODE
+
+wandb_project: "Lorenz_INDall_N${data.train_test_params.delay_embedding_params.n_delays}_D${data.train_test_params.delay_embedding_params.delay_spacing}_Norm${data.postprocessing.normalize}_T${model.n_target_dims}__JacobianODE"
+
+wandb_group: "spline_coupling__baseline__sweep_lc_x_kl_dyn"
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 45     # traj_init_steps(15) + prediction_steps(30)
+    delay_embedding_params:
+      observed_indices: 'all'   # fully observed (all 3 Lorenz dims)
+      n_delays: 1               # no delay embedding
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  n_target_dims: 3              # full 3D dynamic subspace, no null space
+  prediction_steps: 30
+  encoder_warmup_epochs: 5
+  vae_sample_all_losses: true   # match geometric noise experiment
+  geometric_noise:
+    enabled: false              # <-- baseline: standard isotropic VAE noise
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 150
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    n_eigval_jacobians: 8        # number of validation samples for eigenvalue diagnostics
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 10
+
+# ── Sweep grid ────────────────────────────────────────────────────────────────
+hydra:
+  sweeper:
+    params:
+      training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+      training.lightning.kl_dyn_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"

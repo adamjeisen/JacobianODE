@@ -28,6 +28,8 @@ from .models import (
     TICAEmbedding,
 )
 from .coupling_flows import (
+    AdditiveCouplingLayer,
+    AdditiveFlow,
     AffineCouplingEncoder,
     AffineCouplingLayer,
     ActNorm,

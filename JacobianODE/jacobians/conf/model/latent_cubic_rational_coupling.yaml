@@ -32,3 +32,13 @@ encoder_warmup_epochs: 0
 dynamics_warmup_epochs: 0
 jac_window_stride: null
 decode_only_recent: false
+
+# Geometric noise: learned volume-preserving map f: z_dyn -> u that warps
+# isotropic noise in u-space into dynamics-aware anisotropic noise in z-space.
+# Requires use_vae: true.
+geometric_noise:
+  enabled: false
+  n_coupling_layers: 6        # number of additive coupling layers in f
+  hidden_dim: 128              # hidden width of the conditioner MLPs inside each coupling layer
+  n_hidden_layers: 2           # depth of conditioner MLPs
+  permutation_seed: 0

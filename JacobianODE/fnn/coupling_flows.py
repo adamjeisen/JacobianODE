@@ -612,6 +612,195 @@ class AffineCouplingLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Additive (NICE-style) Coupling Layer — volume-preserving by construction
+# ---------------------------------------------------------------------------
+
+
+class AdditiveCouplingLayer(nn.Module):
+    """Additive coupling layer (NICE-style) — volume-preserving by construction.
+
+    Splits the last dimension at *split_dim*.  The first ``split_dim`` features
+    are kept fixed and fed into a conditioner MLP that predicts a translation
+    ``t`` for the remaining features.
+
+    Forward:  ``y_a = x_a``,  ``y_b = x_b + t(x_a)``
+    Inverse:  ``x_a = y_a``,  ``x_b = y_b - t(y_a)``
+
+    The Jacobian is lower-triangular with ones on the diagonal, so
+    ``det(J) = 1`` always.  This makes the layer volume-preserving regardless
+    of the conditioner complexity.
+
+    Parameters
+    ----------
+    dim : int
+        Total feature dimension.
+    split_dim : int or None
+        Number of dimensions in the fixed partition (default: ``dim // 2``).
+    hidden_dim : int
+        Conditioner MLP hidden width.
+    n_hidden_layers : int
+        Conditioner MLP depth.
+    zero_init : bool
+        Zero-initialise the last conditioner layer so the coupling starts as
+        the identity map.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        split_dim: int | None = None,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        if split_dim is None:
+            split_dim = dim // 2
+        self.dim = dim
+        self.split_dim = split_dim
+        self.transform_dim = dim - split_dim
+
+        # Translation-only conditioner: output_dim = transform_dim (not 2x)
+        self.conditioner = _build_conditioner(
+            input_dim=split_dim,
+            output_dim=self.transform_dim,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            zero_init=zero_init,
+        )
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : Tensor (..., D)
+
+        Returns
+        -------
+        y : Tensor (..., D)
+        log_det : Tensor (...)   always zero (volume-preserving)
+        """
+        x_a = x[..., : self.split_dim]
+        x_b = x[..., self.split_dim :]
+        t = self.conditioner(x_a)
+        y_b = x_b + t
+        y = torch.cat([x_a, y_b], dim=-1)
+        log_det = torch.zeros(x.shape[:-1], device=x.device, dtype=x.dtype)
+        return y, log_det
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Exact analytical inverse.
+
+        Parameters
+        ----------
+        y : Tensor (..., D)
+
+        Returns
+        -------
+        x : Tensor (..., D)
+        """
+        y_a = y[..., : self.split_dim]
+        y_b = y[..., self.split_dim :]
+        t = self.conditioner(y_a)  # y_a == x_a
+        x_b = y_b - t
+        return torch.cat([y_a, x_b], dim=-1)
+
+
+class AdditiveFlow(nn.Module):
+    """Volume-preserving flow from stacked additive coupling layers.
+
+    Composes *n_coupling_layers* :class:`AdditiveCouplingLayer` modules with
+    :class:`FixedPermutation` layers in between so that all dimensions interact.
+    Since each additive coupling has ``det(J) = 1`` and each permutation has
+    ``|det| = 1``, the full composition is volume-preserving by construction.
+
+    Parameters
+    ----------
+    n_dims : int
+        Feature dimension.
+    n_coupling_layers : int
+        Number of additive coupling layers.
+    hidden_dim : int
+        Hidden width of the conditioner MLPs inside each coupling layer.
+    n_hidden_layers : int
+        Depth of the conditioner MLPs.
+    permutation_seed : int
+        Base seed for reproducible permutations between layers.
+    zero_init : bool
+        Zero-initialise the last layer of each conditioner so the flow starts
+        as the identity map.
+    """
+
+    def __init__(
+        self,
+        n_dims: int,
+        n_coupling_layers: int = 6,
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        permutation_seed: int = 0,
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        self.n_dims = n_dims
+
+        self.layers = nn.ModuleList(
+            [
+                AdditiveCouplingLayer(
+                    dim=n_dims,
+                    hidden_dim=hidden_dim,
+                    n_hidden_layers=n_hidden_layers,
+                    zero_init=zero_init,
+                )
+                for _ in range(n_coupling_layers)
+            ]
+        )
+        # Permutations between consecutive coupling layers (not after last)
+        self.permutations = nn.ModuleList(
+            [
+                FixedPermutation(n_dims, seed=permutation_seed + i)
+                for i in range(n_coupling_layers - 1)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Map from z-space to noise space u.
+
+        Parameters
+        ----------
+        x : Tensor (..., n_dims)
+
+        Returns
+        -------
+        y : Tensor (..., n_dims)
+        """
+        for i, layer in enumerate(self.layers):
+            x, _ = layer(x)
+            if i < len(self.permutations):
+                x = self.permutations[i](x)
+        return x
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Map from noise space u back to z-space.
+
+        Parameters
+        ----------
+        y : Tensor (..., n_dims)
+
+        Returns
+        -------
+        x : Tensor (..., n_dims)
+        """
+        for i in reversed(range(len(self.layers))):
+            if i < len(self.permutations):
+                y = self.permutations[i].inverse(y)
+            y = self.layers[i].inverse(y)
+        return y
+
+
+# ---------------------------------------------------------------------------
 # Spline Coupling Layer  (Durkan et al., "Neural Spline Flows", NeurIPS 2019)
 # ---------------------------------------------------------------------------
 

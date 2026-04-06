@@ -42,7 +42,7 @@ dependencies = [
     "torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git",
     "nbconvert",
     "wmtask @ git+ssh://git@github.com/adamjeisen/wmtask.git",
-    "marimo>=0.22.0",
+    "marimo>=0.22.4",
 ]
 
 [project.optional-dependencies]

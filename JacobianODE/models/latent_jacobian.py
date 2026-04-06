@@ -89,6 +89,7 @@ class LitLatentJacobianODE(LitBase):
         use_vae=False,
         vae_sample_all_losses=False,
         kl_warmup_epochs=0,
+        geometric_noise=None,
         # Reconstruction mode
         reconstruction_mode='uniform',
         # Tangent space entropy
@@ -153,6 +154,23 @@ class LitLatentJacobianODE(LitBase):
             self.log_var_proj = nn.Linear(n_target_dims, n_target_dims)
             nn.init.zeros_(self.log_var_proj.weight)
             nn.init.constant_(self.log_var_proj.bias, -6.0)  # sigma ≈ 0.05
+
+        # Geometric noise: learned volume-preserving noise warping (z → u)
+        self.geometric_noise_enabled = False
+        if geometric_noise is not None and geometric_noise.get("enabled", False):
+            if not use_vae:
+                raise ValueError("geometric_noise requires use_vae=True")
+            if n_target_dims is None:
+                raise ValueError("geometric_noise requires n_target_dims")
+            from JacobianODE.fnn.coupling_flows import AdditiveFlow
+            self.noise_warp = AdditiveFlow(
+                n_dims=n_target_dims,
+                n_coupling_layers=geometric_noise.get("n_coupling_layers", 6),
+                hidden_dim=geometric_noise.get("hidden_dim", 128),
+                n_hidden_layers=geometric_noise.get("n_hidden_layers", 2),
+                permutation_seed=geometric_noise.get("permutation_seed", 0),
+            )
+            self.geometric_noise_enabled = True
 
         # Reconstruction mode
         if reconstruction_mode not in ('uniform', 'harmonic', 'most_recent'):
@@ -417,16 +435,31 @@ class LitLatentJacobianODE(LitBase):
             Sampled (training) or deterministic (eval) latent.
         log_var : torch.Tensor or None
             Log-variance, same shape as ``mu_dyn``. ``None`` when VAE is off.
+        kl_mu : torch.Tensor or None
+            Mean to use in KL computation.  When geometric noise is enabled
+            this is ``u = f(mu_dyn)`` (noise-space mean); otherwise it equals
+            ``mu_dyn``.  ``None`` when VAE is off.
         """
         if not self.use_vae:
-            return mu_dyn, None
+            return mu_dyn, None, None
+
+        # Geometric noise path: map to u-space, sample there, map back
+        if self.geometric_noise_enabled and self.training:
+            u = self.noise_warp(mu_dyn)
+            log_var = self.log_var_proj(u)
+            std = torch.exp(0.5 * log_var)
+            u_noisy = u + std * torch.randn_like(std)
+            z_dyn = self.noise_warp.inverse(u_noisy)
+            return z_dyn, log_var, u
+
+        # Standard VAE path (no geometric noise, or eval mode)
         log_var = self.log_var_proj(mu_dyn)
         if self.training:
             std = torch.exp(0.5 * log_var)
             z_dyn = mu_dyn + std * torch.randn_like(std)
         else:
             z_dyn = mu_dyn
-        return z_dyn, log_var
+        return z_dyn, log_var, mu_dyn
 
     @staticmethod
     def _kl_divergence(mu, log_var):
@@ -753,7 +786,7 @@ class LitLatentJacobianODE(LitBase):
 
             # Split into dynamic subspace and null subspace
             mu_dyn, _z_null = self._split_latent(z_full)
-            z_dyn_sampled, _ = self._vae_reparameterize(mu_dyn)
+            z_dyn_sampled, _, _ = self._vae_reparameterize(mu_dyn)
             z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
             z_dyn_clean = z_dyn  # save before latent noise
 
@@ -1095,7 +1128,7 @@ class LitLatentJacobianODE(LitBase):
 
         z_full = self.encode_trajectory(batch)
         mu_dyn, z_null = self._split_latent(z_full)
-        z_dyn_sampled, log_var = self._vae_reparameterize(mu_dyn)
+        z_dyn_sampled, log_var, kl_mu = self._vae_reparameterize(mu_dyn)
 
         # Reconstruction uses sampled z_dyn when VAE is active
         if self.use_vae and z_null is not None:
@@ -1115,7 +1148,7 @@ class LitLatentJacobianODE(LitBase):
             else:
                 kl_null_loss = torch.tensor(0.0, device=batch.device)
             if self.use_vae and log_var is not None:
-                kl_dyn_loss = self._kl_divergence(mu_dyn, log_var)
+                kl_dyn_loss = self._kl_divergence(kl_mu, log_var)
             else:
                 kl_dyn_loss = torch.tensor(0.0, device=batch.device)
             if eff_null_w > 0 and kl_null_loss is not None:
@@ -1231,7 +1264,7 @@ class LitLatentJacobianODE(LitBase):
         with self._timed("train/3.encode_recon"):
             z_full = self.encode_trajectory(batch)
             mu_dyn, z_null = self._split_latent(z_full)
-            z_dyn_sampled, log_var = self._vae_reparameterize(mu_dyn)
+            z_dyn_sampled, log_var, kl_mu = self._vae_reparameterize(mu_dyn)
             # Choose which z_dyn downstream losses see
             z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
 
@@ -1324,7 +1357,7 @@ class LitLatentJacobianODE(LitBase):
             else:
                 kl_null_loss = torch.tensor(0.0, device=batch.device)
             if self.use_vae and log_var is not None:
-                kl_dyn_loss = self._kl_divergence(mu_dyn, log_var)
+                kl_dyn_loss = self._kl_divergence(kl_mu, log_var)
             else:
                 kl_dyn_loss = torch.tensor(0.0, device=batch.device)
 
@@ -1464,7 +1497,7 @@ class LitLatentJacobianODE(LitBase):
         with self._timed("val/2.encode"):
             z_full = self.encode_trajectory(batch)
             mu_dyn, z_null = self._split_latent(z_full)
-            z_dyn, log_var = self._vae_reparameterize(mu_dyn)  # deterministic in eval
+            z_dyn, log_var, kl_mu = self._vae_reparameterize(mu_dyn)  # deterministic in eval
 
         with self._timed("val/3.loop_closure"):
             val_loop_closure = self.loop_closure_model_step(
@@ -1488,7 +1521,7 @@ class LitLatentJacobianODE(LitBase):
                 else:
                     val_kl_null_loss = torch.tensor(0.0, device=batch.device)
                 if self.use_vae and log_var is not None:
-                    val_kl_dyn_loss = self._kl_divergence(mu_dyn, log_var)
+                    val_kl_dyn_loss = self._kl_divergence(kl_mu, log_var)
                 else:
                     val_kl_dyn_loss = torch.tensor(0.0, device=batch.device)
 
