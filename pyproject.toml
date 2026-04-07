@@ -32,7 +32,6 @@ dependencies = [
     "cython",
     "hydra-core",
     "hydra-submitit-launcher",
-    "hydra-list-sweeper",
     "hydra-optuna-sweeper",
     "wandb>=0.25.0",
     "OmegaConf",
