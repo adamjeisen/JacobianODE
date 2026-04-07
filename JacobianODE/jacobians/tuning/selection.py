@@ -18,6 +18,7 @@ from .criteria import (
     fails_loop_closure_criterion,
     fails_one_step_criterion,
 )
+from .ranking import RankingMethod, rank_survivors
 
 
 @dataclass
@@ -49,15 +50,29 @@ def select_best_model(
     eigenvalue_threshold: float = 0.001,
     use_loop_closure: bool = True,
     loop_closure_n_dims: Optional[int] = None,
+    ranking_method: RankingMethod = "pareto_knee",
 ) -> SelectionResult:
     """Select the best model from a sequence of diagnostic metrics.
 
-    Algorithm (mirrors wandb_utils.py lines 276-323):
-      1. Evaluate all three criteria per candidate.
-      2. Relaxation:
-         - If no C2-passer also passes C1 -> discard C2.
-         - If no C3-passer also passes C1 -> discard C1 (high noise regime).
-      3. Return the candidate with lowest ``trajectory_val_loss`` among survivors.
+    Algorithm:
+      1. Evaluate hard criteria (C1: one-step MASE, C3: eigenvalue fraction)
+         per candidate.
+      2. For ``"best_traj_loss"`` ranking, also apply C2 (loop closure
+         threshold) as a hard filter.  For all other ranking methods, C2 is
+         recorded but NOT enforced — loop closure loss is used as a ranking
+         signal instead.
+      3. Relaxation: if no C3-passer also passes C1, discard C1.
+      4. Among survivors, select the best using the chosen ranking method.
+
+    Available ranking methods:
+      - ``"best_traj_loss"``: Lowest trajectory validation loss.  Uses C2 as
+        a hard filter (original behaviour).
+      - ``"pareto_knee"`` (default): Knee of the Pareto front in
+        (loop_closure_loss, traj_loss) space.
+      - ``"geo_rank"``: Lowest geometric mean of ordinal ranks.
+      - ``"minimax_rank"``: Lowest max (worst-case) ordinal rank.
+      - ``"geo_log_score"``: Geometric mean of log-normalized scores.
+      - ``"minimax_log_score"``: Max of log-normalized scores (most balanced).
 
     Args:
         candidates: Sequence of DiagnosticMetrics, one per model.
@@ -67,6 +82,7 @@ def select_best_model(
         use_loop_closure: Whether to apply C2 (False for NeuralODE).
         loop_closure_n_dims: Dimension for C2 threshold sqrt(n). For latent models
             (LitLatentJacobianODE), use n_latent. When None, defaults to n_dims.
+        ranking_method: How to rank survivors and pick the best model.
 
     Returns:
         SelectionResult with selection outcome and diagnostics.
@@ -102,13 +118,12 @@ def select_best_model(
 
     # Which criteria to enforce (may be relaxed below)
     apply_c1 = True
-    apply_c2 = use_loop_closure
+    # C2 is only a hard filter for "best_traj_loss"; other methods use LC as
+    # a ranking signal instead.
+    apply_c2 = use_loop_closure and ranking_method == "best_traj_loss"
     apply_c3 = True
 
     # Step 2: relaxation rules
-    # C1 passes
-    passes_c1 = [i for i in range(n) if not fails_c1[i]]
-
     if apply_c2:
         # If no model that passes C2 also passes C1 -> discard C2
         passes_c2_and_c1 = [
@@ -148,16 +163,8 @@ def select_best_model(
     if apply_c3:
         criteria_applied.append("C3")
 
-    # Pick lowest trajectory_val_loss among survivors.
-    # Exclude NaN/inf: min() treats NaN as "smaller" than everything (nothing
-    # ever replaces it), so models with invalid traj loss would be wrongly selected.
-    valid_survivors = [
-        i for i in survivors if math.isfinite(candidates[i].trajectory_val_loss)
-    ]
-    if valid_survivors:
-        best_idx = min(valid_survivors, key=lambda i: candidates[i].trajectory_val_loss)
-    else:
-        best_idx = survivors[0]  # fallback if all have NaN/inf
+    # Step 4: rank survivors and pick the best
+    best_idx = rank_survivors(survivors, candidates, method=ranking_method)
 
     return SelectionResult(
         best_index=best_idx,

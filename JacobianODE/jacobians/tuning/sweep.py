@@ -23,6 +23,7 @@ from .criteria import (
     compute_all_diagnostics,
     diagnostics_from_wandb,
 )
+from .ranking import RankingMethod
 from .selection import SelectionResult, select_best_model
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ def run_sweep(
     sigma: float = 1.0,
     verbose: bool = False,
     n_latent: Optional[int] = None,
+    ranking_method: RankingMethod = "pareto_knee",
 ) -> SweepResult:
     """Run a full hyperparameter sweep over lambda_loop values (notebook mode).
 
@@ -95,6 +97,7 @@ def run_sweep(
         mu: Data mean for normalization.
         sigma: Data std for normalization.
         verbose: Whether to print progress.
+        ranking_method: How to rank survivors and pick the best model.
 
     Returns:
         SweepResult with selection, diagnostics, and best model.
@@ -155,6 +158,7 @@ def run_sweep(
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
         loop_closure_n_dims=n_latent,
+        ranking_method=ranking_method,
     )
 
     best_model = None
@@ -188,6 +192,7 @@ def select_from_wandb_runs(
     save_dir: Optional[str] = None,
     verbose: bool = False,
     n_latent: Optional[int] = None,
+    ranking_method: RankingMethod = "pareto_knee",
 ) -> SweepResult:
     """Select the best model from already-trained W&B runs (post-hoc mode).
 
@@ -348,6 +353,7 @@ def select_from_wandb_runs(
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
         loop_closure_n_dims=n_latent,
+        ranking_method=ranking_method,
     )
 
     if lambda_values is None:
@@ -560,6 +566,7 @@ def select_best_from_sweep(
     use_loop_closure: bool = True,
     delete_crashed: bool = False,
     verbose: bool = False,
+    ranking_method: RankingMethod = "pareto_knee",
 ) -> tuple[str, SweepResult, DiscoveredSweep]:
     """Discover sweep runs and select the best one.
 
@@ -654,6 +661,7 @@ def select_best_from_sweep(
         save_dir=save_dir,
         verbose=verbose,
         n_latent=n_latent,
+        ranking_method=ranking_method,
     )
 
     result = sweep_result.selection
@@ -664,7 +672,8 @@ def select_best_from_sweep(
 
     if verbose:
         idx = result.best_index
-        print(f"\nBest run ID:              {best_run_id}")
+        print(f"\nRanking method:           {ranking_method}")
+        print(f"Best run ID:              {best_run_id}")
         print(f"Best loop_closure_weight: {discovered.lambdas[idx]}")
         print(f"Best tangent_entropy_weight: {discovered.tangent_entropy_weights[idx]}")
         print(f"Best kl_dyn_weight:       {discovered.kl_dyn_weights[idx]}")

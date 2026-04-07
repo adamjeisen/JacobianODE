@@ -10,14 +10,15 @@ JacobianODE/fnn/Deep_reconstruction_of_strange_attractors.pdf
 _jupyter/*.pdf
 _jupyter/*.html
 _jupyter/_sandbox/*.html
-_jupyter/reports/
-_marimo/reports/
 _marimo/example_data/
 _marimo/_sandbox/dysts_data/
 _marimo/_sandbox/example_data/
 .vscode/
 _marimo/__marimo__/
 _marimo/results/
+_notebook/__marimo__/
+_notebook/example_data/
+_notebook/results/
 papers/
 
 # Byte-compiled / optimized / DLL files

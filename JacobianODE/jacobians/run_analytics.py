@@ -65,7 +65,7 @@ import math
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal, Sequence, overload
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -78,6 +78,7 @@ from torch.utils.data import DataLoader, RandomSampler
 from tqdm.auto import tqdm
 
 from .metrics import r2_score, normalized_mse as nmse_fn, mase as mase_fn
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -169,6 +170,77 @@ def _save_or_show(fig: plt.Figure, name: str, output: list[str],
 # ---------------------------------------------------------------------------
 # Plot functions — each accepts precomputed data and returns a Figure
 # ---------------------------------------------------------------------------
+
+def plot_sweep_pareto(
+    all_diagnostics: list,
+    best_index: int | None,
+    ranking_method: str,
+) -> plt.Figure:
+    """Log-log scatter of loop closure loss vs trajectory loss with Pareto front.
+
+    Highlights the chosen run and labels the ranking method used.
+    """
+    traj_losses = np.array([d.trajectory_val_loss for d in all_diagnostics])
+    lc_losses = np.array([
+        d.loop_closure_loss if d.loop_closure_loss is not None else np.nan
+        for d in all_diagnostics
+    ])
+    valid = np.isfinite(lc_losses) & np.isfinite(traj_losses)
+
+    # --- Pareto front (lower is better on both) ---
+    pareto_mask = np.zeros(len(traj_losses), dtype=bool)
+    for i in range(len(traj_losses)):
+        if not valid[i]:
+            continue
+        dominated = False
+        for j in range(len(traj_losses)):
+            if i == j or not valid[j]:
+                continue
+            if (traj_losses[j] <= traj_losses[i] and lc_losses[j] <= lc_losses[i]
+                    and (traj_losses[j] < traj_losses[i] or lc_losses[j] < lc_losses[i])):
+                dominated = True
+                break
+        if not dominated:
+            pareto_mask[i] = True
+
+    pareto_idx = np.where(pareto_mask)[0]
+    pareto_order = pareto_idx[np.argsort(lc_losses[pareto_idx])]
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    # All runs
+    ax.scatter(
+        lc_losses[valid], traj_losses[valid],
+        s=40, alpha=0.6, edgecolors="black", linewidths=0.5,
+        c="tab:blue", label="All runs",
+    )
+
+    # Pareto front line
+    if len(pareto_order) >= 2:
+        ax.plot(
+            lc_losses[pareto_order], traj_losses[pareto_order],
+            "r-o", markersize=5, linewidth=1.5, label="Pareto front", zorder=5,
+        )
+
+    # Chosen run
+    if best_index is not None and valid[best_index]:
+        ax.scatter(
+            [lc_losses[best_index]], [traj_losses[best_index]],
+            marker="*", s=400, c="gold", edgecolors="black",
+            linewidths=1.5, zorder=10,
+            label=f"Selected ({ranking_method})",
+        )
+
+    ax.set_xlabel("Loop closure loss")
+    ax.set_ylabel("Trajectory val loss")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_title(f"Sweep Pareto Front — selection: {ranking_method}")
+    ax.legend(fontsize=9)
+
+    fig.tight_layout()
+    return fig
+
 
 def plot_sweep_overview(
     all_diagnostics: list,
@@ -748,7 +820,7 @@ def run_analytics(
     epoch: int | None = None,
     wandb_group: str | None = None,
     true_lyapunov: list[float] | None = None,
-    output: str | list[str] = "show",
+    output: str | Sequence[str] = "show",
     output_dir: str | Path | None = None,
     sections: list[str] | None = None,
     device: str | None = None,
@@ -763,6 +835,7 @@ def run_analytics(
     sweep_diagnostics: list | None = None,
     sweep_result: Any | None = None,
     sweep_lambdas: list[float] | None = None,
+    ranking_method: str = "pareto_knee",
     return_model: Literal[True],
 ) -> tuple[dict[str, plt.Figure] | None, Any, str]: ...
 
@@ -777,7 +850,7 @@ def run_analytics(
     epoch: int | None = None,
     wandb_group: str | None = None,
     true_lyapunov: list[float] | None = None,
-    output: str | list[str] = "show",
+    output: str | Sequence[str] = "show",
     output_dir: str | Path | None = None,
     sections: list[str] | None = None,
     device: str | None = None,
@@ -792,6 +865,7 @@ def run_analytics(
     sweep_diagnostics: list | None = None,
     sweep_result: Any | None = None,
     sweep_lambdas: list[float] | None = None,
+    ranking_method: str = "pareto_knee",
     return_model: Literal[False] = False,
 ) -> dict[str, plt.Figure] | None: ...
 
@@ -808,7 +882,7 @@ def run_analytics(
     epoch: int | None = None,
     wandb_group: str | None = None,
     true_lyapunov: list[float] | None = None,
-    output: str | list[str] = "show",
+    output: str | Sequence[str] = "show",
     output_dir: str | Path | None = None,
     sections: list[str] | None = None,
     device: str | None = None,
@@ -825,6 +899,7 @@ def run_analytics(
     sweep_diagnostics: list | None = None,
     sweep_result: Any | None = None,
     sweep_lambdas: list[float] | None = None,
+    ranking_method: str = "pareto_knee", # "best_traj_loss" | "pareto_knee" | "geo_rank" | "minimax_rank" | "geo_log_score" | "minimax_log_score"
     return_model: bool = False,
 ) -> Any:
     """Run the full analytics suite on a trained LitLatentJacobianODE model.
@@ -852,7 +927,7 @@ def run_analytics(
         Known ground-truth Lyapunov exponents for comparison plots (e.g.
         ``[0.91, 0.0, -14.57]`` for Lorenz).  Pass ``None`` for systems
         without known exponents.
-    output : str or list of str
+    output : str or sequence of str
         One or more of ``"show"``, ``"save"``, ``"pdf"``, ``"return"``.
     output_dir : str or Path, optional
         Required when ``output`` contains ``"save"`` or ``"pdf"``.
@@ -902,6 +977,8 @@ def run_analytics(
     # ------------------------------------------------------------------ setup
     if isinstance(output, str):
         output = [output]
+    else:
+        output = list(output)
 
     if ("save" in output or "pdf" in output) and output_dir is None:
         raise ValueError("output_dir must be provided when output contains 'save' or 'pdf'.")
@@ -923,6 +1000,7 @@ def run_analytics(
             wandb_project=wandb_project,
             save_dir=save_dir,
             wandb_group=wandb_group,
+            ranking_method=ranking_method,
             verbose=True,
         )
         print(f"Auto-selected run_id: {run_id}")
@@ -1088,6 +1166,21 @@ def run_analytics(
         ]
         if true_lyapunov is not None:
             _header_lines += ["", f"True Lyapunov  : {true_lyapunov}"]
+
+        # -- Chosen run diagnostics (from sweep selection) --
+        if sweep_result is not None and sweep_result.best_metrics is not None:
+            _bm = sweep_result.best_metrics
+            _header_lines += [
+                "",
+                f"Selection method: {ranking_method}",
+                "",
+                "Selected run diagnostics",
+                f"  trajectory val loss       : {_bm.trajectory_val_loss:.6f}",
+                f"  loop closure loss         : {_bm.loop_closure_loss:.6f}" if _bm.loop_closure_loss is not None else "  loop closure loss         : N/A",
+                f"  one-step MASE             : {_bm.one_step_mase:.6f}",
+                f"  fast eigenvalue fraction  : {_bm.fast_eigenvalue_fraction:.6f}",
+            ]
+
         _summary_lines += _header_lines
         _html_section("Run Summary", _header_lines)
 
@@ -1098,6 +1191,12 @@ def run_analytics(
             if sweep_diagnostics is not None and sweep_result is not None and sweep_lambdas is not None:
                 fig = plot_sweep_overview(sweep_diagnostics, sweep_result, sweep_lambdas, n_latent)
                 _emit("sweep_overview", fig)
+
+                # Pareto front plot (log-log lc_loss vs traj_loss)
+                fig_pareto = plot_sweep_pareto(
+                    sweep_diagnostics, sweep_result.best_index, ranking_method,
+                )
+                _emit("sweep_pareto", fig_pareto)
             else:
                 print("Skipping 'sweep_overview': provide wandb_group or precomputed sweep_diagnostics.")
 
