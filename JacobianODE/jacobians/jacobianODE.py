@@ -468,7 +468,7 @@ class JacobianODEint:
             odeint_kwargs={"method": "rk4"}, 
             jacobianODE_kwargs={},
             inner_path="line",
-            inner_N=None,
+            inner_N=20,
             reverse=False,
             fast_mode=True,
             fast_mode_base_ind=None,

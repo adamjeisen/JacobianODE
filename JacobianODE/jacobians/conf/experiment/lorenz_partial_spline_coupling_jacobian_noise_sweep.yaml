@@ -1,16 +1,16 @@
 # @package _global_
 #
-# Experiment: Lorenz × SplineCoupling + Geometric Noise — loop-closure / KL sweep
+# Experiment: Lorenz × SplineCoupling + Jacobian Noise — loop-closure / KL sweep
 # ---------------------------------------------------------------------------------
 # Encoder : spline_coupling (RQS, 8 coupling layers, VAE on dynamic subspace)
-# Data    : Lorenz, fully observed (all 3 dims), 1 delay (no embedding)
+# Data    : Lorenz, partial observation (dim 0 only), 25-step delay embedding
 # Latent  : 3D dynamic subspace, no null space
-# Noise   : geometric_noise enabled (volume-preserving additive flow)
+# Noise   : jacobian_noise enabled (parameter-free orthogonalized Jacobian routing)
 # Sweep   : loop_closure_weight × kl_dyn_weight  (9 × 9 = 81 combinations)
 #
 # Launch:
 #   python -m JacobianODE.jacobians.run_jacobians --multirun \
-#     experiment=lorenz_spline_coupling_geometric_noise_sweep
+#     experiment=lorenz_partial_spline_coupling_jacobian_noise_sweep_many_step
 
 defaults:
   - override /data: dysts
@@ -21,9 +21,9 @@ defaults:
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 
-wandb_project: "Lorenz_IND${data.train_test_params.delay_embedding_params.observed_indices}_N${data.train_test_params.delay_embedding_params.n_delays}_D${data.train_test_params.delay_embedding_params.delay_spacing}_Norm${data.postprocessing.normalize}_T${model.n_target_dims}__JacobianODE"
+wandb_project: "Lorenz_PARTIAL_N${data.train_test_params.delay_embedding_params.n_delays}_D${data.train_test_params.delay_embedding_params.delay_spacing}_Norm${data.postprocessing.normalize}_T${model.n_target_dims}__JacobianODE"
 
-wandb_group: "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn_30step_cleantarget"
+wandb_group: "spline_coupling__jacobian_noise__sweep_lc_x_kl_dyn_30step"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
@@ -33,8 +33,8 @@ data:
   train_test_params:
     seq_length: 45     # traj_init_steps(15) + prediction_steps(30)
     delay_embedding_params:
-      observed_indices: 'all'   # fully observed (all 3 Lorenz dims)
-      n_delays: 1               # no delay embedding
+      observed_indices: [0]   # dim 0 only (Lorenz x-coordinate)
+      n_delays: 25            # 25-step delay embedding -> 25D input
       delay_spacing: 1
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -44,11 +44,11 @@ model:
   encoder_warmup_epochs: 5
   vae_sample_all_losses: true   # critical: downstream losses must see noisy z
   geometric_noise:
+    enabled: false
+  jacobian_noise:
     enabled: true
-    n_coupling_layers: 6
-    hidden_dim: 128              # smaller for 3D latent
-    n_hidden_layers: 2
-    permutation_seed: 0
+    lookahead_steps: null        # defaults to prediction_steps (30)
+    orthogonalize: true
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
@@ -66,4 +66,3 @@ training:
   early_stopping:
     early_stopping_patience: 5
     min_epochs: 10
-

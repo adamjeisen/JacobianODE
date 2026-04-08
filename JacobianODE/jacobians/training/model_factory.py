@@ -87,6 +87,10 @@ def make_model(
             extra_kwargs["geometric_noise"] = OmegaConf.to_container(
                 cfg.model.geometric_noise, resolve=True
             )
+        if "jacobian_noise" in cfg.model:
+            extra_kwargs["jacobian_noise"] = OmegaConf.to_container(
+                cfg.model.jacobian_noise, resolve=True
+            )
         # kl_null_weight / kl_dyn_weight are set via cfg.training.lightning
         # (the single source of truth). Model YAML values are kept as
         # documentation defaults only — do NOT pass them here, otherwise

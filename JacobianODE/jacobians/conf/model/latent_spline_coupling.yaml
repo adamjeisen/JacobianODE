@@ -44,3 +44,12 @@ geometric_noise:
   hidden_dim: 128              # hidden width of the conditioner MLPs inside each coupling layer
   n_hidden_layers: 2           # depth of conditioner MLPs
   permutation_seed: 0
+
+# Jacobian noise: parameter-free volume-preserving noise routing using the
+# Jacobian MLP.  Routes VAE noise into the stable manifold (contracting
+# directions) of the learned dynamics via K-step lookahead matrix exponentials.
+# Requires use_vae: true.  Mutually exclusive with geometric_noise.
+jacobian_noise:
+  enabled: false
+  lookahead_steps: null        # defaults to prediction_steps at runtime
+  orthogonalize: true          # polar decomposition: keep rotation, discard scaling

@@ -90,6 +90,7 @@ class LitLatentJacobianODE(LitBase):
         vae_sample_all_losses=False,
         kl_warmup_epochs=0,
         geometric_noise=None,
+        jacobian_noise=None,
         # Reconstruction mode
         reconstruction_mode='uniform',
         # Tangent space entropy
@@ -171,6 +172,26 @@ class LitLatentJacobianODE(LitBase):
                 permutation_seed=geometric_noise.get("permutation_seed", 0),
             )
             self.geometric_noise_enabled = True
+
+        # Jacobian noise: parameter-free volume-preserving noise routing
+        self.jacobian_noise_enabled = False
+        self.jacobian_noise_lookahead_steps = None
+        if jacobian_noise is not None and jacobian_noise.get("enabled", False):
+            if not use_vae:
+                raise ValueError("jacobian_noise requires use_vae=True")
+            if n_target_dims is None:
+                raise ValueError("jacobian_noise requires n_target_dims")
+            if self.geometric_noise_enabled:
+                raise ValueError(
+                    "jacobian_noise and geometric_noise are mutually exclusive"
+                )
+            self.jacobian_noise_enabled = True
+            self.jacobian_noise_lookahead_steps = jacobian_noise.get(
+                "lookahead_steps", None
+            )
+            self.jacobian_noise_orthogonalize = jacobian_noise.get(
+                "orthogonalize", True
+            )
 
         # Reconstruction mode
         if reconstruction_mode not in ('uniform', 'harmonic', 'most_recent'):
@@ -452,7 +473,20 @@ class LitLatentJacobianODE(LitBase):
             z_dyn = self.noise_warp.inverse(u_noisy)
             return z_dyn, log_var, u
 
-        # Standard VAE path (no geometric noise, or eval mode)
+        # Jacobian noise path: route isotropic noise through volume-preserving
+        # matrix derived from the K-step lookahead traceless Jacobians.
+        # KL is computed in U-space (on mu_dyn) — deliberate design choice.
+        if self.jacobian_noise_enabled and self.training:
+            A = self._compute_routing_matrices(mu_dyn)     # (..., T, D, D)
+            log_var = self.log_var_proj(mu_dyn)
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            noise = std * eps                               # (..., T, D)
+            routed_noise = torch.einsum('...ij,...j->...i', A, noise)
+            z_dyn = mu_dyn + routed_noise
+            return z_dyn, log_var, mu_dyn
+
+        # Standard VAE path (no geometric/jacobian noise, or eval mode)
         log_var = self.log_var_proj(mu_dyn)
         if self.training:
             std = torch.exp(0.5 * log_var)
@@ -475,6 +509,61 @@ class LitLatentJacobianODE(LitBase):
             return self.kl_null_weight, self.kl_dyn_weight
         ramp = min(self.current_epoch / self.kl_warmup_epochs, 1.0)
         return self.kl_null_weight * ramp, self.kl_dyn_weight * ramp
+
+    def _compute_routing_matrices(self, mu_dyn):
+        """Compute K-step lookahead volume-preserving routing matrices.
+
+        Uses the Jacobian MLP (detached) to build a matrix that routes noise
+        into the stable manifold of the dynamics.  Each single-step matrix
+        ``E_t = exp(-tilde{J}_t dt)`` is volume-preserving because
+        ``tilde{J}_t`` is traceless, and their product preserves this property.
+
+        Parameters
+        ----------
+        mu_dyn : torch.Tensor
+            Deterministic encoder means, shape ``(B, T, D)`` or ``(T, D)``.
+
+        Returns
+        -------
+        A : torch.Tensor
+            Routing matrices, same leading shape as *mu_dyn* plus ``(D, D)``.
+        """
+        D = mu_dyn.shape[-1]
+        T = mu_dyn.shape[-2]
+        K = self.jacobian_noise_lookahead_steps or self.prediction_steps
+
+        # 1. Jacobians at all points — detached so prediction loss doesn't
+        #    alter the vector field just to satisfy noise routing.
+        with torch.no_grad():
+            J = self.compute_jacobians(mu_dyn)          # (..., T, D, D)
+
+        # 2. Make traceless: J_tilde = J - tr(J)/D * I
+        trace_J = torch.diagonal(J, dim1=-2, dim2=-1).sum(-1)  # (..., T)
+        eye = torch.eye(D, device=mu_dyn.device, dtype=mu_dyn.dtype)
+        J_tilde = J - (trace_J / D)[..., None, None] * eye
+
+        # 3. Single-step backward matrices: E_t = exp(-J_tilde_t * dt)
+        E = torch.linalg.matrix_exp(-J_tilde * self.dt)  # (..., T, D, D)
+
+        # 4. Rolling window product: A_t = E_t @ E_{t+1} @ ... @ E_{t+K_eff-1}
+        #    Start with A = E (K=1), then progressively multiply in future steps.
+        #    For timesteps near the end where fewer than K future steps exist,
+        #    A retains the partial product (K_eff < K).
+        A = E.clone()
+        for k in range(1, K):
+            t_end = T - k
+            if t_end <= 0:
+                break
+            A[..., :t_end, :, :] = A[..., :t_end, :, :] @ E[..., k:k + t_end, :, :]
+
+        # 5. Optionally orthogonalize via polar decomposition: A = U @ P.
+        #    Keep only the orthogonal factor U = U_svd @ Vh so that
+        #    ||A @ noise|| = ||noise|| (pure rotation, no scaling).
+        if self.jacobian_noise_orthogonalize:
+            U_svd, _, Vh_svd = torch.linalg.svd(A)
+            A = U_svd @ Vh_svd
+
+        return A
 
     def _tangent_space_entropy_loss(self, batch, z_full):
         """Tangent space entropy using **encoder** Jacobians (dz/dx).
@@ -788,7 +877,7 @@ class LitLatentJacobianODE(LitBase):
             mu_dyn, _z_null = self._split_latent(z_full)
             z_dyn_sampled, _, _ = self._vae_reparameterize(mu_dyn)
             z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
-            z_dyn_clean = z_dyn  # save before latent noise
+            z_dyn_clean = mu_dyn  # target is always the mean, not the sample
 
             # Add isotropic noise in latent space before propagation.
             if latent_noise_scale > 0:
