@@ -1,3 +1,13 @@
+## Scientific Skills
+
+Before starting domain-specific work, call `find_helpful_skills` to check for relevant
+guidance. The following installed skills are especially relevant to this project — look for
+opportunities to apply them:
+- **fluidsim** — fluid dynamics simulation
+- **scikit-learn** — ML modeling, preprocessing, evaluation
+- **optimize-for-gpu** — GPU/CUDA optimization for training and inference
+- **aeon** — time series classification, regression, and forecasting
+
 ## Jupyter Notebooks
 
 Always use the notebook-mcp tools to read and edit `.ipynb` files. Never use the default 

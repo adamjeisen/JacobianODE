@@ -65,7 +65,7 @@ import math
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal, Sequence, overload
+from typing import Any, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -810,69 +810,6 @@ def plot_amplification(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-@overload
-def run_analytics(
-    wandb_entity: str,
-    wandb_project: str,
-    save_dir: str,
-    *,
-    run_id: str | None = None,
-    epoch: int | None = None,
-    wandb_group: str | None = None,
-    true_lyapunov: list[float] | None = None,
-    output: str | Sequence[str] = "show",
-    output_dir: str | Path | None = None,
-    sections: list[str] | None = None,
-    device: str | None = None,
-    n_sample: int = 128,
-    n_mase_batches: int = 10,
-    n_amp_trajs: int = 64,
-    n_amp_neighbors: int = 10,
-    n_amp_max_t: int = 10,
-    n_pred_trajs: int = 3,
-    lyapunov_burn_in_steps: int = 400,
-    lyapunov_burn_in_drop: int = 100,
-    sweep_diagnostics: list | None = None,
-    sweep_result: Any | None = None,
-    sweep_lambdas: list[float] | None = None,
-    ranking_method: str = "pareto_knee",
-    return_model: Literal[True],
-) -> tuple[dict[str, plt.Figure] | None, Any, str]: ...
-
-
-@overload
-def run_analytics(
-    wandb_entity: str,
-    wandb_project: str,
-    save_dir: str,
-    *,
-    run_id: str | None = None,
-    epoch: int | None = None,
-    wandb_group: str | None = None,
-    true_lyapunov: list[float] | None = None,
-    output: str | Sequence[str] = "show",
-    output_dir: str | Path | None = None,
-    sections: list[str] | None = None,
-    device: str | None = None,
-    n_sample: int = 128,
-    n_mase_batches: int = 10,
-    n_amp_trajs: int = 64,
-    n_amp_neighbors: int = 10,
-    n_amp_max_t: int = 10,
-    n_pred_trajs: int = 3,
-    lyapunov_burn_in_steps: int = 400,
-    lyapunov_burn_in_drop: int = 100,
-    sweep_diagnostics: list | None = None,
-    sweep_result: Any | None = None,
-    sweep_lambdas: list[float] | None = None,
-    ranking_method: str = "pareto_knee",
-    return_model: Literal[False] = False,
-) -> dict[str, plt.Figure] | None: ...
-
-
-# Implementation uses ``Any`` so checkers use the ``@overload`` signatures above;
-# a single union return would include ``None`` and confuse unpacking when
-# ``return_model=True``.
 def run_analytics(
     wandb_entity: str,
     wandb_project: str,
@@ -901,6 +838,7 @@ def run_analytics(
     sweep_lambdas: list[float] | None = None,
     ranking_method: str = "pareto_knee", # "best_traj_loss" | "pareto_knee" | "geo_rank" | "minimax_rank" | "geo_log_score" | "minimax_log_score"
     return_model: bool = False,
+    use_all_runs: bool = False,
 ) -> Any:
     """Run the full analytics suite on a trained LitLatentJacobianODE model.
 
@@ -1002,6 +940,7 @@ def run_analytics(
             wandb_group=wandb_group,
             ranking_method=ranking_method,
             verbose=True,
+            use_all_runs=use_all_runs,
         )
         print(f"Auto-selected run_id: {run_id}")
 

@@ -1,0 +1,675 @@
+{
+  "version": 1,
+  "skills": {
+    "adaptyv": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "2778e1be6177aa324f0cbd20ccea09557d6463ebfd1f78b3c0637e4a1666d684"
+    },
+    "aeon": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "c26b247eebaf022d6828ebdc7b85286068e5d0cd13163936e4511dc74ec23aae"
+    },
+    "anndata": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "18280011e7f1a4d2f10cb6132aa7245ba42ceb27af5c32bf3f380197dab3876f"
+    },
+    "arboreto": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "90abc6a682218153d5db86ba357ff88c7bf8a04658e196c7729ce6298e29012f"
+    },
+    "astropy": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "e2b86a967ad2bd71adfc4e12df2bc2adef2b0269def2c1be1c6f387966f08924"
+    },
+    "benchling-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "447548955df0c8d1da718a78ccd5884bd5ecdfe45376e41962f34ab5283f2b1d"
+    },
+    "bgpt-paper-search": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "8ff3ef019be001bc6dc05f889957ea93371daadf05da5c23edfc915b36c6131c"
+    },
+    "biopython": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "a2bd1f968a1a44efcf07d93eccb06e3d547a6fbe38249e62d537e60f3d783cfc"
+    },
+    "bioservices": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "8f19a68abfafd7640bbdfd3e5972c5634e535dab1480e904523b5cbce4fd1733"
+    },
+    "cellxgene-census": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "428b079158316e0c4e028e427326719296f56de9f2b8c1cb6ea69ec0baf7b64e"
+    },
+    "cirq": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "f0708e8c2112d827014356a98d88920992f074de92161d9cf3b801a619a56d55"
+    },
+    "citation-management": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "85f701e8e3eeee008e428572e709eebb35f68e4d05ccd2ed10f68245c36fabb7"
+    },
+    "clinical-decision-support": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "3501dcae8d1594ead02f9b864ee340d40310451e9f23ee773b6dd998607dc254"
+    },
+    "clinical-reports": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "7b0563f72544feb29fbc7103d4478690cbbe7af70f77de7056cef488cf0b70a2"
+    },
+    "cobrapy": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6109b533e13cc9d1c9977d5f601be08ff13984fef6036ac2d219fc0eca737df3"
+    },
+    "consciousness-council": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "2be1b7e1806e7d52afa6fe2cc6fbcff5e918a89dd4ba60e1481e0193386b29a4"
+    },
+    "dask": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "bf74ec18ab1266010c9ffc219588c63c16e80dbc1bdc9cc1e978ae30b93e4a4d"
+    },
+    "database-lookup": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "99fe11d4060b79e7f8c95d5402bf3e84f62878bbeb5650f071ed949769a036fa"
+    },
+    "datamol": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6947bfc3758a8b0590d0c0fd2d6ce71f225689d33abd382d155c2501f829ccb3"
+    },
+    "deepchem": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "af863ba80c98ab54c6801ec87a47654c10b81a7dfc8f65429550adc999b5b547"
+    },
+    "deeptools": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "adffca5aad95cf65a2100c1d63543e25f381ee9d3146d255b3879b5b428da5dc"
+    },
+    "depmap": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "60a34fdb465da44a385834e3116b4f348ad96937677e09ba97c78690f0816f75"
+    },
+    "dhdna-profiler": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "f0d385f215a5341d94ff80abd227c141fde297a44fd54f93b134a95891d3e324"
+    },
+    "diffdock": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "8c8b0462e8cf80957e72949fe080e804bc2cbfbbaec1cf98df1c56487a73121e"
+    },
+    "dnanexus-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "cca6bc354b41a9868b2bea8b5601a44c06aa1bfcc7e1093813b98c68ba7d1c61"
+    },
+    "docx": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6962db07127ee540a56e4677f65576d0727668a1d67f7da8bc978f10791c2bfe"
+    },
+    "esm": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "14b1aa7eb0b94caef0081b82cd6c7e8301ef96bc8ff4d372ecc27a46a585400b"
+    },
+    "etetoolkit": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "947bd71a5dcd040cba2317a1d9fbfa16f83ee7e5a9defbc4c8ab958233b1093b"
+    },
+    "exploratory-data-analysis": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "ee369723d5d416fe42be49b3551c3407bd7f50ffa75bb7dd9e5fd650cef6a719"
+    },
+    "flowio": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "dfc01deb461e7ff46a3666886880e10d551682bc2a3b3d11bb48aa228241bb2b"
+    },
+    "fluidsim": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "73ae36563ef2635494c738de0e3ba51fcf3fce83661be4fa7f5db941bb091785"
+    },
+    "generate-image": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "2b3e8713b3cb089e2f2424775f9b0caf516cbf6b89a35c1ddb04dd74f1091759"
+    },
+    "geniml": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "64e079dffb0293f935a0e6bf7d5a7ca0f3d2d01b81d32f9375952a78b582f152"
+    },
+    "geomaster": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "cc17180b1ec01513e2ee3fe99d0640b9ff10583e52809e6a0ae1d7ebfa0f7fa8"
+    },
+    "geopandas": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "dfe2aee0a20d778810fc6ea88bc7d1bdeac9c1f6f7dab310fe516d92ce5f7e31"
+    },
+    "get-available-resources": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "499cd3fd267a9b5640acc007fdf2b37551cdf602dfa120d5276eec8250b53d1a"
+    },
+    "gget": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "9660af8a9146c376175cd7507b805c29961c7253550710992ec399ab96b8bd74"
+    },
+    "ginkgo-cloud-lab": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "0cd60a3b4d84fa9a5dd0f5ed0f8f1c8c9d82879a681a32b2e4f6b038b749892b"
+    },
+    "glycoengineering": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "5d50abd1359e4969210c6ee9914e8568d3273cfde33f95c90a4dfb2384ac5103"
+    },
+    "gtars": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "f3f22665949963569ab5c49d11145c21ddf2340044f79472b42c139bccc6a6cd"
+    },
+    "histolab": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "29bb943ac19bd249090654652f64aecf7cc3d78642238243261df6863bf043d1"
+    },
+    "hypogenic": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "400c74325d5ba1168f1a6c7bdfeb5dde5640693f61e6a66133e68f7027fab743"
+    },
+    "hypothesis-generation": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "3de5bde762ed5d8bb19d78dcb1d9e84befb036ada11ffad05c0abd13aab4e79e"
+    },
+    "imaging-data-commons": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "bbef524b1de71df6a64763cbf38e5a1b0c04e953663ec7f88403e4ac816713f0"
+    },
+    "infographics": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "edcd57c4715395b9286bb2923b3aaf7ac0bb94946281df4fa1229002cb845698"
+    },
+    "iso-13485-certification": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "d971a761c33efbe73042f5398174cfa6b13812d5cd68c8af49e9390ae59761ad"
+    },
+    "labarchive-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "90e6c32c7a83c9c07cdb1339035cbb52b376ac509b2344fd5ef314d326badc3f"
+    },
+    "lamindb": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "63002dd4960343632b21905416d009944a7c41992ddac3b948d161d212761d18"
+    },
+    "latchbio-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "361e3f5c7239e9bcddc7a1622a74b36ed88c579342f9a3133bf485040ca0ffab"
+    },
+    "latex-posters": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "b5f12c89ad62b939f5b84ece745e1d5298de0b7d1a954c5ae6361c9a5ece99d7"
+    },
+    "literature-review": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "97e418aeba9389335b35a46ef2c05d49f8f5bb3d6036c0bf7b68a7659df6812a"
+    },
+    "markdown-mermaid-writing": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "e8a2ff91fa9ab3534d3e3ce4d796cbcaa8e0fa5c9145e95e21154c4aabb5df96"
+    },
+    "market-research-reports": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "adc174bbd96fd92e5b37410aa65419c0169e00cf44629e04b91c7f9809bf1eac"
+    },
+    "markitdown": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "d4e19bfed4e4c97ee7d74a320482b8bf7b8169506b811d29086801b9a191496a"
+    },
+    "matchms": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "a9d4a8cde2597f31a717c2fd874ceff01dcd3cf8478ce7382d175ab98830068f"
+    },
+    "matlab": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "1829d27f3687172cd4229487049bd2d33635bde25d1af30e09220b37891467bc"
+    },
+    "matplotlib": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "865d42f91864271b2099b3303ed837fbf91f4ab671f0269ab82a32dcf6c016fb"
+    },
+    "medchem": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "878f624403fb40ee83c6daad3d63a73ba1f51917c6a16cbd1f14eae0eca80fd0"
+    },
+    "modal": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "0b6e4f85c8ac2ddd94757cb1d0fbfcd415285306da1ca37cf482d017ea181ed4"
+    },
+    "molecular-dynamics": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "b117cb2b9d61aa499d11cf49b2cfacbe5bfa19177b3539912a76a836edeb36c1"
+    },
+    "molfeat": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "dd3e1bf6eeaf755e7f8d0d332ba12740abf413847d3ac15a9980fbf83a87bc15"
+    },
+    "networkx": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "0fd3ca893a9c254cd155c27d2adacffa5f69256f5237fab8012812f17f5a0b87"
+    },
+    "neurokit2": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "914dda06c37906ce67be62736bd05c2d64f11484dd00237a4b60370bd1211d8f"
+    },
+    "neuropixels-analysis": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6b9d44d1e21d71fafe82909c96a39ced7577196f15dcb05ef8a764119f384788"
+    },
+    "omero-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "188586b963ac06218edfcfa901994203f155dd57c9f15470b3bee44a2b16cfeb"
+    },
+    "open-notebook": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "f4ca0eda56ce29fa04d8e500d4b285ac8e8d50d0103e217002e55e9b3949b6bd"
+    },
+    "opentrons-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "3a6ef3afbfa4e9bee1baa6f8452d404a563b1f33efdd1f32e98d37b02a5437f2"
+    },
+    "optimize-for-gpu": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "397f72e9c6f4b08a1a30e213fb8df31deed7f5f295bf625995cf90c9324b18e1"
+    },
+    "paper-lookup": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "54d5b222f32fc53d09234d429c147b895ebd4f1950e0d3e0cd4014fc597e40ae"
+    },
+    "parallel-web": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6ecc36797b177eb7d7184c40b7a7ed572c56877d1a6cd3da7bee0f97193c4842"
+    },
+    "pathml": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "47ceb685e4fad02fef7049f93e6271601d9ea3eb7ff370da516592ea632f8c07"
+    },
+    "pdf": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "cfbc539377088ca7e44a813b30c306327385bbd973cd7a721e1743f60837dd62"
+    },
+    "peer-review": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "645c54f367e70b5ff5553baa0d73e157c519355e6f2b47ae4510cba7f9e58b94"
+    },
+    "pennylane": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "cb3bc9cb5deb8c91b189d527c3ebb3f4313673233514cc30d243178309f08afd"
+    },
+    "perplexity-search": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "59f20cd92e0740e8248115ebe553b50822aa6758ab93a811b65a6d6d02041540"
+    },
+    "phylogenetics": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "2cc741f69daafa2ce0bd8124e54dc86ff2ee86ec3015b98f8f5b1abaadd923ea"
+    },
+    "polars": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6cd9828b52982db29bdefcfba4faca1ff5aaff09b385c0ddee4a711c38844a4c"
+    },
+    "polars-bio": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "3199fdbcf3142a1a387ee57d39811008ce98ec5de5efc63c896d999ee8f403e3"
+    },
+    "pptx": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6b8b859d26f93aa059c9870d1ab76b44ab69e3d6757ce4a03cc94cb760888073"
+    },
+    "pptx-posters": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "2462495ea750519ac6f0d53a523d5480a757682641d9610c4087d0ce2990a438"
+    },
+    "primekg": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "cf2c61f60dba83e0e224d3ca4d06e0dc0884b96107ec2f70ebf0fce9f359694e"
+    },
+    "protocolsio-integration": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "e64de7f3791a074d45d261778621e17a056cf4566f074eb733eee80819c6224b"
+    },
+    "pufferlib": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "cfe81d43a39fd8b19e841704ae791a0120a8fab9fc05fd0c67c4f2812120bd80"
+    },
+    "pydeseq2": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "381e40e67825ccc7048ee7d09b3b15cfaae345b4f2defcae34155efb9969ec78"
+    },
+    "pydicom": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "eb2a8e980f9310090866e313b6e9b429f180dcc7c83b8aced6eb396240f1d127"
+    },
+    "pyhealth": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "ae4f34f7b5b9ea9c416788c7eba5dd71f70016e4ab99ccd0fc7bce2a19f0251d"
+    },
+    "pylabrobot": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "5a14eafab025cf83457671bfd8df27a138b67f0d2431c20a00a037dd3d1b5531"
+    },
+    "pymatgen": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "dba3e82225c07cdd0a07e37c519e3d304f1f212d5355830a52f1d6dba91f1422"
+    },
+    "pymc": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "eefa96244586f41258c2131d444938cb88c198acae8546097cd1af8198655e1f"
+    },
+    "pymoo": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "e9eb8a69f409cd3a8717671aa0af0c4eae0bd18ed3323e50ea525e9d650be8de"
+    },
+    "pyopenms": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "9586d788f18bda14611a095fa9e7fbd1aaccd466d0d673ad803a5beff63094ff"
+    },
+    "pysam": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "856681b142c33bfb9245dee42e75a1b7b0594e1771e18aafbf5a775dfcb9663f"
+    },
+    "pytdc": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "a7c37403d3bea4f20f12078cedd0ac3204332ff3509fc5a5a197f7548edd17e0"
+    },
+    "pytorch-lightning": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "8753b2a85f2822c4a13a641c458176971c32a500f12fee521a682dc8c742cb33"
+    },
+    "pyzotero": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "4de42de41a4ef860649b129cf36322f785a8c2f630b7af709552702d0f0cc167"
+    },
+    "qiskit": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "73fc896ff4011aae54799b06b12554137aa739b21df8cb9d7673731e47e394ce"
+    },
+    "qutip": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "c1ef2c2492488bdea0dd3e8c083827a4f10dd580624317a1535d47d7d49bf0a3"
+    },
+    "rdkit": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "b1d3506bf2bfa3dd816e5f8cf24d97f35aa6710cb4f64ef794fd4b6202e9a624"
+    },
+    "research-grants": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "f4639b7986393f5c4189ec5c7c61c923fc05fc993f6e25f75986068f0baaa7de"
+    },
+    "research-lookup": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "13dd9675108adcddced2f3c088906c00b852fd278e5721271e1179afa77b1c6a"
+    },
+    "rowan": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "191dd103e147612829676da7f4045172ea157b504d58cb1cb36d23790ecd947e"
+    },
+    "scanpy": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "7185f1925df161a465097205d73deedd4c96e6af27bcd2738d784f2599a37291"
+    },
+    "scholar-evaluation": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "0e0e3584e45578e7ac3185fe33d84f1f5e7c77b11ca0be05eb1408b949554505"
+    },
+    "scientific-brainstorming": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "a3257a85239d8c378bbb98b27bdd75408a1a0de5d3ff20166db1a17c0f1829cd"
+    },
+    "scientific-critical-thinking": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6618d18454e841b811e50852ca1145d479a105d1978c48ed4f0fc91599233ed5"
+    },
+    "scientific-schematics": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "14a35f07f75e8fb38608e50ac16a6932fb8a0c6d688c4d158838f68911d9d929"
+    },
+    "scientific-slides": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "de27a17060d7debab5eb76beb671bdecf8a372e13b49b2cfca78f511d3be60c1"
+    },
+    "scientific-visualization": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "51d5edb94e1d83855002ddf78eddc53f322e00ba7004ea7d054ae1198a548958"
+    },
+    "scientific-writing": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "7c8528ee48f0455c56d007d8ae38c24c6318ed6234ab2ff2a4065a4482b1eeda"
+    },
+    "scikit-bio": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "998a08f09ce1604eeb1ac32f607a55768143006b3f436040c9c26e4d94b33104"
+    },
+    "scikit-learn": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "4cc5b4ce177d538d5923c3cdd30fc75a09d4f63a0c9696827a83e2d80aca0f90"
+    },
+    "scikit-survival": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "d9d1968cd82c6f61406033cac64cc746b58394c555ae0e8d4e7aacc185c239a6"
+    },
+    "scvelo": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "d2624e64237ce3b2c4bf757c83b61f1ec1f8ed8fa6b1f404149f9b3147b9ddca"
+    },
+    "scvi-tools": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "f6c046a936769f61cb9747bd9c8700943086d764ee35996fb384e3b57335ac46"
+    },
+    "seaborn": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "c7292c8048941783cf6b769a7fb48dc1e7df9d4857ea06930bc05573fb1ee357"
+    },
+    "shap": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "bd35d957ed974d7038e7f07e88dc4d23618bbcff27ea2e64f375c30234beb132"
+    },
+    "simpy": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "94e1f98f55671824b6c6bd7bed720a22b060c63b3482b2a7a801cead5a69ea55"
+    },
+    "stable-baselines3": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "d897ff1092a816651c5a32a12a6ac09dcc4d4f51e58f97d7854e609598966291"
+    },
+    "statistical-analysis": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "7498aec2edcbe0e0c657d2f702478eacd6d0277d0304de5f557a045083298f05"
+    },
+    "statsmodels": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "4f07cfe787d813ec4eeaa8d97232740dbb6de5937b3efd440bd6d62651ea9023"
+    },
+    "sympy": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "1ae5fabd2e36cca7f4d734f443bf72a17835fa59eddad721f7fc00534c8bdb75"
+    },
+    "tiledbvcf": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "295acb7c536d7e5a52c418271f799f503c4c90948c5d605e543643e3c28d90ba"
+    },
+    "timesfm-forecasting": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "9cdf9a383b9b55a209efa32b583869509515d7b26a91c3d3c35125b7b5e3d408"
+    },
+    "torch-geometric": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "d7cdf6a608ca2bb2db49abef78c927c097541d6aeb0c3b0b9093bdbecea620d0"
+    },
+    "torchdrug": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6dc0b698bf044d39fb0d08c1951426eeaeb2e951a78da292d786503114cdd705"
+    },
+    "transformers": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "892c0a271afd80a0504595b67e30b422314969427204b38f6b680fd12be33fbe"
+    },
+    "treatment-plans": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "77733fdb7fda85164675f792645b02018513ccba252e99ed4b21afe3c22d1a59"
+    },
+    "umap-learn": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "84f93704aa4e153faf6554b78ffacc34e1e738bd3bb05538aa0ce59e0b8132c5"
+    },
+    "usfiscaldata": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "891fe5d5399d34cd5d4a5e18bb5fb768d6fe34a82b8ecbf1dacc858dac9c14be"
+    },
+    "vaex": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "5433dd845fc7da9159313fcc8a98474b947e419730d243c58be4e4f45ed5789a"
+    },
+    "venue-templates": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "6618b086a7188022804349e1de9c481ace40bf6404bb56139bbb87d275e55377"
+    },
+    "what-if-oracle": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "649eaa2bd9c3a7161a602db0e1189f524d8db5a14e4146ca6524e37ff58cdde0"
+    },
+    "xlsx": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "efd0c8011cf0677d8075cf93867ecec804f9a8754a777e1d2fdb46197e9c247f"
+    },
+    "zarr-python": {
+      "source": "K-Dense-AI/claude-scientific-skills",
+      "sourceType": "github",
+      "computedHash": "29a448eef544f2bc0ea6151416ddf490c6e5d22a9ced4761067a0a0ebf765767"
+    }
+  }
+}

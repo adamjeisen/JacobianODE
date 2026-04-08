@@ -7,6 +7,7 @@ _jupyter/checkpoints/
 JacobianODE/fnn/Deep_reconstruction_of_strange_attractors.pdf
 .claude
 .submitit_logs/
+.agents/
 _jupyter/*.pdf
 _jupyter/*.html
 _jupyter/_sandbox/*.html

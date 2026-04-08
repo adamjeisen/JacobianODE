@@ -168,6 +168,20 @@ def _run_training(cfg: DictConfig) -> float:
     else:
         lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, verbose=True)
 
+    # Store SLURM timeout in the app config so it gets logged to W&B.
+    # This allows downstream tools (run_analytics, discover_sweep_runs) to
+    # determine if a crashed run hit the walltime without reading local files.
+    try:
+        from hydra.core.hydra_config import HydraConfig
+        hcfg = HydraConfig.get()
+        timeout_min = OmegaConf.select(hcfg.cfg, "hydra.launcher.timeout_min", default=None)
+        if timeout_min is not None:
+            OmegaConf.set_struct(cfg, False)
+            cfg.slurm_timeout_min = int(timeout_min)
+            OmegaConf.set_struct(cfg, True)
+    except Exception:
+        pass  # Not running under Hydra launcher (e.g. local / notebook)
+
     # Log training information
     log_training_info(train_dataloader, trajs, lit_model, log=log)
 

@@ -454,6 +454,14 @@ def discover_sweep_runs(
     *,
     delete_crashed: bool = False,
     verbose: bool = False,
+    # Early-stopping / walltime params for classifying crashed runs as done
+    es_monitor: str = "mean val loss",
+    es_patience: int = 5,
+    es_percent_thresh: float = 0.01,
+    es_min_epochs: int = 10,
+    slurm_timeout_min: Optional[float] = None,
+    walltime_tolerance_min: float = 5.0,
+    use_all_runs: bool = False,
 ) -> DiscoveredSweep:
     """Query W&B for finished JacobianODE runs in a project (optionally filtered by group).
 
@@ -482,6 +490,10 @@ def discover_sweep_runs(
     """
     import wandb as _wandb
 
+    from .run_status import is_run_effectively_done, meets_early_stopping_criterion, hit_slurm_walltime
+
+    _DEFAULT_SLURM_TIMEOUT_MIN = 180
+
     api = _wandb.Api(timeout=90)
     project_path = f"{wandb_entity}/{wandb_project}"
     run_filters = {"group": wandb_group} if wandb_group else None
@@ -500,36 +512,116 @@ def discover_sweep_runs(
             print(f"  {r.id}: state={r.state}, lc={lc}, te={te}, kl_dyn={kd}")
         print()
 
-    # Handle crashed/failed runs
+    # Auto-detect slurm_timeout_min from W&B run configs if not provided
+    if slurm_timeout_min is None:
+        for r in all_runs:
+            val = r.config.get("slurm_timeout_min")
+            if val is not None:
+                slurm_timeout_min = float(val)
+                if verbose:
+                    print(f"Auto-detected slurm_timeout_min={slurm_timeout_min} from run {r.id}")
+                break
+        if slurm_timeout_min is None:
+            slurm_timeout_min = _DEFAULT_SLURM_TIMEOUT_MIN
+            print(
+                f"slurm_timeout_min not found in any run config — "
+                f"falling back to {_DEFAULT_SLURM_TIMEOUT_MIN} min"
+            )
+
+    # Handle crashed/failed runs scheduled for deletion
     crashed_ids: List[str] = []
-    for run in all_runs:
-        if run.state in ("crashed", "failed") and _is_jac_ode_run(run):
+    if delete_crashed:
+        for run in all_runs:
+            if run.state not in ("crashed", "failed") or not _is_jac_ode_run(run):
+                continue
             lam = _get_loop_closure_weight(run)
-            if delete_crashed:
+            # Only delete runs that are truly failed (not converged/walltimed)
+            effectively_done = is_run_effectively_done(
+                run,
+                monitor=es_monitor,
+                patience=es_patience,
+                percent_thresh=es_percent_thresh,
+                min_epochs=es_min_epochs,
+                slurm_timeout_min=slurm_timeout_min,
+                walltime_tolerance_min=walltime_tolerance_min,
+            )
+            if not effectively_done:
                 if verbose:
                     print(f"CRASHED: run_id={run.id} (lc={lam}) — deleting from W&B")
                 run.delete()
                 crashed_ids.append(run.id)
             elif verbose:
-                print(f"CRASHED: run_id={run.id} (lc={lam}) — keeping")
+                print(f"CRASHED but done: run_id={run.id} (lc={lam}) — keeping")
 
-    # Collect finished sweep runs
+    # Collect effectively-done sweep runs
     run_ids: List[str] = []
     lambdas: List[float] = []
     te_weights: List[float] = []
     kd_weights: List[float] = []
 
     for run in all_runs:
-        if run.state != "finished" or not _is_jac_ode_run(run):
+        if not _is_jac_ode_run(run):
             continue
         if run.id in crashed_ids:
             continue
+
         lc = _get_loop_closure_weight(run)
-        if lc is not None:
+        if lc is None:
+            continue
+
+        if use_all_runs:
+            if verbose:
+                print(f"  Including {run.id} (lc={lc}): use_all_runs=True (state={run.state})")
             run_ids.append(run.id)
             lambdas.append(lc)
             te_weights.append(_get_tangent_entropy_weight(run))
             kd_weights.append(_get_kl_dyn_weight(run))
+            continue
+
+        if run.state == "finished":
+            run_ids.append(run.id)
+            lambdas.append(lc)
+            te_weights.append(_get_tangent_entropy_weight(run))
+            kd_weights.append(_get_kl_dyn_weight(run))
+            continue
+
+        if run.state not in ("crashed", "failed"):
+            continue
+
+        # Check why this crashed/failed run should be included
+        converged, last_ep = meets_early_stopping_criterion(
+            run,
+            monitor=es_monitor,
+            patience=es_patience,
+            percent_thresh=es_percent_thresh,
+            min_epochs=es_min_epochs,
+        )
+        if converged:
+            if verbose:
+                print(
+                    f"  Including {run.id} (lc={lc}): "
+                    f"converged at epoch {last_ep} (early stopping criterion met)"
+                )
+            run_ids.append(run.id)
+            lambdas.append(lc)
+            te_weights.append(_get_tangent_entropy_weight(run))
+            kd_weights.append(_get_kl_dyn_weight(run))
+            continue
+
+        if hit_slurm_walltime(run, slurm_timeout_min, tolerance_min=walltime_tolerance_min):
+            if verbose:
+                print(
+                    f"  Including {run.id} (lc={lc}): "
+                    f"hit SLURM walltime ({slurm_timeout_min} min)"
+                )
+            run_ids.append(run.id)
+            lambdas.append(lc)
+            te_weights.append(_get_tangent_entropy_weight(run))
+            kd_weights.append(_get_kl_dyn_weight(run))
+            continue
+
+        if verbose:
+            print(f"  Excluding {run.id} (lc={lc}): crashed/failed, not converged, not walltimed")
 
     # Sort by lambda
     sorted_tuples = sorted(zip(lambdas, te_weights, kd_weights, run_ids))
@@ -539,7 +631,7 @@ def discover_sweep_runs(
     run_ids = [t[3] for t in sorted_tuples]
 
     if verbose:
-        print(f"Found {len(run_ids)} finished sweep runs:")
+        print(f"Found {len(run_ids)} effectively-done sweep runs:")
         for lam, te, kd, rid in zip(lambdas, te_weights, kd_weights, run_ids):
             print(
                 f"  loop_closure_weight={lam}, tangent_entropy_weight={te}, "
@@ -567,6 +659,14 @@ def select_best_from_sweep(
     delete_crashed: bool = False,
     verbose: bool = False,
     ranking_method: RankingMethod = "pareto_knee",
+    # Early-stopping / walltime params forwarded to discover_sweep_runs
+    es_monitor: str = "mean val loss",
+    es_patience: int = 5,
+    es_percent_thresh: float = 0.01,
+    es_min_epochs: int = 10,
+    slurm_timeout_min: Optional[float] = None,
+    walltime_tolerance_min: float = 5.0,
+    use_all_runs: bool = False,
 ) -> tuple[str, SweepResult, DiscoveredSweep]:
     """Discover sweep runs and select the best one.
 
@@ -614,6 +714,13 @@ def select_best_from_sweep(
     discovered = discover_sweep_runs(
         wandb_entity, wandb_project, wandb_group,
         delete_crashed=delete_crashed, verbose=verbose,
+        es_monitor=es_monitor,
+        es_patience=es_patience,
+        es_percent_thresh=es_percent_thresh,
+        es_min_epochs=es_min_epochs,
+        slurm_timeout_min=slurm_timeout_min,
+        walltime_tolerance_min=walltime_tolerance_min,
+        use_all_runs=use_all_runs,
     )
 
     if not discovered.run_ids:

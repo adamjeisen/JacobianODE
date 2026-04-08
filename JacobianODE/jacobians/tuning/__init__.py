@@ -5,6 +5,11 @@ from __future__ import annotations
 from .criteria import DiagnosticMetrics, diagnostics_from_wandb
 from .ranking import ALL_RANKING_METHODS, RankingMethod, rank_survivors
 from .selection import SelectionResult, select_best_model
+from .run_status import (
+    hit_slurm_walltime,
+    is_run_effectively_done,
+    meets_early_stopping_criterion,
+)
 from .sweep import (
     DEFAULT_LAMBDA_LOOP_VALUES,
     DiscoveredSweep,
@@ -25,6 +30,9 @@ __all__ = [
     "SweepResult",
     "diagnostics_from_wandb",
     "discover_sweep_runs",
+    "hit_slurm_walltime",
+    "is_run_effectively_done",
+    "meets_early_stopping_criterion",
     "rank_survivors",
     "run_sweep",
     "select_best_from_sweep",
