@@ -10,9 +10,20 @@ opportunities to apply them:
 
 ## Jupyter Notebooks
 
-Always use the notebook-mcp tools to read and edit `.ipynb` files. Never use the default 
-notebook read/edit/grep tools. Specifically:
+Never use the default notebook read/edit/grep tools. Never try to read the raw `.ipynb` 
+JSON directly. Two MCP servers are available for notebook work:
+
+### notebook-mcp (structural editing)
+Use for reading, editing, and organizing notebook structure:
 - Use `notebook_get_outline` first to understand the structure before editing
 - Use `notebook_search` to locate specific cells by keyword
 - Use `notebook_edit_cell` for targeted edits
-- Never try to read the raw `.ipynb` JSON directly
+- Use `notebook_add_cell`, `notebook_delete_cell`, `notebook_move_cell` for structure changes
+
+### jupyter-server MCP (execution & debugging)
+Use for running code and inspecting results. Requires a running Jupyter server 
+(user starts one with `jlab` in terminal, which runs on localhost:8888):
+- Use `execute_notebook_code` to run cells and get outputs
+- Use `setup_notebook` to connect to a notebook on the server
+- Use `query_notebook` to inspect notebook state
+- Best for: iterating on code, debugging, checking outputs, running analysis

@@ -952,6 +952,64 @@ def run_analytics(
         if sweep_lambdas is None:
             sweep_lambdas = _auto_discovered.lambdas
 
+        # --- Print Pareto frontier runs and all ranking method picks ----------
+        _diags = _auto_sweep_result.all_diagnostics
+        _rids = _auto_discovered.run_ids
+        _traj = np.array([d.trajectory_val_loss for d in _diags])
+        _lc = np.array([
+            d.loop_closure_loss if d.loop_closure_loss is not None else np.nan
+            for d in _diags
+        ])
+        _valid = np.isfinite(_lc) & np.isfinite(_traj)
+
+        # Compute Pareto frontier
+        _pareto_mask = np.zeros(len(_traj), dtype=bool)
+        for _i in range(len(_traj)):
+            if not _valid[_i]:
+                continue
+            _dominated = False
+            for _j in range(len(_traj)):
+                if _i == _j or not _valid[_j]:
+                    continue
+                if (_traj[_j] <= _traj[_i] and _lc[_j] <= _lc[_i]
+                        and (_traj[_j] < _traj[_i] or _lc[_j] < _lc[_i])):
+                    _dominated = True
+                    break
+            if not _dominated:
+                _pareto_mask[_i] = True
+
+        _pareto_idx = np.where(_pareto_mask)[0]
+        _pareto_order = _pareto_idx[np.argsort(_lc[_pareto_idx])]
+
+        print(f"\n{'='*70}")
+        print(f"PARETO FRONTIER RUNS ({len(_pareto_order)} runs)")
+        print(f"{'='*70}")
+        print(f"  {'Run ID':<12s}  {'LC Loss':>14s}  {'Traj Val Loss':>14s}")
+        print(f"  {'-'*12}  {'-'*14}  {'-'*14}")
+        for _pi in _pareto_order:
+            _marker = " <-- selected" if _rids[_pi] == run_id else ""
+            print(f"  {_rids[_pi]:<12s}  {_lc[_pi]:>14.6f}  {_traj[_pi]:>14.6f}{_marker}")
+
+        # Run all ranking methods and print which run each picks
+        from .tuning.ranking import ALL_RANKING_METHODS, rank_survivors
+        _survivors = _auto_sweep_result.selection.surviving_indices
+        print(f"\n{'='*70}")
+        print(f"RANKING METHOD COMPARISON (over {len(_survivors)} survivors)")
+        print(f"{'='*70}")
+        print(f"  {'Method':<22s}  {'Run ID':<12s}  {'LC Loss':>14s}  {'Traj Val Loss':>14s}")
+        print(f"  {'-'*22}  {'-'*12}  {'-'*14}  {'-'*14}")
+        for _method in ALL_RANKING_METHODS:
+            try:
+                _best_idx = rank_survivors(_survivors, _diags, method=_method)
+                _marker = " <-- active" if _method == ranking_method else ""
+                print(
+                    f"  {_method:<22s}  {_rids[_best_idx]:<12s}  "
+                    f"{_lc[_best_idx]:>14.6f}  {_traj[_best_idx]:>14.6f}{_marker}"
+                )
+            except Exception as _e:
+                print(f"  {_method:<22s}  ERROR: {_e}")
+        print(f"{'='*70}\n")
+
     active_sections = set(sections if sections is not None else _ALL_SECTIONS)
 
     device_obj = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -1540,9 +1598,10 @@ def run_analytics(
                 _state["Z_flat"] = _Z.reshape(-1, _Z.shape[-1])
 
             _Z_flat_pca = _state["Z_flat"]
+            _X_true_src = trajs.get("train_trajs_full", trajs["train_trajs"])
             _X_true_flat = np.asarray(
-                trajs.get("test_trajs_full", trajs["test_trajs"]).sequence
-            ).reshape(-1, test_trajs_full.shape[-1])
+                _X_true_src.sequence
+            ).reshape(-1, _X_true_src.sequence.shape[-1])
             _mean_ky_true_pca = float(ky_emp_np_ky.mean()) if ky_emp_np_ky is not None else None
 
             # Compute burn-in D_KY if burn-in Lyapunov exponents are available

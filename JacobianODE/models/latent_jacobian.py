@@ -1652,10 +1652,16 @@ class LitLatentJacobianODE(LitBase):
                 if self.n_eigval_jacobians is not None and self.n_eigval_jacobians < B * T:
                     idx = torch.randperm(B * T, device=jacs_flat.device)[:self.n_eigval_jacobians]
                     jacs_flat = jacs_flat[idx]
-                eigs_real = torch.linalg.eigvals(jacs_flat).real.flatten()
-                threshold = -1.0 / self.dt
-                n_too_fast = torch.sum(eigs_real <= threshold).float().item()
-                n_total = len(eigs_real)
+                finite_mask = torch.isfinite(jacs_flat).all(dim=-1).all(dim=-1)
+                jacs_finite = jacs_flat[finite_mask]
+                if jacs_finite.numel() > 0:
+                    eigs_real = torch.linalg.eigvals(jacs_finite).real.flatten()
+                    threshold = -1.0 / self.dt
+                    n_too_fast = torch.sum(eigs_real <= threshold).float().item()
+                    n_total = len(eigs_real)
+                else:
+                    n_too_fast = 0.0
+                    n_total = 0
         if not hasattr(self, '_val_eig_too_fast'):
             self._val_eig_too_fast = []
             self._val_eig_total = []

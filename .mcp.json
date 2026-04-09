@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "jupyter-server": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "mcp-jupyter"
+      ],
+      "env": {
+        "TOKEN": "jacobianode-jupyter-token"
+      }
+    }
+  }
+}
