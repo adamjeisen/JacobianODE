@@ -14,9 +14,9 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.0.0",
-    "torchvision",
-    "torchaudio",
+    # torch / torchvision / torchaudio are declared in [dependency-groups]
+    # below (cu128 by default, cu118 opt-in) so the CUDA build can be
+    # selected per-machine. See [tool.uv] for the conflict + index setup.
     "lightning>=2.0.0",
     "jupyter",
     "jupyterlab",
@@ -55,4 +55,50 @@ dev = [
     "ipdb",
     "ipykernel>=7.1.0",
     "pytest>=9.0.2",
+]
+cu128 = [
+    "torch>=2.0.0",
+    "torchvision",
+    "torchaudio",
+]
+cu118 = [
+    "torch>=2.0.0",
+    "torchvision",
+    "torchaudio",
+]
+
+[tool.uv]
+# cu128 is the default GPU build. To install the cu118 build instead
+# (e.g. on a Pascal GPU), run:
+#   uv sync --no-group cu128 --group cu118
+default-groups = ["dev", "cu128"]
+conflicts = [
+    [
+        { group = "cu118" },
+        { group = "cu128" },
+    ],
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", group = "cu128" },
+    { index = "pytorch-cu118", group = "cu118" },
+]
+torchvision = [
+    { index = "pytorch-cu128", group = "cu128" },
+    { index = "pytorch-cu118", group = "cu118" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", group = "cu128" },
+    { index = "pytorch-cu118", group = "cu118" },
 ]
