@@ -91,6 +91,7 @@ class LitLatentJacobianODE(LitBase):
         kl_warmup_epochs=0,
         geometric_noise=None,
         jacobian_noise=None,
+        eigenvalue_noise=None,
         # Reconstruction mode
         reconstruction_mode='uniform',
         # Tangent space entropy
@@ -191,6 +192,27 @@ class LitLatentJacobianODE(LitBase):
             )
             self.jacobian_noise_orthogonalize = jacobian_noise.get(
                 "orthogonalize", True
+            )
+
+        # Eigenvalue noise: parameter-free anisotropic noise routing using the
+        # Jacobian's eigenstructure.  Routes more noise into contracting
+        # directions (negative eigenvalues of the symmetric part of J) and less
+        # into expanding ones.  No extra trainable parameters.
+        self.eigenvalue_noise_enabled = False
+        self.eigenvalue_noise_temperature = None
+        if eigenvalue_noise is not None and eigenvalue_noise.get("enabled", False):
+            if self.geometric_noise_enabled:
+                raise ValueError(
+                    "eigenvalue_noise and geometric_noise are mutually exclusive"
+                )
+            if self.jacobian_noise_enabled:
+                raise ValueError(
+                    "eigenvalue_noise and jacobian_noise are mutually exclusive"
+                )
+            self.eigenvalue_noise_enabled = True
+            # temperature controls anisotropy strength; None → auto (self.dt)
+            self.eigenvalue_noise_temperature = eigenvalue_noise.get(
+                "temperature", None
             )
 
         # Reconstruction mode
@@ -564,6 +586,49 @@ class LitLatentJacobianODE(LitBase):
             A = U_svd @ Vh_svd
 
         return A
+
+    def _eigenvalue_noise_geometry(self, z):
+        """Compute eigenvalue-guided anisotropic noise scales and directions.
+
+        Uses the symmetric part of the learned Jacobian (detached) to identify
+        contracting vs expanding directions.  Returns per-direction scales that
+        amplify noise in contracting directions and suppress it in expanding
+        ones, plus the eigenvectors defining those directions.
+
+        The scaling is ``s_i = exp(-lambda_i * temperature)`` normalised so
+        that ``mean(s) = 1``, preserving total noise energy while
+        redistributing it toward contracting directions.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Latent states, shape ``(..., D)`` (typically ``(B, T, D)``).
+
+        Returns
+        -------
+        scales : torch.Tensor
+            Per-direction noise multipliers, shape ``(..., D)``.
+            Normalised so that ``scales.mean(-1) ≈ 1``.
+        eigvecs : torch.Tensor
+            Columns are eigenvectors of the symmetric Jacobian,
+            shape ``(..., D, D)``.
+        """
+        D = z.shape[-1]
+        temp = self.eigenvalue_noise_temperature
+        if temp is None:
+            temp = self.dt
+
+        with torch.no_grad():
+            J = self.compute_jacobians(z)                        # (..., D, D)
+            J_sym = 0.5 * (J + J.transpose(-1, -2))
+            eigenvalues, eigvecs = torch.linalg.eigh(J_sym)     # ascending
+
+            # exp(-λ * temp): contracting (λ<0) → scale>1, expanding (λ>0) → scale<1
+            raw_scales = torch.exp(-eigenvalues * temp)
+            # Normalise to preserve total noise energy
+            scales = raw_scales * (D / raw_scales.sum(dim=-1, keepdim=True))
+
+        return scales, eigvecs
 
     def _tangent_space_entropy_loss(self, batch, z_full):
         """Tangent space entropy using **encoder** Jacobians (dz/dx).
