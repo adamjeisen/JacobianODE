@@ -21,10 +21,10 @@ defaults:
 wandb_entity: JacobianODE
 
 # Project encodes: data source, observed dims, delay params, normalization, latent dim, encoder
-wandb_project: "WMTask_INDall_N${data.train_test_params.delay_embedding_params.n_delays}_D${data.train_test_params.delay_embedding_params.delay_spacing}_Norm${data.postprocessing.normalize}_T${model.n_target_dims}__JacobianODE"
+wandb_project: "WMTask_IND${data.train_test_params.delay_embedding_params.observed_indices}_N${data.train_test_params.delay_embedding_params.n_delays}_D${data.train_test_params.delay_embedding_params.delay_spacing}_Norm${data.postprocessing.normalize}_T${model.n_target_dims}__JacobianODE"
 
 # Group encodes: what is swept + key fixed hyperparams
-wandb_group: "spline_coupling__sweep_lc_x_kl_dyn_vae_sample_all_losses"
+wandb_group: "spline_coupling__sweep_lc_x_kl_dyn_${model.prediction_steps}step_cleantarget"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
@@ -33,6 +33,10 @@ data:
     normalize: true    # default false
   train_test_params:
     seq_length: 45     # traj_init_steps(15) + prediction_steps(30)
+    delay_embedding_params:
+      observed_indices: 'all'   # fully observed (all 128 dims)
+      n_delays: 1               # no delay embedding
+      delay_spacing: 1
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:

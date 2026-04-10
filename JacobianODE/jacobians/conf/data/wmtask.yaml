@@ -13,6 +13,8 @@ dataset_loader:
   model_to_load: "final"
   dataloader_to_use: "all"
   traj_window: "delay2"
+  verbose: true
+  use_cache: true
 
 flow:
   dim: 128  # N1 + N2 = 64 + 64

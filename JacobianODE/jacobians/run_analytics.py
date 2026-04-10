@@ -1388,14 +1388,25 @@ def run_analytics(
                 n_full_trajs = z_for_jac_full.shape[0]
                 print(f"  Computing full-trajectory Lyapunov ({n_full_trajs} test trajs, "
                       f"T={traj_seq_full.shape[1]}) ...")
+                # Chunked-batched: compute_jacobians and compute_lyapunov_exponents
+                # both broadcast over a leading batch dim. Process the trajectories
+                # in chunks to bound peak memory (jacs are (B_chunk, T, D, D)) while
+                # keeping everything on device until the final stack.
+                _lyap_chunk_size = 64
                 _lyap_full_list = []
-                for _i in range(n_full_trajs):
-                    _jacs_i = lit_model.compute_jacobians(z_for_jac_full[_i:_i + 1])[0]
-                    _le_i = LitLatentJacobianODE.compute_lyapunov_exponents(_jacs_i.cpu(), dt)
-                    _lyap_full_list.append(_le_i)
-                    if _i < 3:
-                        print(f"    Traj {_i}: {_le_i.numpy()}")
-                all_pred_lyap_full = torch.stack(_lyap_full_list)
+                _n_chunks = (n_full_trajs + _lyap_chunk_size - 1) // _lyap_chunk_size
+                for _ci in tqdm(
+                    range(0, n_full_trajs, _lyap_chunk_size),
+                    total=_n_chunks,
+                    desc="    full-traj Lyap chunks",
+                ):
+                    _z_chunk = z_for_jac_full[_ci:_ci + _lyap_chunk_size]
+                    _jacs_chunk = lit_model.compute_jacobians(_z_chunk)
+                    _le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(
+                        _jacs_chunk, dt
+                    )
+                    _lyap_full_list.append(_le_chunk.cpu())
+                all_pred_lyap_full = torch.cat(_lyap_full_list, dim=0)
                 _state["all_pred_lyap_full"] = all_pred_lyap_full
 
                 # --- Batch + burn-in Lyapunov (128 sampled windowed trajs) ---
@@ -1468,16 +1479,38 @@ def run_analytics(
                 traj_raw = np.asarray(traj_full_np) * sigma_norm + mu_val
 
                 n_test_t = traj_raw.shape[0]
-                all_emp_lyap = []
-                for i in range(n_test_t):
-                    traj_i = traj_raw[i]
-                    if hasattr(eq, "model"):
-                        traj_i = torch.as_tensor(traj_i).float()
-                    jacs_np = eq.jac(traj_i, t=0)
-                    jacs_t = torch.as_tensor(jacs_np).float()
-                    le_i = LitLatentJacobianODE.compute_lyapunov_exponents(jacs_t, dt)
-                    all_emp_lyap.append(le_i)
-                all_emp_lyap_t = torch.stack(all_emp_lyap).cpu()
+                if hasattr(eq, "model"):
+                    # Torch-native eq.jac (e.g. wmtask): broadcasts over a leading
+                    # batch dim, so chunk-batch the trajectories on `device_obj`
+                    # and keep the inner Lyapunov QR loop on GPU.
+                    traj_raw_t = torch.as_tensor(traj_raw).float().to(device_obj)
+                    _emp_chunk_size = 64
+                    _emp_n_chunks = (n_test_t + _emp_chunk_size - 1) // _emp_chunk_size
+                    _emp_chunks: list[torch.Tensor] = []
+                    for _ci in tqdm(
+                        range(0, n_test_t, _emp_chunk_size),
+                        total=_emp_n_chunks,
+                        desc="    empirical Lyap chunks",
+                    ):
+                        _traj_chunk = traj_raw_t[_ci:_ci + _emp_chunk_size]
+                        _jacs_chunk = eq.jac(_traj_chunk, t=0)
+                        _le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(
+                            _jacs_chunk, dt
+                        )
+                        _emp_chunks.append(_le_chunk.cpu())
+                    all_emp_lyap_t = torch.cat(_emp_chunks, dim=0)
+                else:
+                    # Numpy-based dysts eq.jac: D is small (3-5), per-traj loop is
+                    # cheap and the internal jac dispatcher already handles only
+                    # specific input shapes. Leave it untouched.
+                    all_emp_lyap = []
+                    for i in range(n_test_t):
+                        traj_i = traj_raw[i]
+                        jacs_np = eq.jac(traj_i, t=0)
+                        jacs_t = torch.as_tensor(jacs_np).float()
+                        le_i = LitLatentJacobianODE.compute_lyapunov_exponents(jacs_t, dt)
+                        all_emp_lyap.append(le_i)
+                    all_emp_lyap_t = torch.stack(all_emp_lyap).cpu()
                 _state["all_emp_lyap_t"] = all_emp_lyap_t
                 emp_np = all_emp_lyap_t.mean(dim=0).numpy()
                 emp_std_np = all_emp_lyap_t.std(dim=0).numpy()
@@ -1532,18 +1565,27 @@ def run_analytics(
             elif "all_pred_lyap" in _state:
                 all_pred_lyap_ky = _state["all_pred_lyap"]
             else:
-                print("Computing Lyapunov exponents for KY dimension (full-length, per-traj) ...")
+                print("Computing Lyapunov exponents for KY dimension (full-length, chunk-batched) ...")
                 with torch.no_grad():
                     traj_full_t = torch.as_tensor(test_dl.dataset.sequence).float().to(device_obj)
                     z_full_t = lit_model.encode_trajectory(traj_full_t)
                     z_for_jac_ky = _z_dyn(z_full_t, n_target_dims)
+                    _ky_n = z_for_jac_ky.shape[0]
+                    _ky_chunk_size = 64
+                    _ky_n_chunks = (_ky_n + _ky_chunk_size - 1) // _ky_chunk_size
                     _lyap_ky_list = []
-                    for _i in range(z_for_jac_ky.shape[0]):
-                        _jacs_i = lit_model.compute_jacobians(z_for_jac_ky[_i:_i + 1])[0]
-                        _lyap_ky_list.append(
-                            LitLatentJacobianODE.compute_lyapunov_exponents(_jacs_i.cpu(), dt)
+                    for _ci in tqdm(
+                        range(0, _ky_n, _ky_chunk_size),
+                        total=_ky_n_chunks,
+                        desc="    KY Lyap chunks",
+                    ):
+                        _z_chunk = z_for_jac_ky[_ci:_ci + _ky_chunk_size]
+                        _jacs_chunk = lit_model.compute_jacobians(_z_chunk)
+                        _le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(
+                            _jacs_chunk, dt
                         )
-                    all_pred_lyap_ky = torch.stack(_lyap_ky_list)
+                        _lyap_ky_list.append(_le_chunk.cpu())
+                    all_pred_lyap_ky = torch.cat(_lyap_ky_list, dim=0)
 
             ky_val = _kaplan_yorke_dim(all_pred_lyap_ky)
             ky_pred_np = np.atleast_1d(ky_val.cpu().numpy() if torch.is_tensor(ky_val) else np.array(ky_val))

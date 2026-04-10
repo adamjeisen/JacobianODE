@@ -54,6 +54,7 @@ auto_reload = "lazy"
 dev = [
     "ipdb",
     "ipykernel>=7.1.0",
+    "jupytext>=1.19.1",
     "pytest>=9.0.2",
 ]
 cu128 = [
