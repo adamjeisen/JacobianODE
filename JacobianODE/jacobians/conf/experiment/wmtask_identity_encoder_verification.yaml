@@ -1,0 +1,73 @@
+# @package _global_
+#
+# Experiment: WMTask — Identity Encoder Verification
+# -------------------------------------------------------------------------------
+# Verifies that the latent JacobianODE reproduces vanilla JacobianODE behavior
+# when the encoder is initialized to identity (zero_init) and frozen.
+#
+# Encoder : spline_coupling (identity via zero_init, permanently frozen)
+# Data    : WMTask (delay2 window, all 128 dims, n_delays=1)
+# Matches : vanilla JacobianODE paper config with loop_closure_weight=0.0001
+#           and obs_noise=0.05
+#
+# Launch:
+#   uv run python -m JacobianODE.jacobians.run_jacobians \
+#     experiment=wmtask_identity_encoder_verification
+
+defaults:
+  - override /data: wmtask
+  - override /model: latent_spline_coupling
+  - _self_
+
+# ── W&B / logging ─────────────────────────────────────────────────────────────
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "identity_frozen__lc1e-4_obs0.05"
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+# Match original paper: obs_noise=0.05, seq_length=25, all 128 dims, no delays
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: false
+  train_test_params:
+    seq_length: 25       # traj_init_steps(15) + prediction_steps(10)
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 1
+      delay_spacing: 1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Identity encoder: zero_init (default) starts at identity; freeze permanently
+# by setting dynamics_warmup_epochs >= max_epochs.
+# n_target_dims=128 = full observation dim → no subspace splitting.
+model:
+  n_target_dims: 128
+  prediction_steps: 10        # match vanilla: seq_length(25) - traj_init_steps(15)
+  encoder_warmup_epochs: 0    # no warmup — encoder stays at identity
+  dynamics_warmup_epochs: 9999  # >= max_epochs → encoder frozen for entire run
+  use_vae: false              # deterministic (vanilla has no VAE)
+  vae_sample_all_losses: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+
+# ── Training ──────────────────────────────────────────────────────────────────
+# Match vanilla paper defaults as closely as possible.
+training:
+  batch_size: 16
+  trainer_params:
+    max_epochs: 1000
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    obs_noise_scale: 0.05
+    loop_closure_weight: 0.0001
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+  early_stopping:
+    early_stopping_patience: 2
+    min_epochs: 0
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01

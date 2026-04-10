@@ -62,6 +62,7 @@ WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_vae_sample_all_losses"
 # WANDB_GROUP = "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn"
 # WANDB_GROUP = "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn_30step_cleantarget"
 # WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_30step_cleantarget"
+# WANDB_GROUP = "spline_coupling_no_vae__sweep_lc_x_obs_noise_30step_cleantarget"
 
 SAVE_DIR = "/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs"
 # TRUE_LYAPUNOV = [0.91, 0.0, -14.57]  # None for wmtask (overridden from config)
@@ -73,20 +74,22 @@ TRUE_LYAPUNOV = None
 _analytics_out = run_analytics(
     wandb_entity=WANDB_ENTITY,
     wandb_project=WANDB_PROJECT,
-    # run_id="etjtrtzt",
-    run_id="6ba3smor",
+    # run_id="s1vjb64a",
+    run_id="a46xa0xz",
     ranking_method='pareto_knee',
     # ranking_method='minimax_log_score',
     save_dir=SAVE_DIR,
     wandb_group=WANDB_GROUP,
     true_lyapunov=TRUE_LYAPUNOV,
-    lyapunov_burn_in_steps=1000,
-    lyapunov_burn_in_drop=200,
+    # lyapunov_burn_in_steps=1000,
+    # lyapunov_burn_in_drop=200,
+    lyapunov_burn_in_steps=100,
+    lyapunov_burn_in_drop=20,
     # output='html',
-    # output='show',
-    output=[],
-    # sections=["sweep_overview", "lyapunov"],             
-    sections=[], # skip ALL analytics
+    output='show',
+    # output=[],
+    sections=["sweep_overview", "lyapunov", "prediction_windows"],             
+    # sections=[], # skip ALL analytics
     output_dir='reports',
     return_model=True,
     # use_all_runs=True,
@@ -120,7 +123,8 @@ print(f"n_latent: {lit_model_analysis.encoder.n_latent}")
 
 # %%
 # Compare prediction loss under (a) latent-space noise drawn from the learned
-# log_var_proj and (b) 5% observation-space noise. For each scenario we run
+# log_var_proj (only if the model has log_var_proj) and (b) 5% observation-space
+# noise. For each scenario we run
 # free-running prediction (alpha_teacher_forcing=0) and report normalized_mse
 # with mean ± standard error across test trajectories.
 #
@@ -140,11 +144,15 @@ from JacobianODE.jacobians.metrics import normalized_mse
 OBS_NOISE_STD = 0.05       # 5% obs noise (data normalized → unit-std)
 TRAJ_INIT_STEPS_NP = 15
 SEED_NP = 0
+BATCH_SIZE_NP = 4          # micro-batch size to avoid OOM on small GPUs
 
 lit_model_analysis = lit_model.to(device).eval()
-assert hasattr(lit_model_analysis, "log_var_proj"), (
-    "Model has no log_var_proj (use_vae=False). Latent-noise branch requires VAE."
-)
+_has_latent_noise = hasattr(lit_model_analysis, "log_var_proj")
+if not _has_latent_noise:
+    print(
+        "Model has no log_var_proj (e.g. use_vae=False); "
+        "skipping latent-noise branch, observation-space analysis only."
+    )
 
 n_target_dims = lit_model_analysis.n_target_dims
 prediction_steps = lit_model_analysis.prediction_steps
@@ -173,43 +181,49 @@ def _mean_sem(arr: np.ndarray):
     return float(arr.mean()), float(arr.std(ddof=1) / np.sqrt(len(arr)))
 
 
+def _batched_generate(z_win, bs=BATCH_SIZE_NP):
+    """Run generate_dynamics in micro-batches to avoid OOM."""
+    chunks = [z_win[i:i + bs] for i in range(0, z_win.shape[0], bs)]
+    return torch.cat([
+        jacobian_odeint.generate_dynamics(
+            ch, alpha_teacher_forcing=0, teacher_forcing_steps=1,
+            fast_mode=True, scale_interp_pts=True, traj_init_steps=traj_init_steps,
+        ) for ch in chunks
+    ], dim=0)
+
+
 torch.manual_seed(SEED_NP)
 
 # =====================================================================
-# 1. LATENT-SPACE NOISE via learned log_var_proj
+# 1. LATENT-SPACE NOISE via learned log_var_proj (VAE models only)
 # =====================================================================
-with torch.no_grad():
-    z_full_clean = lit_model_analysis.encode_trajectory(x_clean)  # (B, T', D_latent)
-    if n_target_dims is not None:
-        mu_dyn_full = z_full_clean[..., :n_target_dims]
-    else:
-        mu_dyn_full = z_full_clean
+if _has_latent_noise:
+    with torch.no_grad():
+        z_full_clean = lit_model_analysis.encode_trajectory(x_clean)  # (B, T', D_latent)
+        if n_target_dims is not None:
+            mu_dyn_full = z_full_clean[..., :n_target_dims]
+        else:
+            mu_dyn_full = z_full_clean
 
-    log_var = lit_model_analysis.log_var_proj(mu_dyn_full)
-    std_lat = torch.exp(0.5 * log_var)
-    eps_lat = torch.randn_like(std_lat)
-    mu_dyn_noisy_full = mu_dyn_full + std_lat * eps_lat
+        log_var = lit_model_analysis.log_var_proj(mu_dyn_full)
+        std_lat = torch.exp(0.5 * log_var)
+        eps_lat = torch.randn_like(std_lat)
+        mu_dyn_noisy_full = mu_dyn_full + std_lat * eps_lat
 
-    mu_dyn_win = mu_dyn_full[:, :window_len, :]
-    mu_dyn_noisy_win = mu_dyn_noisy_full[:, :window_len, :]
+        mu_dyn_win = mu_dyn_full[:, :window_len, :]
+        mu_dyn_noisy_win = mu_dyn_noisy_full[:, :window_len, :]
 
-    z_pred_lat_clean = jacobian_odeint.generate_dynamics(
-        mu_dyn_win, alpha_teacher_forcing=0, teacher_forcing_steps=1,
-        fast_mode=True, scale_interp_pts=True, traj_init_steps=traj_init_steps,
-    )
-    z_pred_lat_noisy = jacobian_odeint.generate_dynamics(
-        mu_dyn_noisy_win, alpha_teacher_forcing=0, teacher_forcing_steps=1,
-        fast_mode=True, scale_interp_pts=True, traj_init_steps=traj_init_steps,
-    )
+        z_pred_lat_clean = _batched_generate(mu_dyn_win)
+        z_pred_lat_noisy = _batched_generate(mu_dyn_noisy_win)
 
-    z_pred_lat_clean_c = z_pred_lat_clean[:, traj_init_steps:, :]
-    z_pred_lat_noisy_c = z_pred_lat_noisy[:, traj_init_steps:, :]
-    z_true_lat_clean = mu_dyn_win[:, traj_init_steps:, :]
-    z_true_lat_noisy = mu_dyn_noisy_win[:, traj_init_steps:, :]
+        z_pred_lat_clean_c = z_pred_lat_clean[:, traj_init_steps:, :]
+        z_pred_lat_noisy_c = z_pred_lat_noisy[:, traj_init_steps:, :]
+        z_true_lat_clean = mu_dyn_win[:, traj_init_steps:, :]
+        z_true_lat_noisy = mu_dyn_noisy_win[:, traj_init_steps:, :]
 
-    nmse_lat_pn_tn = _per_traj_nmse(z_true_lat_noisy, z_pred_lat_noisy_c)
-    nmse_lat_pn_tc = _per_traj_nmse(z_true_lat_clean, z_pred_lat_noisy_c)
-    nmse_lat_pc_tc = _per_traj_nmse(z_true_lat_clean, z_pred_lat_clean_c)
+        nmse_lat_pn_tn = _per_traj_nmse(z_true_lat_noisy, z_pred_lat_noisy_c)
+        nmse_lat_pn_tc = _per_traj_nmse(z_true_lat_clean, z_pred_lat_noisy_c)
+        nmse_lat_pc_tc = _per_traj_nmse(z_true_lat_clean, z_pred_lat_clean_c)
 
 # =====================================================================
 # 2. OBSERVATION-SPACE NOISE (5%) — encode → dynamics → decode
@@ -229,14 +243,8 @@ with torch.no_grad():
     mu_from_clean_win = mu_from_clean[:, :window_len, :]
     mu_from_noisy_win = mu_from_noisy[:, :window_len, :]
 
-    z_pred_obs_clean = jacobian_odeint.generate_dynamics(
-        mu_from_clean_win, alpha_teacher_forcing=0, teacher_forcing_steps=1,
-        fast_mode=True, scale_interp_pts=True, traj_init_steps=traj_init_steps,
-    )
-    z_pred_obs_noisy = jacobian_odeint.generate_dynamics(
-        mu_from_noisy_win, alpha_teacher_forcing=0, teacher_forcing_steps=1,
-        fast_mode=True, scale_interp_pts=True, traj_init_steps=traj_init_steps,
-    )
+    z_pred_obs_clean = _batched_generate(mu_from_clean_win)
+    z_pred_obs_noisy = _batched_generate(mu_from_noisy_win)
 
     z_pred_obs_clean_c = z_pred_obs_clean[:, traj_init_steps:, :]
     z_pred_obs_noisy_c = z_pred_obs_noisy[:, traj_init_steps:, :]
@@ -264,16 +272,20 @@ with torch.no_grad():
     nmse_obs_pc_tc = _per_traj_nmse(x_true_clean_pred, x_pred_clean)
 
 # =====================================================================
-# 3. BAR PLOT — 6 conditions with SEM across test trajectories
+# 3. BAR PLOT — latent (if available) + obs conditions with SEM
 # =====================================================================
-bar_spec = [
-    ("Latent\npred_noisy vs true_noisy", nmse_lat_pn_tn, "tab:orange"),
-    ("Latent\npred_noisy vs true_clean", nmse_lat_pn_tc, "tab:red"),
-    ("Latent\npred_clean vs true_clean", nmse_lat_pc_tc, "tab:gray"),
+bar_spec = []
+if _has_latent_noise:
+    bar_spec.extend([
+        ("Latent\npred_noisy vs true_noisy", nmse_lat_pn_tn, "tab:orange"),
+        ("Latent\npred_noisy vs true_clean", nmse_lat_pn_tc, "tab:red"),
+        ("Latent\npred_clean vs true_clean", nmse_lat_pc_tc, "tab:gray"),
+    ])
+bar_spec.extend([
     ("Obs\npred_noisy vs true_noisy",    nmse_obs_pn_tn, "tab:blue"),
     ("Obs\npred_noisy vs true_clean",    nmse_obs_pn_tc, "tab:purple"),
     ("Obs\npred_clean vs true_clean",    nmse_obs_pc_tc, "tab:green"),
-]
+])
 labels = [row[0] for row in bar_spec]
 stats = [_mean_sem(row[1]) for row in bar_spec]
 means = [s[0] for s in stats]
@@ -283,9 +295,13 @@ colors = [row[2] for row in bar_spec]
 fig, ax = plt.subplots(figsize=(12, 6))
 ax.bar(labels, means, yerr=sems, capsize=5, color=colors, alpha=0.85, edgecolor="black")
 ax.set_ylabel("Normalized MSE")
-ax.set_title(
-    f"Noise Propagation — prediction nMSE (α_tf=0, n_trajs={B})\n"
+_subtitle = (
     f"latent noise via learned log_var  |  obs noise σ={OBS_NOISE_STD}"
+    if _has_latent_noise
+    else f"obs noise only (no log_var_proj)  |  σ={OBS_NOISE_STD}"
+)
+ax.set_title(
+    f"Noise Propagation — prediction nMSE (α_tf=0, n_trajs={B})\n" + _subtitle
 )
 ax.set_yscale("log")
 ax.tick_params(axis="x", labelsize=9)
@@ -297,6 +313,11 @@ print(f"\n{'Scenario':<42} {'Mean nMSE':>12} {'SEM':>12}")
 print("-" * 68)
 for (lbl, _, _), (m, s) in zip(bar_spec, stats):
     print(f"{lbl.replace(chr(10), ' '):<42} {m:>12.6f} {s:>12.6f}")
+
+# Batch-pooled nMSE (comparable to logged trajectory val_loss)
+nmse_obs_batch = normalized_mse(x_true_clean_pred, x_pred_clean).item()
+print(f"\n{'Batch-pooled obs nMSE (clean→clean)':<42} {nmse_obs_batch:>12.6f}")
+print("  ↑ comparable to logged 'trajectory val_loss' (same normalization, different data split)")
 
 # %% [markdown]
 # # Geometric Noise Analysis
