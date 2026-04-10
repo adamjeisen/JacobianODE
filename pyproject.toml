@@ -66,6 +66,7 @@ cu118 = [
     "torch>=2.0.0",
     "torchvision",
     "torchaudio",
+    "nvidia-cudnn-cu12>=9.1",  # cu118 torch 2.7+ needs libcudnn.so.9; the cu11 wheel is a broken stub
 ]
 
 [tool.uv]
