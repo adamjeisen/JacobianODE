@@ -25,6 +25,27 @@ across all groups. That can trigger large unnecessary torch wheel downloads
 import from project code, prefer `uv tool install <tool>` or `uv pip install <tool>`
 to avoid the re-resolve. Never bypass uv by calling a bare `python` / `pip`.
 
+## Engaging cluster (SLURM job submission)
+
+To submit JacobianODE training jobs on the Engaging cluster, use:
+
+```
+engaging-submit experiment=wmtask_identity_encoder_verification
+```
+
+This script (located at `~/bin/engaging-submit`):
+1. Commits and pushes any local changes on the current branch
+2. Pulls latest on engaging from the repo at `/home/eisenaj/code/JacobianODE`
+3. Runs `jsweep` (Hydra multirun + submitit) via SSH
+4. Polls `squeue` until the SLURM job appears
+5. Kills the hanging Hydra process and exits cleanly
+
+Pass any Hydra overrides as arguments. To check job status: `ssh engaging 'squeue -u eisenaj'`
+
+**Important**: The SSH hook exemption in `.claude/hooks/uv-cu118-guard.sh` allows
+`ssh` commands containing `uv run` — this is intentional since the guard is for the
+local Pascal GPU machine only.
+
 ## Jupyter Notebooks
 
 Never use the default notebook read/edit/grep tools. Never try to read the raw `.ipynb`

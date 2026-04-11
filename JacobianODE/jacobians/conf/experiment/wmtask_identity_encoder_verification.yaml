@@ -5,7 +5,7 @@
 # Verifies that the latent JacobianODE reproduces vanilla JacobianODE behavior
 # when the encoder is initialized to identity (zero_init) and frozen.
 #
-# Encoder : spline_coupling (identity via zero_init, permanently frozen)
+# Encoder : affine coupling (true identity via zero_init, permanently frozen)
 # Data    : WMTask (delay2 window, all 128 dims, n_delays=1)
 # Matches : vanilla JacobianODE paper config with loop_closure_weight=0.0001
 #           and obs_noise=0.05
@@ -22,7 +22,7 @@ defaults:
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "identity_frozen__lc1e-4_obs0.05_mse_nolpl_noactnorm"
+wandb_group: "identity_frozen__lc1e-4_obs0.05_mse_nolpl_affine_noactnorm"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 # Match original paper: obs_noise=0.05, seq_length=25, all 128 dims, no delays
@@ -43,6 +43,7 @@ data:
 # n_target_dims=128 = full observation dim → no subspace splitting.
 model:
   encoder:
+    coupling_type: affine       # affine + zero_init = true identity (spline has softplus(0)≈0.694 distortion)
     use_actnorm: false
   n_target_dims: 128
   prediction_steps: 10        # match vanilla: seq_length(25) - traj_init_steps(15)
