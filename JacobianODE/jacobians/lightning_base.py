@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from typing import Any, Callable, Optional, Union, Tuple
 
 from .jacobianODE import JacobianODE, JacobianODEint
-from .metrics import mase, mse, r2_score, smape
+from .metrics import mase, mse, r2_score, smape, normalized_mse
 from .teacher_forcing import get_alpha_exact, get_alpha_explogapprox, get_alpha_lyap
 
 
@@ -277,7 +277,9 @@ class LitBase(L.LightningModule):
         self.alpha_hal = alpha_hal
         if loss_func == 'mse':
             self.criterion = nn.MSELoss()
-        else: # not implemented
+        elif loss_func == 'normalized_mse':
+            self.criterion = normalized_mse
+        else:
             raise ValueError(f"Loss function {loss_func} not implemented")
 
         self.obs_noise_scale = obs_noise_scale

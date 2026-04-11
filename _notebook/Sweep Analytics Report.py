@@ -77,6 +77,7 @@ TRUE_LYAPUNOV = None
 _analytics_out = run_analytics(
     wandb_entity=WANDB_ENTITY,
     wandb_project=WANDB_PROJECT,
+    run_id="5aevrnfm",
     ranking_method='pareto_knee',
     # ranking_method='minimax_log_score',
     save_dir=SAVE_DIR,

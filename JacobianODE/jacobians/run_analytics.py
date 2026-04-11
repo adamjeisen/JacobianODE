@@ -1046,6 +1046,8 @@ def run_analytics(
     lit_model = lit_model.to(device_obj)
     lit_model.eval()
 
+    is_latent = isinstance(lit_model, LitLatentJacobianODE)
+
     # -------------------------------------------------------- config extraction
     mu = float(cfg.data.postprocessing.mu) if np.isscalar(cfg.data.postprocessing.mu) else np.array(cfg.data.postprocessing.mu)
     sigma = float(cfg.data.postprocessing.sigma)
@@ -1065,16 +1067,25 @@ def run_analytics(
     time_offset = (n_delays - 1) * delay_spacing
 
     traj_init_steps = lit_model.jacobianODEint_kwargs.get("traj_init_steps", 15)
-    jac_window_len = traj_init_steps + lit_model.prediction_steps
-    jac_window_stride = lit_model.jac_window_stride
+    if is_latent:
+        jac_window_len = traj_init_steps + lit_model.prediction_steps
+        jac_window_stride = lit_model.jac_window_stride
+    else:
+        # Non-latent: no windowing — use the full trajectory length
+        T_test = trajs["test_trajs"].sequence.shape[1]
+        jac_window_len = T_test
+        jac_window_stride = T_test
 
     test_trajs_full = trajs.get("test_trajs_full", trajs["test_trajs"]).sequence
 
     # Decoder output dims (may be < n_input for decode_only_recent models)
-    if hasattr(lit_model.encoder, "decoder"):
-        decoder_n_out = lit_model.encoder.decoder.n_output
+    if is_latent:
+        if hasattr(lit_model.encoder, "decoder"):
+            decoder_n_out = lit_model.encoder.decoder.n_output
+        else:
+            decoder_n_out = lit_model.encoder.n_latent
     else:
-        decoder_n_out = lit_model.encoder.n_latent
+        decoder_n_out = n_dims
 
     # Number of obs dims to use for metrics, matching the model's behaviour:
     # when reconstruction_mode='most_recent', metrics use only the first d dims.
@@ -1147,7 +1158,7 @@ def run_analytics(
             f"  n_delays     : {n_delays}",
             f"  delay_spacing: {delay_spacing}",
             f"  traj_init_steps : {traj_init_steps}",
-            f"  prediction_steps: {lit_model.prediction_steps}",
+            f"  prediction_steps: {lit_model.prediction_steps if is_latent else 'N/A (non-latent)'}",
             "",
             "Data",
             f"  n_dims (obs) : {n_dims}",
@@ -1200,7 +1211,9 @@ def run_analytics(
         # ============================================================
         # 2. Reconstruction
         # ============================================================
-        if "reconstruction" in active_sections:
+        if "reconstruction" in active_sections and not is_latent:
+            print("Skipping 'reconstruction': requires a latent encoder/decoder model.")
+        if "reconstruction" in active_sections and is_latent:
             print("Computing reconstruction ...")
             test_trajs_obs = trajs["test_trajs"].sequence
             test_trajs_full_aligned = test_trajs_full[:, time_offset:]
@@ -1301,8 +1314,12 @@ def run_analytics(
                     break
                 batch = batch.to(device_obj)
                 with torch.no_grad():
-                    ret_f = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=1, return_decoded=True)
-                    ret_r = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=0, return_decoded=True)
+                    _tms_kw = dict(alpha_teacher_forcing=1)
+                    if is_latent:
+                        _tms_kw["return_decoded"] = True
+                    ret_f = lit_model.trajectory_model_step(batch, **_tms_kw)
+                    _tms_kw["alpha_teacher_forcing"] = 0
+                    ret_r = lit_model.trajectory_model_step(batch, **_tms_kw)
                 model_maes_forced.append(ret_f["metric_vals"]["model_mae"].item())
                 model_maes_free.append(ret_r["metric_vals"]["model_mae"].item())
                 persistence_maes.append(ret_r["metric_vals"]["persistence_mae"].item())
@@ -1326,7 +1343,9 @@ def run_analytics(
         # ============================================================
         # 4. Latent utilization
         # ============================================================
-        if "latent_utilization" in active_sections:
+        if "latent_utilization" in active_sections and not is_latent:
+            print("Skipping 'latent_utilization': requires a latent encoder model.")
+        if "latent_utilization" in active_sections and is_latent:
             print("Computing latent utilization ...")
             traj_key = "train_trajs"
             trajs_obs_lat = trajs[traj_key].sequence
@@ -1383,7 +1402,7 @@ def run_analytics(
                 traj_seq_full = torch.as_tensor(
                     trajs["test_trajs"].sequence
                 ).float().to(device_obj)
-                z_seq_full = lit_model.encode_trajectory(traj_seq_full)
+                z_seq_full = lit_model.encode_trajectory(traj_seq_full) if is_latent else traj_seq_full
                 z_for_jac_full = _z_dyn(z_seq_full, n_target_dims)
                 n_full_trajs = z_for_jac_full.shape[0]
                 print(f"  Computing full-trajectory Lyapunov ({n_full_trajs} test trajs, "
@@ -1415,13 +1434,16 @@ def run_analytics(
                     test_dl.dataset.sequence
                 ).float().to(device_obj)
                 # Encode in chunks to avoid OOM on large test sets
-                _enc_chunks = []
-                _chunk_size = 64
-                for _ci in range(0, traj_batched_t.shape[0], _chunk_size):
-                    _enc_chunks.append(
-                        lit_model.encode_trajectory(traj_batched_t[_ci:_ci + _chunk_size])
-                    )
-                z_batched_t = torch.cat(_enc_chunks, dim=0)
+                if is_latent:
+                    _enc_chunks = []
+                    _chunk_size = 64
+                    for _ci in range(0, traj_batched_t.shape[0], _chunk_size):
+                        _enc_chunks.append(
+                            lit_model.encode_trajectory(traj_batched_t[_ci:_ci + _chunk_size])
+                        )
+                    z_batched_t = torch.cat(_enc_chunks, dim=0)
+                else:
+                    z_batched_t = traj_batched_t
                 z_for_jac = _z_dyn(z_batched_t, n_target_dims)
                 gen = torch.Generator().manual_seed(0)
                 perm = torch.randperm(z_for_jac.shape[0], generator=gen)[:n_sample]
@@ -1568,7 +1590,7 @@ def run_analytics(
                 print("Computing Lyapunov exponents for KY dimension (full-length, chunk-batched) ...")
                 with torch.no_grad():
                     traj_full_t = torch.as_tensor(test_dl.dataset.sequence).float().to(device_obj)
-                    z_full_t = lit_model.encode_trajectory(traj_full_t)
+                    z_full_t = lit_model.encode_trajectory(traj_full_t) if is_latent else traj_full_t
                     z_for_jac_ky = _z_dyn(z_full_t, n_target_dims)
                     _ky_n = z_for_jac_ky.shape[0]
                     _ky_chunk_size = 64
@@ -1635,7 +1657,8 @@ def run_analytics(
                 with torch.no_grad():
                     for _i in range(0, _trajs_lat.shape[0], 8):
                         _x = torch.as_tensor(_trajs_lat[_i:_i + 8]).float().to(device_obj)
-                        _all_lat.append(_z_dyn(lit_model.encode_trajectory(_x), n_target_dims).cpu())
+                        _z = lit_model.encode_trajectory(_x) if is_latent else _x
+                        _all_lat.append(_z_dyn(_z, n_target_dims).cpu())
                 _Z = torch.cat(_all_lat, dim=0).numpy()
                 _state["Z_flat"] = _Z.reshape(-1, _Z.shape[-1])
 
@@ -1681,14 +1704,22 @@ def run_analytics(
                     test_trajs_obs_pw[t_idx:t_idx + 1]
                 ).float().to(device_obj)
                 with torch.no_grad():
-                    rd = lit_model.trajectory_model_step(
-                        traj_i, alpha_teacher_forcing=0.0, obs_noise_scale=0, return_decoded=True
-                    )
-                    z_true_i = lit_model.encode_trajectory(traj_i)
+                    _pw_kw: dict = dict(alpha_teacher_forcing=0.0, obs_noise_scale=0)
+                    if is_latent:
+                        _pw_kw["return_decoded"] = True
+                    rd = lit_model.trajectory_model_step(traj_i, **_pw_kw)
+                    z_true_i = lit_model.encode_trajectory(traj_i) if is_latent else traj_i
 
-                dec_pred = rd["decoded"].cpu()
-                obs_tgt = rd["targets"].cpu()
                 z_pred_i = rd["outputs"].cpu()
+                if is_latent:
+                    dec_pred = rd["decoded"].cpu()
+                    obs_tgt = rd["targets"].cpu()
+                else:
+                    # Non-latent: outputs ARE obs-space predictions; targets
+                    # are the label shifted by traj_init_steps.
+                    _tis = traj_init_steps
+                    dec_pred = z_pred_i[..., _tis:, :]
+                    obs_tgt = traj_i[..., _tis:, :].cpu()
 
                 # Slice to metric dims (matches model's reconstruction_mode)
                 _dp = dec_pred[..., :_n_metric_dims] if _n_metric_dims else dec_pred
@@ -1766,13 +1797,18 @@ def run_analytics(
             traj_long = torch.as_tensor(test_trajs_obs_lt[[0]]).float().to(device_obj)
 
             with torch.no_grad():
-                rd_long = lit_model.trajectory_model_step(
-                    traj_long, alpha_teacher_forcing=0.0, obs_noise_scale=0,
-                    return_decoded=True, strided=False,
-                )
-                encoded_lt = lit_model.encode_trajectory(traj_long)
-                z_pred_full_lt = lit_model._pad_to_full_dim(rd_long["outputs"])
-                decoded_lt = lit_model.decode_trajectory(z_pred_full_lt)
+                _lt_kw: dict = dict(alpha_teacher_forcing=0.0, obs_noise_scale=0)
+                if is_latent:
+                    _lt_kw.update(return_decoded=True, strided=False)
+                rd_long = lit_model.trajectory_model_step(traj_long, **_lt_kw)
+
+                if is_latent:
+                    encoded_lt = lit_model.encode_trajectory(traj_long)
+                    z_pred_full_lt = lit_model._pad_to_full_dim(rd_long["outputs"])
+                    decoded_lt = lit_model.decode_trajectory(z_pred_full_lt)
+                else:
+                    encoded_lt = traj_long
+                    decoded_lt = rd_long["outputs"]
 
             traj_true_lt = traj_long[0].cpu().numpy()
             decoded_pred_lt = decoded_lt[0].cpu().numpy()
@@ -1789,7 +1825,9 @@ def run_analytics(
         # ============================================================
         # 10. Encoder/decoder Jacobians
         # ============================================================
-        if "encoder_decoder_jacobians" in active_sections:
+        if "encoder_decoder_jacobians" in active_sections and not is_latent:
+            print("Skipping 'encoder_decoder_jacobians': requires a latent encoder/decoder model.")
+        if "encoder_decoder_jacobians" in active_sections and is_latent:
             print("Computing encoder/decoder Jacobians ...")
             from torch.func import vmap, jacrev, jacfwd
 
@@ -1908,7 +1946,7 @@ def run_analytics(
                         X_orig_s = x_orig[torch.from_numpy(idx_amp)].to(device_obj)
 
                         with torch.no_grad():
-                            X_latent_amp = lit_model.encode_trajectory(X_de_s)
+                            X_latent_amp = lit_model.encode_trajectory(X_de_s) if is_latent else X_de_s
                             amp_true = loss_amplification(
                                 X_de_s, X_orig_s[..., [0]],
                                 n_neighbors=n_amp_neighbors, max_T=n_amp_max_t, normalize=True,

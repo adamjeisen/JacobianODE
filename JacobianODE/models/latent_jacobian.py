@@ -661,19 +661,22 @@ class LitLatentJacobianODE(LitBase):
         """Observation-space loss with ``reconstruction_mode`` weighting.
 
         Applied to both reconstruction and trajectory prediction losses.
+        Uses ``self.criterion`` (configured via ``loss_func``) as the
+        underlying loss function, so the scale is consistent with other
+        loss terms (e.g. loop closure).
         """
         if self.reconstruction_mode == 'harmonic':
             # sq_err = F.mse_loss(predictions, targets, reduction='none')
             # TODO: fix this because normalized_mse doesn't support reduction='none'
-            sq_err = normalized_mse(targets, predictions)
+            sq_err = self.criterion(targets, predictions)
             return (sq_err * self.recon_weights).mean()
         elif self.reconstruction_mode == 'most_recent':
             d = self._n_recent_dims
             if d is not None:
-                return normalized_mse(targets[..., :d], predictions[..., :d])
-            return normalized_mse(targets, predictions)
+                return self.criterion(targets[..., :d], predictions[..., :d])
+            return self.criterion(targets, predictions)
         else:  # uniform
-            return normalized_mse(targets, predictions)
+            return self.criterion(targets, predictions)
 
     # ------------------------------------------------------------------
     # Jacobian computation
@@ -1013,7 +1016,7 @@ class LitLatentJacobianODE(LitBase):
 
             # Latent prediction loss in z_dyn space (computed outside no_grad so
             # gradients flow back through the encoder).
-            latent_pred_loss = normalized_mse(z_true_crop, z_pred_crop)
+            latent_pred_loss = criterion(z_true_crop, z_pred_crop)
             metric_vals['latent_pred_loss'] = latent_pred_loss
             with torch.no_grad():
                 z_pred_flat = z_pred_crop.reshape(z_pred_crop.shape[0], -1)
