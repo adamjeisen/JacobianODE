@@ -22,7 +22,7 @@ defaults:
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "identity_frozen__lc1e-4_obs0.05_mse"
+wandb_group: "identity_frozen__lc1e-4_obs0.05_mse_nolpl"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 # Match original paper: obs_noise=0.05, seq_length=25, all 128 dims, no delays
@@ -69,7 +69,7 @@ training:
     loop_closure_weight: 0.0001
     loop_closure_training: true
     reconstruction_loss_weight: 1.0
-    latent_prediction_loss_weight: 1.0
+    latent_prediction_loss_weight: 0.0
   early_stopping:
     early_stopping_patience: 2
     min_epochs: 0

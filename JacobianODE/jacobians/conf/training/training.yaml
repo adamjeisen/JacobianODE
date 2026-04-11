@@ -138,7 +138,7 @@ lightning:
   use_base_deriv_pt: False
   # direct: False
   direct: True
-  loss_func: mse
+  loss_func: mse # mse | normalized_mse
   data_type: null
 
   # -----------------
