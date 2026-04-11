@@ -55,14 +55,17 @@ WANDB_ENTITY = "JacobianODE"
 # WANDB_PROJECT = "WMTask_IND1926273140555669819498104_N10_D1_NormTrue_T10__spline_coupling__JacobianODE"
 # WANDB_GROUP = None
 
-WANDB_PROJECT = "WMTask_INDall_N1_D1_NormTrue_T128__JacobianODE"
-# WANDB_GROUP = None
-WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_vae_sample_all_losses"
-# WANDB_GROUP = "mlp_diffeo__sweep_lc_x_kl_dyn_vae_sample_all_losses"
-# WANDB_GROUP = "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn"
-# WANDB_GROUP = "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn_30step_cleantarget"
-# WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_30step_cleantarget"
-# WANDB_GROUP = "spline_coupling_no_vae__sweep_lc_x_obs_noise_30step_cleantarget"
+# WANDB_PROJECT = "WMTask_INDall_N1_D1_NormTrue_T128__JacobianODE"
+# # WANDB_GROUP = None
+# WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_vae_sample_all_losses"
+# # WANDB_GROUP = "mlp_diffeo__sweep_lc_x_kl_dyn_vae_sample_all_losses"
+# # WANDB_GROUP = "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn"
+# # WANDB_GROUP = "spline_coupling__geometric_noise__sweep_lc_x_kl_dyn_30step_cleantarget"
+# # WANDB_GROUP = "spline_coupling__sweep_lc_x_kl_dyn_30step_cleantarget"
+# # WANDB_GROUP = "spline_coupling_no_vae__sweep_lc_x_obs_noise_30step_cleantarget"
+
+WANDB_PROJECT = "WMTask_identity_encoder_verification"
+WANDB_GROUP = None
 
 SAVE_DIR = "/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs"
 # TRUE_LYAPUNOV = [0.91, 0.0, -14.57]  # None for wmtask (overridden from config)
@@ -74,8 +77,6 @@ TRUE_LYAPUNOV = None
 _analytics_out = run_analytics(
     wandb_entity=WANDB_ENTITY,
     wandb_project=WANDB_PROJECT,
-    # run_id="s1vjb64a",
-    run_id="a46xa0xz",
     ranking_method='pareto_knee',
     # ranking_method='minimax_log_score',
     save_dir=SAVE_DIR,
@@ -92,7 +93,7 @@ _analytics_out = run_analytics(
     # sections=[], # skip ALL analytics
     output_dir='reports',
     return_model=True,
-    # use_all_runs=True,
+    use_all_runs=True,
 )
 assert isinstance(_analytics_out, tuple) and len(_analytics_out) == 3
 _result, lit_model, run_id = _analytics_out

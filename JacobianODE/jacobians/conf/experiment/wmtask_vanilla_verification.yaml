@@ -1,0 +1,58 @@
+# @package _global_
+#
+# Experiment: WMTask — Vanilla JacobianODE Verification
+# -------------------------------------------------------------------------------
+# Baseline vanilla JacobianODE (no encoder/latent mapping) on WMTask.
+# Paired with wmtask_identity_encoder_verification to confirm the latent model
+# with a frozen identity encoder reproduces this result.
+#
+# Model   : MLP (no encoder)
+# Data    : WMTask (delay2 window, all 128 dims, n_delays=1)
+# Matches : original paper config with loop_closure_weight=0.0001, obs_noise=0.05
+#
+# Launch:
+#   uv run python -m JacobianODE.jacobians.run_jacobians \
+#     experiment=wmtask_vanilla_verification
+
+defaults:
+  - override /data: wmtask
+  - override /model: mlp
+  - _self_
+
+# ── W&B / logging ─────────────────────────────────────────────────────────────
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "vanilla__lc1e-4_obs0.05"
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: false
+  train_test_params:
+    seq_length: 25
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 1
+      delay_spacing: 1
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  batch_size: 16
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  trainer_params:
+    max_epochs: 1000
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 4
+  lightning:
+    obs_noise_scale: 0.05
+    loop_closure_weight: 0.0001
+    loop_closure_training: true
+  early_stopping:
+    early_stopping_patience: 2
+    min_epochs: 0
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01
