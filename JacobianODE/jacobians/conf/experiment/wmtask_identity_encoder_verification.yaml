@@ -65,7 +65,7 @@ training:
     accumulate_grad_batches: 4
   lightning:
     loss_func: mse              # match vanilla: plain MSE keeps loss scale consistent with loop closure
-    obs_noise_scale: 0.05
+    obs_noise_scale: 0.0
     loop_closure_weight: 0.0001
     loop_closure_training: true
     reconstruction_loss_weight: 1.0

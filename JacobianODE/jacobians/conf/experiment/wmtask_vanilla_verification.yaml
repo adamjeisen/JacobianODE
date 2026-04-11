@@ -44,12 +44,12 @@ training:
     save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
   trainer_params:
     max_epochs: 1000
-    limit_train_batches: 200
-    limit_val_batches: 50
+    limit_train_batches: 500
+    limit_val_batches: 100
     accumulate_grad_batches: 4
   lightning:
-    # obs_noise_scale: 0.05
-    obs_noise_scale: 0.0
+    obs_noise_scale: 0.05
+    # obs_noise_scale: 0.0
     loop_closure_weight: 0.0001
     loop_closure_training: true
   early_stopping:
