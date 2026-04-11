@@ -22,7 +22,7 @@ defaults:
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "vanilla__lc1e-4_obs0.05"
+wandb_group: "vanilla__lc1e-4_obs0.0"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
@@ -48,7 +48,8 @@ training:
     limit_val_batches: 50
     accumulate_grad_batches: 4
   lightning:
-    obs_noise_scale: 0.05
+    # obs_noise_scale: 0.05
+    obs_noise_scale: 0.0
     loop_closure_weight: 0.0001
     loop_closure_training: true
   early_stopping:
