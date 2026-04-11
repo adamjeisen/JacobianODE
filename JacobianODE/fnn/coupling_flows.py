@@ -1318,8 +1318,8 @@ class CouplingEncoder(nn.Module):
     n_coupling_layers : int
         Number of coupling layers.
     coupling_type : str
-        ``'affine'``, ``'spline'``, ``'cubic_rational'``, ``'sinh'``, or
-        ``'cubic_conjugation'``.
+        ``'affine'``, ``'spline'``, ``'additive'``, ``'cubic_rational'``,
+        ``'sinh'``, or ``'cubic_conjugation'``.
     use_actnorm : bool
         Insert an :class:`ActNorm` layer after each coupling layer.
     hidden_dim : int
@@ -1397,6 +1397,16 @@ class CouplingEncoder(nn.Module):
                         clamp_type=clamp_type,
                         alpha_pos=alpha_pos,
                         alpha_neg=alpha_neg,
+                    )
+                )
+            elif coupling_type == "additive":
+                self.coupling_layers.append(
+                    AdditiveCouplingLayer(
+                        dim=n_input,
+                        split_dim=split_dim,
+                        hidden_dim=hidden_dim,
+                        n_hidden_layers=n_hidden_layers,
+                        zero_init=zero_init,
                     )
                 )
             elif coupling_type == "spline":

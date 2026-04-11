@@ -1,0 +1,64 @@
+# @package _global_
+#
+# Experiment: WMTask — Affine coupling, non-trivial init, frozen
+# -------------------------------------------------------------------------------
+# Tests gradient flow through a non-identity affine coupling encoder.
+# The affine coupling with zero_init=false creates a random bijection
+# (condition number ~29). The encoder is frozen and only dynamics are trained.
+
+defaults:
+  - override /data: wmtask
+  - override /model: latent_spline_coupling
+  - _self_
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "affine_nontrivial_frozen__lc1e-4_obs0.05"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: false
+  train_test_params:
+    seq_length: 25
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 1
+      delay_spacing: 1
+
+model:
+  encoder:
+    coupling_type: affine
+    zero_init: false
+    use_actnorm: false
+  n_target_dims: 128
+  prediction_steps: 10
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 9999
+  use_vae: false
+  vae_sample_all_losses: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+
+training:
+  batch_size: 16
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  trainer_params:
+    max_epochs: 1000
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 4
+  lightning:
+    loss_func: mse
+    obs_noise_scale: 0.05
+    loop_closure_weight: 0.0001
+    loop_closure_training: true
+    reconstruction_loss_weight: 0.0
+    latent_prediction_loss_weight: 0.0
+  early_stopping:
+    early_stopping_patience: 2
+    min_epochs: 0
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01
