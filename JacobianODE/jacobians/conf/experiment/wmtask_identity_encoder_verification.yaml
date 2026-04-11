@@ -22,7 +22,7 @@ defaults:
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "identity_frozen__lc1e-4_obs0.05_mse_nolpl"
+wandb_group: "identity_frozen__lc1e-4_obs0.05_mse_nolpl_noactnorm"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 # Match original paper: obs_noise=0.05, seq_length=25, all 128 dims, no delays
@@ -42,6 +42,8 @@ data:
 # by setting dynamics_warmup_epochs >= max_epochs.
 # n_target_dims=128 = full observation dim → no subspace splitting.
 model:
+  encoder:
+    use_actnorm: false
   n_target_dims: 128
   prediction_steps: 10        # match vanilla: seq_length(25) - traj_init_steps(15)
   encoder_warmup_epochs: 0    # no warmup — encoder stays at identity
@@ -65,7 +67,7 @@ training:
     accumulate_grad_batches: 4
   lightning:
     loss_func: mse              # match vanilla: plain MSE keeps loss scale consistent with loop closure
-    obs_noise_scale: 0.0
+    obs_noise_scale: 0.05
     loop_closure_weight: 0.0001
     loop_closure_training: true
     reconstruction_loss_weight: 1.0
