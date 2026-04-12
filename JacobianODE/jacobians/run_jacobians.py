@@ -137,7 +137,7 @@ def _run_training(cfg: DictConfig) -> float:
     from .metrics import compute_generalized_variance
     generalized_variance = compute_generalized_variance(values)
     log.info(f"Precomputed generalized variance det(Cov)^(1/D) = {generalized_variance:.6g}")
-    cfg.data.postprocessing.generalized_variance = generalized_variance
+    OmegaConf.update(cfg, "data.postprocessing.generalized_variance", generalized_variance, force_add=True)
 
     # ----------------------------------------
     # CREATE DATALOADERS
