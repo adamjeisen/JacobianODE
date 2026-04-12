@@ -203,6 +203,8 @@ def run_full_analytics(
     save_dir: Path,
     output_dir: Path,
     true_lyapunov: list | None = None,
+    lyapunov_burn_in_steps: int = 100,
+    lyapunov_burn_in_drop: int = 20,
 ) -> tuple[dict[str, str], str]:
     """Invoke run_analytics with the standard section set.
 
@@ -245,6 +247,8 @@ def run_full_analytics(
             output_dir=str(figures_dir),
             sections=ANALYTICS_SECTIONS,
             ranking_method="best_traj_loss",
+            lyapunov_burn_in_steps=lyapunov_burn_in_steps,
+            lyapunov_burn_in_drop=lyapunov_burn_in_drop,
             use_all_runs=True,
             return_model=False,
         )
@@ -694,7 +698,12 @@ def write_context(sentinel: dict, output_dir: Path) -> None:
     (output_dir / "context.json").write_text(json.dumps(context, indent=2) + "\n")
 
 
-def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | None = None) -> Path:
+def analyze(
+    group: str, sweeps_dir: Path, save_dir: Path,
+    true_lyapunov: list | None = None,
+    lyapunov_burn_in_steps: int = 100,
+    lyapunov_burn_in_drop: int = 20,
+) -> Path:
     """Top-level: analyse one sweep's sentinel → produce analysis/<group>/."""
     done_path = sweeps_dir / "done" / f"{group}.done.json"
     if not done_path.is_file():
@@ -751,6 +760,8 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
             save_dir=save_dir,
             output_dir=output_dir,
             true_lyapunov=true_lyapunov,
+            lyapunov_burn_in_steps=lyapunov_burn_in_steps,
+            lyapunov_burn_in_drop=lyapunov_burn_in_drop,
         )
     except Exception as e:
         analytics_error = f"{type(e).__name__}: {e}"
@@ -812,7 +823,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-dir", default=None,
                         help="Directory containing Lightning checkpoints")
     parser.add_argument("--true-lyapunov", default=None,
-                        help="Comma-separated ground-truth Lyapunov exponents, e.g. '0.91,0,-14.57'")
+                        help="Comma-separated literature Lyapunov exponents, e.g. '0.91,0,-14.57'. "
+                             "If not given, the empirical spectrum (computed from eq.jac on the "
+                             "test trajectories) is used as the 'true' reference.")
+    parser.add_argument("--lyapunov-burn-in-steps", type=int, default=100,
+                        help="Extra integration steps appended after the real trajectory for "
+                             "the batch+burn-in predicted Lyapunov variant (default: 100)")
+    parser.add_argument("--lyapunov-burn-in-drop", type=int, default=20,
+                        help="Initial Jacobians to drop from the Lyapunov QR so Q can converge "
+                             "(default: 20)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args(argv)
@@ -830,7 +849,12 @@ def main(argv: list[str] | None = None) -> int:
         true_lyapunov = [float(x) for x in args.true_lyapunov.split(",")]
 
     try:
-        analyze(args.group, sweeps_dir, save_dir, true_lyapunov=true_lyapunov)
+        analyze(
+            args.group, sweeps_dir, save_dir,
+            true_lyapunov=true_lyapunov,
+            lyapunov_burn_in_steps=args.lyapunov_burn_in_steps,
+            lyapunov_burn_in_drop=args.lyapunov_burn_in_drop,
+        )
     except Exception:
         traceback.print_exc()
         return 2
