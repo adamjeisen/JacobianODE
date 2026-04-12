@@ -475,6 +475,39 @@ def acquire_lock(sweeps_dir: Path):
     return fd
 
 
+def install_cron(sweeps_dir: Path, interval_min: int = 10) -> int:
+    """Install a crontab entry that runs this monitor every ``interval_min``
+    minutes. Intended to be invoked once from engaging.
+    """
+    uv_bin = os.path.expanduser("~/.local/bin/uv")
+    # Prefer the repo that contains this file — if we're running from
+    # /home/eisenaj/code/JacobianODE, that's the repo root.
+    repo_root = Path(__file__).resolve().parents[3]
+    log_path = sweeps_dir / "logs" / "monitor.log"
+    line = (
+        f"*/{interval_min} * * * * "
+        f"SWEEPS_DIR={sweeps_dir} {uv_bin} run --no-sync --project {repo_root} "
+        f"python -m JacobianODE.jacobians.tuning.monitor "
+        f">> {log_path} 2>&1"
+    )
+    # Get current crontab (empty if none)
+    try:
+        current = subprocess.check_output(["crontab", "-l"], text=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        current = ""
+    marker = "JacobianODE.jacobians.tuning.monitor"
+    kept = [ln for ln in current.splitlines() if marker not in ln]
+    new_cron = "\n".join(kept + [line]) + "\n"
+    p = subprocess.run(["crontab", "-"], input=new_cron, text=True)
+    if p.returncode != 0:
+        print("ERROR: failed to install crontab", file=sys.stderr)
+        return 2
+    print(f"Installed crontab entry (every {interval_min} min):")
+    print(f"  {line}")
+    print(f"Logs will go to: {log_path}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -484,6 +517,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--log-level", default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    parser.add_argument(
+        "--install-cron", action="store_true",
+        help="Install a crontab entry for this monitor and exit (run once on engaging).",
+    )
+    parser.add_argument(
+        "--cron-interval", type=int, default=10,
+        help="Interval in minutes for the installed cron entry (default: 10).",
     )
     args = parser.parse_args(argv)
 
@@ -498,6 +539,9 @@ def main(argv: list[str] | None = None) -> int:
     sweeps_dir.mkdir(parents=True, exist_ok=True)
     for sub in ("active", "done", "processed", "logs"):
         (sweeps_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    if args.install_cron:
+        return install_cron(sweeps_dir, interval_min=args.cron_interval)
 
     lock = acquire_lock(sweeps_dir)
     if lock is None:
