@@ -314,6 +314,59 @@ def evaluate_success_criteria(criteria: list[str], metrics_summary: dict) -> lis
     return verdicts
 
 
+def _compute_empirical_lyapunov(
+    eq,
+    trajs_raw: Any,
+    dt: float,
+    mu: float,
+    sigma: float,
+    device,
+    chunk_size: int = 64,
+) -> tuple[Any, Any] | tuple[None, None]:
+    """Compute the empirical Lyapunov spectrum from ground-truth Jacobians.
+
+    Mirrors the empirical-Lyapunov path in ``run_analytics.py``:
+    - Denormalize trajectories (``traj * sigma + mu``).
+    - Query ``eq.jac(traj, t=0)`` to get the true Jacobian at each point.
+    - Run the QR-based ``compute_lyapunov_exponents`` on those Jacobians.
+
+    Returns (mean_spectrum, per_traj_spectra) or (None, None) on failure.
+    """
+    import numpy as np
+    import torch
+    from ...models.latent_jacobian import LitLatentJacobianODE
+
+    if eq is None:
+        return None, None
+    try:
+        traj_raw_np = np.asarray(trajs_raw) * sigma + mu
+        if hasattr(eq, "model"):
+            # Torch-native eq.jac (wmtask): batched over leading dim.
+            traj_t = torch.as_tensor(traj_raw_np).float().to(device)
+            n = traj_t.shape[0]
+            chunks: list = []
+            for start in range(0, n, chunk_size):
+                chunk = traj_t[start:start + chunk_size]
+                jacs_chunk = eq.jac(chunk, t=0)
+                le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(jacs_chunk, dt)
+                chunks.append(le_chunk.detach().cpu())
+                del jacs_chunk, le_chunk
+            all_emp = torch.cat(chunks, dim=0).numpy()  # (n, D)
+        else:
+            # Numpy-based dysts eq.jac: per-traj loop (D is small).
+            all_emp_list = []
+            for i in range(traj_raw_np.shape[0]):
+                jacs_np = eq.jac(traj_raw_np[i], t=0)
+                jacs_t = torch.as_tensor(jacs_np).float()
+                le_i = LitLatentJacobianODE.compute_lyapunov_exponents(jacs_t, dt)
+                all_emp_list.append(le_i.detach().cpu().numpy())
+            all_emp = np.stack(all_emp_list, axis=0)
+        return all_emp.mean(axis=0), all_emp
+    except Exception as e:
+        logger.warning(f"empirical Lyapunov computation failed: {e}")
+        return None, None
+
+
 def compute_per_run_lyapunov(
     wandb_entity: str,
     wandb_project: str,
@@ -367,6 +420,11 @@ def compute_per_run_lyapunov(
     dt_cached = None
     per_run: dict[str, Any] = {}
 
+    # Empirical ground-truth Lyapunov spectrum, computed once from eq.jac on
+    # the test trajectories (see run_analytics.py for the canonical path).
+    empirical_mean: np.ndarray | None = None
+    empirical_per_traj: np.ndarray | None = None
+
     for i, run in enumerate(all_runs):
         run_id = run.id
         try:
@@ -393,6 +451,27 @@ def compute_per_run_lyapunov(
                 if trajs is not None and "test_trajs" in trajs:
                     test_seq = trajs["test_trajs"].sequence
                     test_trajs_cached = test_seq[:n_sample_trajectories].to(device)
+
+                    # Compute empirical spectrum ONCE (same data/eq across runs).
+                    mu_val = cfg.data.postprocessing.get("mu", 0.0)
+                    sigma_val = cfg.data.postprocessing.get("sigma", 1.0)
+                    # Use FULL test set (not subsampled) for empirical since
+                    # ground-truth Jacobians are cheap.
+                    traj_for_emp = (
+                        trajs["test_trajs_full"].sequence
+                        if "test_trajs_full" in trajs
+                        else trajs["test_trajs"].sequence
+                    )
+                    logger.info("Computing empirical ground-truth Lyapunov spectrum...")
+                    empirical_mean, empirical_per_traj = _compute_empirical_lyapunov(
+                        eq, traj_for_emp, dt, mu_val, sigma_val, device,
+                    )
+                    if empirical_mean is not None:
+                        logger.info(
+                            f"Empirical λ₁={empirical_mean[0]:.4f}, "
+                            f"λ_min={empirical_mean[-1]:.4f}, "
+                            f"Σλ={empirical_mean.sum():.3f}"
+                        )
 
             load_checkpoint(run_obj, cfg, lit_model, save_dir=str(save_dir), verbose=False)
             lit_model = lit_model.to(device).eval()
@@ -453,7 +532,16 @@ def compute_per_run_lyapunov(
 
     cfgs = {r.id: dict(r.config) for r in all_runs}
     summaries = {r.id: dict(r.summary) for r in all_runs}
-    true_arr = np.array(true_lyapunov, dtype=float) if true_lyapunov else None
+    # Preference: user-provided literature values > computed empirical spectrum.
+    if true_lyapunov:
+        true_arr = np.array(true_lyapunov, dtype=float)
+        true_label = "True spectrum (literature)"
+    elif empirical_mean is not None:
+        true_arr = np.asarray(empirical_mean)
+        true_label = "Empirical (ground-truth Jacobian)"
+    else:
+        true_arr = None
+        true_label = None
 
     # ------- Figure 1: overlay + lambda_max vs val loss scatter -------
     try:
@@ -475,7 +563,7 @@ def compute_per_run_lyapunov(
                 alpha=0.6, lw=1.0,
             )
         if true_arr is not None:
-            ax[0].plot(true_arr, color="black", lw=2.5, label="True spectrum", zorder=10)
+            ax[0].plot(true_arr, color="black", lw=2.5, label=true_label, zorder=10)
             ax[0].legend(loc="upper right")
         ax[0].axhline(0, color="k", lw=0.5, ls="--")
         ax[0].set_xlabel("Index (sorted desc)")
@@ -522,7 +610,8 @@ def compute_per_run_lyapunov(
                 row, col = i // ncol, i % ncol
                 a = axes[row][col]
                 pred = np.array(d["lambda_spectrum"])[:L]
-                a.plot(true_arr, "k-", lw=1.5, label="true")
+                lit_label = "literature" if true_lyapunov else "empirical"
+                a.plot(true_arr, "k-", lw=1.5, label=lit_label)
                 a.plot(pred, "C0o-", lw=1, ms=3, label="pred")
                 a.axhline(0, color="gray", lw=0.5, ls="--")
                 s = summaries.get(rid, {})
@@ -581,7 +670,11 @@ def compute_per_run_lyapunov(
         except Exception as e:
             logger.exception(f"spectrum_mse vs val_loss failed: {e}")
 
-    return per_run
+    return {
+        "per_run": per_run,
+        "empirical_mean": empirical_mean.tolist() if empirical_mean is not None else None,
+        "empirical_per_traj_shape": list(empirical_per_traj.shape) if empirical_per_traj is not None else None,
+    }
 
 
 def write_context(sentinel: dict, output_dir: Path) -> None:
@@ -667,9 +760,10 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
     # run) but valuable — gives both the spectrum overlay and λ_max vs val_loss
     # scatter for identifying runs with unphysical dynamics.
     per_run_lyapunov = {}
+    empirical_lyapunov_mean = None
     per_run_lyap_error = None
     try:
-        per_run_lyapunov = compute_per_run_lyapunov(
+        result = compute_per_run_lyapunov(
             wandb_entity=wandb_entity,
             wandb_project=wandb_project,
             group=group,
@@ -677,6 +771,8 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
             output_dir=output_dir,
             true_lyapunov=true_lyapunov,
         )
+        per_run_lyapunov = result.get("per_run", {})
+        empirical_lyapunov_mean = result.get("empirical_mean")
         # Register any produced per-run plots
         for name in (
             "per_run_lyapunov",
@@ -696,6 +792,7 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
         "analyzed_at": iso_now(),
         "metrics_summary": metrics_summary,
         "per_run_lyapunov": per_run_lyapunov,
+        "empirical_lyapunov_spectrum": empirical_lyapunov_mean,
         "per_run_lyapunov_error": per_run_lyap_error,
         "success_criteria_verdicts": verdicts,
         "figures": figure_map,
