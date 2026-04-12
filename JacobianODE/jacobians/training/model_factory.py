@@ -23,6 +23,7 @@ def make_model(
     mu: float = 0.0,
     sigma: float = 1.0,
     noise_scale_factor: float = 1.0,
+    generalized_variance: Optional[float] = None,
     verbose: bool = False,
 ) -> Any:
     """Create and initialize the model for training.
@@ -106,6 +107,7 @@ def make_model(
         mu=mu,
         sigma=sigma,
         noise_scale_factor=noise_scale_factor,
+        generalized_variance=generalized_variance,
         **extra_kwargs,
     )
 

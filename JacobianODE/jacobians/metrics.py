@@ -17,6 +17,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import shortest_path
 
 import torch
+from torch import nn
 
 def mase(y_true, y_pred, y_train=None):
     """
@@ -93,6 +94,66 @@ def normalized_mse(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     mean_var = true_flat.var(dim=0).mean().clamp(min=1e-8)
     mse_total = (pred_flat - true_flat).pow(2).mean()
     return mse_total / mean_var
+
+
+def compute_generalized_variance(data) -> float:
+    """Compute the D-th root of the generalized variance, ``det(Cov)^(1/D)``.
+
+    Equivalent to the geometric mean of the eigenvalues of the covariance
+    matrix. Unlike the arithmetic mean of per-dim variances (which is the
+    trace of Cov over D), this quantity is INVARIANT under volume-preserving
+    linear transformations (det(A)=1), and thus matches the structure of
+    additive coupling encoders.
+
+    Parameters
+    ----------
+    data : np.ndarray or torch.Tensor
+        Array of shape (..., D). Flattened to (N, D) for covariance.
+
+    Returns
+    -------
+    float
+        ``det(Cov)^(1/D)`` — a single positive scalar with units of variance.
+    """
+    import torch as _torch
+    if isinstance(data, np.ndarray):
+        tensor = _torch.from_numpy(data)
+    else:
+        tensor = data
+    D = tensor.shape[-1]
+    flat = tensor.reshape(-1, D).double()  # double for numerical stability
+    cov = _torch.cov(flat.T)  # (D, D) symmetric PSD
+    eigvals = _torch.linalg.eigvalsh(cov).clamp(min=1e-12)
+    log_gen_var = _torch.log(eigvals).mean()
+    return float(_torch.exp(log_gen_var).item())
+
+
+class GeneralizedNormalizedMSE(nn.Module):
+    """MSE normalized by a precomputed ``det(Cov)^(1/D)`` of the training data.
+
+    Unlike ``normalized_mse`` (per-batch arithmetic-mean-of-variances), this
+    uses a FIXED scalar computed once at initialization. That gives:
+
+    * Scale-invariance w.r.t. the dataset (like nMSE).
+    * CONSISTENT scaling across all loss terms (trajectory, reconstruction,
+      latent prediction, etc.) — they all use the same denominator.
+    * No batch-dependent noise in the denominator.
+    * Exact preservation under volume-preserving encoders (additive coupling).
+
+    Parameters
+    ----------
+    generalized_variance : float
+        Precomputed ``det(Cov)^(1/D)`` from the training data.
+    """
+
+    def __init__(self, generalized_variance: float):
+        super().__init__()
+        self.register_buffer(
+            "denom", torch.tensor(float(generalized_variance))
+        )
+
+    def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
+        return (y_pred - y_true).pow(2).mean() / self.denom
 
 
 # def mape(y_true, y_pred):

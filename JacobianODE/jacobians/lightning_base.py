@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from typing import Any, Callable, Optional, Union, Tuple
 
 from .jacobianODE import JacobianODE, JacobianODEint
-from .metrics import mase, mse, r2_score, smape, normalized_mse
+from .metrics import mase, mse, r2_score, smape, normalized_mse, GeneralizedNormalizedMSE
 from .teacher_forcing import get_alpha_exact, get_alpha_explogapprox, get_alpha_lyap
 
 
@@ -264,6 +264,7 @@ class LitBase(L.LightningModule):
                     mu=0,
                     sigma=1,
                     noise_scale_factor=1.0,
+                    generalized_variance=None,
                     **kwargs
                 ):
         super().__init__()
@@ -279,6 +280,13 @@ class LitBase(L.LightningModule):
             self.criterion = nn.MSELoss()
         elif loss_func == 'normalized_mse':
             self.criterion = normalized_mse
+        elif loss_func == 'generalized_normalized_mse':
+            if generalized_variance is None:
+                raise ValueError(
+                    "loss_func='generalized_normalized_mse' requires "
+                    "generalized_variance to be precomputed and passed in."
+                )
+            self.criterion = GeneralizedNormalizedMSE(generalized_variance)
         else:
             raise ValueError(f"Loss function {loss_func} not implemented")
 

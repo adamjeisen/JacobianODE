@@ -131,6 +131,14 @@ def _run_training(cfg: DictConfig) -> float:
     cfg.data.postprocessing.mu = mu
     cfg.data.postprocessing.sigma = sigma
 
+    # Precompute generalized variance (det(Cov)^(1/D)) for the
+    # 'generalized_normalized_mse' loss function. Volume-preserving under
+    # additive-coupling encoders. Cheap (one-time O(D^3) eigendecomposition).
+    from .metrics import compute_generalized_variance
+    generalized_variance = compute_generalized_variance(values)
+    log.info(f"Precomputed generalized variance det(Cov)^(1/D) = {generalized_variance:.6g}")
+    cfg.data.postprocessing.generalized_variance = generalized_variance
+
     # ----------------------------------------
     # CREATE DATALOADERS
     # ----------------------------------------
@@ -164,9 +172,9 @@ def _run_training(cfg: DictConfig) -> float:
         x0 = None
 
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
-        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, verbose=True)
+        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True)
     else:
-        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, verbose=True)
+        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True)
 
     # Store SLURM timeout in the app config so it gets logged to W&B.
     # This allows downstream tools (run_analytics, discover_sweep_runs) to
