@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -292,6 +293,184 @@ def evaluate_success_criteria(criteria: list[str], metrics_summary: dict) -> lis
     return verdicts
 
 
+def compute_per_run_lyapunov(
+    wandb_entity: str,
+    wandb_project: str,
+    group: str,
+    save_dir: Path,
+    output_dir: Path,
+    n_sample_trajectories: int = 24,
+    chunk_size: int = 8,
+) -> dict[str, Any]:
+    """Compute the Lyapunov spectrum for every run in the sweep.
+
+    Reuses the WMTask trajectories / dataloaders across runs to avoid
+    reloading data 27 times. Each run's model is loaded, its latent
+    trajectory is computed, then Jacobians along the trajectory, then
+    Lyapunov exponents via QR.
+
+    Produces:
+    - ``metrics_summary['per_run_lyapunov']`` — dict of run_id to
+      ``{lambda_spectrum: [...], lambda_max, lambda_sum, ky_dim, error}``
+    - ``figures/lyapunov_vs_val_loss.png`` — scatter of lambda_max vs traj_loss
+    - ``figures/lyapunov_spectra_overlay.png`` — all per-run spectra on one plot
+
+    Returns the per-run dict.
+    """
+    import torch
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import wandb as _wandb
+
+    from ..checkpoints.loader import load_run, load_checkpoint
+    from ...models.latent_jacobian import LitLatentJacobianODE
+
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # List the group's runs (in wandb order)
+    api = _wandb.Api()
+    all_runs = list(api.runs(
+        f"{wandb_entity}/{wandb_project}",
+        filters={"group": group, "state": "finished"},
+    ))
+    logger.info(f"Computing per-run Lyapunov for {len(all_runs)} finished runs")
+
+    # Cache the test trajectories across runs — only the FIRST load_run call
+    # actually generates them; subsequent calls pass generate_data=False.
+    test_trajs_cached = None
+    dt_cached = None
+    per_run: dict[str, Any] = {}
+
+    for i, run in enumerate(all_runs):
+        run_id = run.id
+        try:
+            if i == 0:
+                loaded = load_run(
+                    f"{wandb_entity}/{wandb_project}",
+                    run_id=run_id,
+                    save_dir=str(save_dir),
+                    generate_data=True,
+                    verbose=False,
+                )
+            else:
+                loaded = load_run(
+                    f"{wandb_entity}/{wandb_project}",
+                    run_id=run_id,
+                    save_dir=str(save_dir),
+                    generate_data=False,
+                    dt=dt_cached,
+                    verbose=False,
+                )
+            run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
+            if i == 0:
+                dt_cached = dt
+                if trajs is not None and "test_trajs" in trajs:
+                    test_seq = trajs["test_trajs"].sequence
+                    test_trajs_cached = test_seq[:n_sample_trajectories].to(device)
+
+            load_checkpoint(run_obj, cfg, lit_model, save_dir=str(save_dir), verbose=False)
+            lit_model = lit_model.to(device).eval()
+
+            if test_trajs_cached is None:
+                raise RuntimeError(
+                    "No cached test trajectories — first run must have generate_data=True"
+                )
+
+            # Compute Jacobians along the test trajectories (chunked).
+            lambdas = []
+            with torch.no_grad():
+                for start in range(0, test_trajs_cached.shape[0], chunk_size):
+                    chunk = test_trajs_cached[start : start + chunk_size]
+                    z_full = lit_model.encode_trajectory(chunk)
+                    mu_dyn, _ = lit_model._split_latent(z_full)
+                    jacs = lit_model.compute_jacobians(mu_dyn)  # (B, T, D, D)
+                    lams = LitLatentJacobianODE.compute_lyapunov_exponents(jacs, dt)
+                    lambdas.append(lams.detach().cpu())
+                    del z_full, mu_dyn, jacs
+            lambda_per_traj = torch.cat(lambdas, dim=0).numpy()  # (B, D)
+            lambda_mean = lambda_per_traj.mean(axis=0)            # (D,)
+            lambda_max = float(lambda_mean.max())
+            lambda_sum = float(lambda_mean.sum())
+            # Kaplan-Yorke (rough): largest k such that sum of top-k >= 0
+            cum = np.cumsum(lambda_mean)
+            k_star = int(np.searchsorted(-cum, 0))  # first index where cum crosses 0
+            ky_dim = None
+            if 0 < k_star < len(lambda_mean):
+                # fractional correction
+                ky_dim = float(k_star + cum[k_star - 1] / max(abs(lambda_mean[k_star]), 1e-12))
+            per_run[run_id] = {
+                "lambda_spectrum": lambda_mean.tolist(),
+                "lambda_max": lambda_max,
+                "lambda_sum": lambda_sum,
+                "kaplan_yorke_dim": ky_dim,
+                "error": None,
+            }
+            logger.info(f"  [{i + 1}/{len(all_runs)}] {run_id}: λ_max={lambda_max:.4f}, sum={lambda_sum:.2f}")
+        except Exception as e:
+            per_run[run_id] = {"error": f"{type(e).__name__}: {e}"}
+            logger.warning(f"  [{i + 1}/{len(all_runs)}] {run_id}: FAILED — {e}")
+        finally:
+            # Free GPU memory between runs
+            try:
+                del lit_model
+            except NameError:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # --- Cross-run plots ---
+    # Pair per-run Lyapunov with trajectory val loss (from wandb summary).
+    success = [(rid, d) for rid, d in per_run.items() if d.get("error") is None]
+    if success:
+        try:
+            cfgs = {r.id: dict(r.config) for r in all_runs}
+            summaries = {r.id: dict(r.summary) for r in all_runs}
+
+            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+            # (a) spectrum overlay
+            for rid, d in success:
+                ax[0].plot(d["lambda_spectrum"], alpha=0.4)
+            ax[0].axhline(0, color="k", lw=0.5, ls="--")
+            ax[0].set_xlabel("Index (sorted desc)")
+            ax[0].set_ylabel(r"$\lambda_i$")
+            ax[0].set_title(f"Lyapunov spectra, {len(success)} runs")
+
+            # (b) lambda_max vs traj_loss scatter, colored by LC weight
+            xs, ys, cs = [], [], []
+            for rid, d in success:
+                s = summaries.get(rid, {})
+                tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
+                if tl is None:
+                    continue
+                lc = _nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")
+                xs.append(d["lambda_max"])
+                ys.append(float(tl))
+                cs.append(_to_float_or_none(lc) or 0.0)
+            if xs:
+                sc = ax[1].scatter(xs, ys, c=np.array(cs) + 1e-12,
+                                   norm=matplotlib.colors.LogNorm(),
+                                   cmap="viridis", s=30)
+                ax[1].set_xlabel(r"$\lambda_{\max}$ (predicted)")
+                ax[1].set_ylabel("trajectory val loss")
+                ax[1].set_yscale("log")
+                ax[1].set_title("Leading Lyap. vs val loss")
+                plt.colorbar(sc, ax=ax[1], label="LC weight")
+            fig.tight_layout()
+            path = figures_dir / "per_run_lyapunov.png"
+            fig.savefig(path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"Wrote {path}")
+        except Exception as e:
+            logger.exception(f"per-run Lyapunov plot failed: {e}")
+
+    return per_run
+
+
 def write_context(sentinel: dict, output_dir: Path) -> None:
     """Write context.json — everything the report writer needs from the sentinel."""
     expected = sentinel.get("expected_snapshot", {})
@@ -370,11 +549,34 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
         analytics_error = f"{type(e).__name__}: {e}"
         logger.exception("run_analytics raised")
 
+    # Per-run Lyapunov spectra (across the whole sweep). Expensive (~10-20s per
+    # run) but valuable — gives both the spectrum overlay and λ_max vs val_loss
+    # scatter for identifying runs with unphysical dynamics.
+    per_run_lyapunov = {}
+    per_run_lyap_error = None
+    try:
+        per_run_lyapunov = compute_per_run_lyapunov(
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            group=group,
+            save_dir=save_dir,
+            output_dir=output_dir,
+        )
+        # Register the plot if produced
+        per_run_fig = output_dir / "figures" / "per_run_lyapunov.png"
+        if per_run_fig.is_file():
+            figure_map["per_run_lyapunov"] = str(per_run_fig)
+    except Exception as e:
+        per_run_lyap_error = f"{type(e).__name__}: {e}"
+        logger.exception("per-run Lyapunov computation raised")
+
     metrics_doc = {
         "schema_version": 1,
         "group": group,
         "analyzed_at": iso_now(),
         "metrics_summary": metrics_summary,
+        "per_run_lyapunov": per_run_lyapunov,
+        "per_run_lyapunov_error": per_run_lyap_error,
         "success_criteria_verdicts": verdicts,
         "figures": figure_map,
         "analytics_error": analytics_error,
