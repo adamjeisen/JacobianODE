@@ -647,6 +647,17 @@ def load_checkpoint(
         ):
             loaded_state["logvar_lipschitz"] = torch.tensor(0)
 
+    # Backward compatibility: checkpoints saved before the latent_criterion
+    # split (gennMSE with gen_variance_mode) won't have latent_criterion.denom.
+    # If criterion.denom is present but latent_criterion.denom is not, mirror it.
+    if (
+        "criterion.denom" in loaded_state
+        and "latent_criterion.denom" not in loaded_state
+        and hasattr(lit_model, "latent_criterion")
+        and hasattr(lit_model.latent_criterion, "denom")
+    ):
+        loaded_state["latent_criterion.denom"] = loaded_state["criterion.denom"].clone()
+
     lit_model.load_state_dict(loaded_state)
     lit_model.eval()
 
