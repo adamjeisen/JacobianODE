@@ -214,6 +214,18 @@ def _load_recent_run(
         mu = result.mu
         sigma = result.sigma
         noise_scale_factor = result.noise_scale_factor
+        # Recompute the generalized variance if the run used gennMSE loss.
+        # (run_jacobians.py slices to n_recent_dims before computing it.)
+        generalized_variance = None
+        loss_func = cfg.training.lightning.get("loss_func", "mse")
+        if loss_func == "generalized_normalized_mse":
+            from ..metrics import compute_generalized_variance
+            _n_recent = OmegaConf.select(cfg, "model.n_recent_dims", default=None)
+            if _n_recent is not None and _n_recent < values.shape[-1]:
+                _values_for_gv = values[..., :_n_recent]
+            else:
+                _values_for_gv = values
+            generalized_variance = compute_generalized_variance(_values_for_gv)
         # Create train and test sets
         return_full = "LitEncoderDecoder" in str(cfg.training.lightning.get("_target_", ""))
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
@@ -234,6 +246,9 @@ def _load_recent_run(
             mu = 0.0
             sigma = 1.0
             noise_scale_factor = 1.0
+        # Pull generalized_variance from stored postprocessing if present
+        # (written by run_jacobians.py at training time).
+        generalized_variance = cfg.data.postprocessing.get("generalized_variance", None)
 
     # Make model
     target_str = str(cfg.training.lightning.get("_target_", ""))
@@ -334,6 +349,7 @@ def _load_recent_run(
             mu=float(mu),
             sigma=float(sigma),
             noise_scale_factor=float(noise_scale_factor),
+            generalized_variance=generalized_variance,
             **extra_kwargs,
         )
         lit_model.eq = eq
@@ -388,6 +404,7 @@ def _load_recent_run(
             mu=float(mu),
             sigma=float(sigma),
             noise_scale_factor=float(noise_scale_factor),
+            generalized_variance=generalized_variance,
             **extra_kwargs,
         )
         lit_model.eq = eq
@@ -399,12 +416,14 @@ def _load_recent_run(
             lit_model = make_model(
                 cfg, dt, eq=None, save_dir=save_dir,
                 mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
+                generalized_variance=generalized_variance,
                 verbose=verbose,
             )
         else:
             lit_model = make_model(
                 cfg, dt, eq=eq, project=project, save_dir=save_dir,
                 mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor,
+                generalized_variance=generalized_variance,
                 verbose=verbose,
             )
 

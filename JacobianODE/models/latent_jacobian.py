@@ -1015,8 +1015,10 @@ class LitLatentJacobianODE(LitBase):
                 metric_vals['r2_score'] = r2_score(tgt_flat, pred_flat)
 
             # Latent prediction loss in z_dyn space (computed outside no_grad so
-            # gradients flow back through the encoder).
-            latent_pred_loss = criterion(z_true_crop, z_pred_crop)
+            # gradients flow back through the encoder). Uses latent_criterion,
+            # which may differ from criterion when gen_variance_mode='adaptive_latent'
+            # (denominator recomputed from Cov(z_dyn) each epoch).
+            latent_pred_loss = self.latent_criterion(z_true_crop, z_pred_crop)
             metric_vals['latent_pred_loss'] = latent_pred_loss
             with torch.no_grad():
                 z_pred_flat = z_pred_crop.reshape(z_pred_crop.shape[0], -1)
@@ -1303,6 +1305,55 @@ class LitLatentJacobianODE(LitBase):
                 param.requires_grad = encoder_grad_state[name]
 
         return loss
+
+    # Number of batches sampled to estimate Cov(z_dyn) for adaptive-latent mode.
+    ADAPTIVE_LATENT_N_BATCHES = 50
+
+    def on_train_epoch_start(self):
+        """Recompute the latent-space generalized variance if in adaptive mode.
+
+        Processes a small number of training batches through the (possibly
+        partially-trained) encoder to estimate ``det(Cov(z_dyn))^(1/D_dyn)``.
+        That scalar becomes the denominator for the latent prediction loss
+        over the upcoming epoch.
+        """
+        super().on_train_epoch_start()
+        mode = getattr(self, '_gen_variance_mode', 'fixed')
+        if mode != 'adaptive_latent':
+            return
+
+        train_dl = self.trainer.train_dataloader
+        if train_dl is None:
+            return
+
+        was_training = self.training
+        self.eval()
+        z_samples = []
+        with torch.no_grad():
+            for i, batch in enumerate(train_dl):
+                if i >= self.ADAPTIVE_LATENT_N_BATCHES:
+                    break
+                if isinstance(batch, (list, tuple)):
+                    batch = batch[0]
+                batch = batch.type(self.dtype).to(self.device)
+                z_full = self.encode_trajectory(batch)
+                z_dyn, _ = self._split_latent(z_full)
+                z_samples.append(z_dyn.reshape(-1, z_dyn.shape[-1]))
+
+        if was_training:
+            self.train()
+
+        if not z_samples:
+            return
+
+        from ..jacobians.metrics import compute_generalized_variance
+        all_z = torch.cat(z_samples, dim=0)
+        new_denom = compute_generalized_variance(all_z)
+        self.latent_criterion.set_denom(new_denom)
+        self.log(
+            "latent_gen_var", new_denom,
+            on_step=False, on_epoch=True, sync_dist=True,
+        )
 
     def training_step(self, batch, batch_idx=0, dataloader_idx=0):
         """Full training step: encode, predict, decode, loop closure.

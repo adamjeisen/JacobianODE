@@ -122,6 +122,11 @@ def compute_generalized_variance(data) -> float:
         tensor = data
     D = tensor.shape[-1]
     flat = tensor.reshape(-1, D).double()  # double for numerical stability
+
+    if D == 1:
+        # 1D: generalized variance is just the scalar variance.
+        return float(flat.var(dim=0).clamp(min=1e-12).item())
+
     cov = _torch.cov(flat.T)  # (D, D) symmetric PSD
     eigvals = _torch.linalg.eigvalsh(cov).clamp(min=1e-12)
     log_gen_var = _torch.log(eigvals).mean()
@@ -151,6 +156,10 @@ class GeneralizedNormalizedMSE(nn.Module):
         self.register_buffer(
             "denom", torch.tensor(float(generalized_variance))
         )
+
+    def set_denom(self, new_value: float) -> None:
+        """Update the denominator in-place (used by adaptive-latent mode)."""
+        self.denom.fill_(float(new_value))
 
     def forward(self, y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
         return (y_pred - y_true).pow(2).mean() / self.denom

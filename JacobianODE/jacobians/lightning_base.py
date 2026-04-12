@@ -265,6 +265,7 @@ class LitBase(L.LightningModule):
                     sigma=1,
                     noise_scale_factor=1.0,
                     generalized_variance=None,
+                    gen_variance_mode='fixed',
                     **kwargs
                 ):
         super().__init__()
@@ -278,17 +279,36 @@ class LitBase(L.LightningModule):
         self.alpha_hal = alpha_hal
         if loss_func == 'mse':
             self.criterion = nn.MSELoss()
+            self.latent_criterion = self.criterion
         elif loss_func == 'normalized_mse':
             self.criterion = normalized_mse
+            self.latent_criterion = self.criterion
         elif loss_func == 'generalized_normalized_mse':
             if generalized_variance is None:
                 raise ValueError(
                     "loss_func='generalized_normalized_mse' requires "
                     "generalized_variance to be precomputed and passed in."
                 )
+            if gen_variance_mode not in ('fixed', 'adaptive_latent'):
+                raise ValueError(
+                    f"gen_variance_mode must be 'fixed' or 'adaptive_latent', "
+                    f"got '{gen_variance_mode}'"
+                )
+            # Obs-space criterion (used for decoded prediction + reconstruction):
+            # denominator = det(Cov(x_recent))^(1/n_recent_dims). Fixed across training.
             self.criterion = GeneralizedNormalizedMSE(generalized_variance)
+            if gen_variance_mode == 'fixed':
+                # Single-scalar mode: same denom for latent-space loss too.
+                self.latent_criterion = self.criterion
+            else:
+                # Adaptive mode: separate criterion for z_dyn loss, with a
+                # denominator that gets updated at the start of each training
+                # epoch (see LitLatentJacobianODE.on_train_epoch_start).
+                # Initialized to the obs-space denom as a safe default.
+                self.latent_criterion = GeneralizedNormalizedMSE(generalized_variance)
         else:
             raise ValueError(f"Loss function {loss_func} not implemented")
+        self._gen_variance_mode = gen_variance_mode
 
         self.obs_noise_scale = obs_noise_scale
         self.noise_scale_factor = noise_scale_factor

@@ -132,11 +132,20 @@ def _run_training(cfg: DictConfig) -> float:
     cfg.data.postprocessing.sigma = sigma
 
     # Precompute generalized variance (det(Cov)^(1/D)) for the
-    # 'generalized_normalized_mse' loss function. Volume-preserving under
-    # additive-coupling encoders. Cheap (one-time O(D^3) eigendecomposition).
+    # 'generalized_normalized_mse' loss function.
+    # Slice to the "most recent observable" (first n_recent_dims of the
+    # delay embedding) so the denominator matches the dims the obs-space
+    # losses actually see when reconstruction_mode='most_recent'.
+    # For fully-observed data (n_recent_dims == D) this is unchanged.
     from .metrics import compute_generalized_variance
-    generalized_variance = compute_generalized_variance(values)
-    log.info(f"Precomputed generalized variance det(Cov)^(1/D) = {generalized_variance:.6g}")
+    _n_recent = OmegaConf.select(cfg, "model.n_recent_dims", default=None)
+    if _n_recent is not None and _n_recent < values.shape[-1]:
+        _values_for_gv = values[..., :_n_recent]
+        log.info(f"Computing obs-space gen. variance over first {_n_recent} of {values.shape[-1]} dims (most recent observable)")
+    else:
+        _values_for_gv = values
+    generalized_variance = compute_generalized_variance(_values_for_gv)
+    log.info(f"Precomputed obs-space generalized variance det(Cov)^(1/D) = {generalized_variance:.6g}")
     OmegaConf.update(cfg, "data.postprocessing.generalized_variance", generalized_variance, force_add=True)
 
     # ----------------------------------------
