@@ -178,7 +178,18 @@ def build_figures_section(metrics_doc: dict, analysis_dir: Path) -> list[str]:
     return lines
 
 
-def build_discussion_stub() -> list[str]:
+def build_discussion(analysis_dir: Path) -> list[str]:
+    """Emit the Discussion section.
+
+    If ``discussion.md`` exists in the analysis dir, use its contents verbatim
+    (written by Claude or a human). Otherwise emit a placeholder stub that
+    invites authorship.
+    """
+    discussion_path = analysis_dir / "discussion.md"
+    if discussion_path.is_file():
+        body = discussion_path.read_text().strip()
+        if body:
+            return ["## Discussion", "", body, ""]
     return [
         "## Discussion",
         "",
@@ -186,7 +197,8 @@ def build_discussion_stub() -> list[str]:
         "This section is intentionally left as a placeholder. A human reviewer",
         "or Claude Code agent should fill it in based on the tables and figures",
         "above, explicitly addressing each success criterion and comparing the",
-        "outcome to the stated hypothesis.",
+        "outcome to the stated hypothesis. Write the Discussion to",
+        "`discussion.md` in this directory and re-run `render_report`.",
         "-->",
         "",
         "_(to be written)_",
@@ -203,7 +215,7 @@ def build_markdown(analysis_dir: Path) -> str:
     lines += build_results_section(metrics_doc)
     lines += build_verdicts_section(metrics_doc)
     lines += build_figures_section(metrics_doc, analysis_dir)
-    lines += build_discussion_stub()
+    lines += build_discussion(analysis_dir)
     return "\n".join(lines)
 
 
