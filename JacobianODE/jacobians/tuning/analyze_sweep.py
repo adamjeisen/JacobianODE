@@ -203,8 +203,8 @@ def run_full_analytics(
     save_dir: Path,
     output_dir: Path,
     true_lyapunov: list | None = None,
-    lyapunov_burn_in_steps: int = 100,
-    lyapunov_burn_in_drop: int = 20,
+    lyapunov_burn_in_steps: int = 400,
+    lyapunov_burn_in_drop: int = 100,
 ) -> tuple[dict[str, str], str]:
     """Invoke run_analytics with the standard section set.
 
@@ -701,8 +701,8 @@ def write_context(sentinel: dict, output_dir: Path) -> None:
 def analyze(
     group: str, sweeps_dir: Path, save_dir: Path,
     true_lyapunov: list | None = None,
-    lyapunov_burn_in_steps: int = 100,
-    lyapunov_burn_in_drop: int = 20,
+    lyapunov_burn_in_steps: int = 400,
+    lyapunov_burn_in_drop: int = 100,
 ) -> Path:
     """Top-level: analyse one sweep's sentinel → produce analysis/<group>/."""
     done_path = sweeps_dir / "done" / f"{group}.done.json"
@@ -826,12 +826,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comma-separated literature Lyapunov exponents, e.g. '0.91,0,-14.57'. "
                              "If not given, the empirical spectrum (computed from eq.jac on the "
                              "test trajectories) is used as the 'true' reference.")
-    parser.add_argument("--lyapunov-burn-in-steps", type=int, default=100,
+    parser.add_argument("--lyapunov-burn-in-steps", type=int, default=400,
                         help="Extra integration steps appended after the real trajectory for "
-                             "the batch+burn-in predicted Lyapunov variant (default: 100)")
-    parser.add_argument("--lyapunov-burn-in-drop", type=int, default=20,
+                             "the batch+burn-in predicted Lyapunov variant (default: 400)")
+    parser.add_argument("--lyapunov-burn-in-drop", type=int, default=100,
                         help="Initial Jacobians to drop from the Lyapunov QR so Q can converge "
-                             "(default: 20)")
+                             "(default: 100)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args(argv)
