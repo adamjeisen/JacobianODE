@@ -203,12 +203,18 @@ def run_full_analytics(
     save_dir: Path,
     output_dir: Path,
     true_lyapunov: list | None = None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], str]:
     """Invoke run_analytics with the standard section set.
 
-    Returns a dict of ``{section: figure_path}`` for the PNGs saved to
-    ``output_dir/figures/``.
+    Captures run_analytics's stdout into ``output_dir/run_analytics.log`` so
+    the printed per-run diagnostics / Lyapunov tables end up in the report.
+
+    Returns ``(figure_map, captured_stdout)`` — the figure map is
+    ``{section: figure_path}`` for the PNGs saved to ``output_dir/figures/``.
     """
+    import contextlib
+    import io
+
     from ..run_analytics import run_analytics
 
     figures_dir = output_dir / "figures"
@@ -216,19 +222,34 @@ def run_full_analytics(
 
     logger.info(f"Running run_analytics for group={group}, sections={ANALYTICS_SECTIONS}")
 
-    # run_analytics with output=['save', 'return'] both writes PNGs and returns the figure dict.
-    figures = run_analytics(
-        wandb_entity=wandb_entity,
-        wandb_project=wandb_project,
-        save_dir=str(save_dir),
-        wandb_group=group,
-        true_lyapunov=true_lyapunov,
-        output=["save", "return"],
-        output_dir=str(figures_dir),
-        sections=ANALYTICS_SECTIONS,
-        use_all_runs=True,
-        return_model=False,
-    )
+    # Capture stdout (the bulk of run_analytics's diagnostic output prints
+    # to stdout) into a string buffer and mirror to a log file.
+    buf = io.StringIO()
+
+    class Tee:
+        def __init__(self, a, b):
+            self.a, self.b = a, b
+        def write(self, s):
+            self.a.write(s); self.b.write(s)
+        def flush(self):
+            self.a.flush(); self.b.flush()
+
+    with contextlib.redirect_stdout(Tee(sys.stdout, buf)):
+        figures = run_analytics(
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            save_dir=str(save_dir),
+            wandb_group=group,
+            true_lyapunov=true_lyapunov,
+            output=["save", "return"],
+            output_dir=str(figures_dir),
+            sections=ANALYTICS_SECTIONS,
+            ranking_method="best_traj_loss",
+            use_all_runs=True,
+            return_model=False,
+        )
+    captured = buf.getvalue()
+    (output_dir / "run_analytics.log").write_text(captured)
 
     # Record which sections actually produced figures
     saved = {}
@@ -245,7 +266,7 @@ def run_full_analytics(
                 for p in figures_dir.glob(f"*{section}*.png"):
                     saved[section] = str(p)
                     break
-    return saved
+    return saved, captured
 
 
 def evaluate_success_criteria(criteria: list[str], metrics_summary: dict) -> list[dict]:
@@ -299,6 +320,7 @@ def compute_per_run_lyapunov(
     group: str,
     save_dir: Path,
     output_dir: Path,
+    true_lyapunov: list | None = None,
     n_sample_trajectories: int = 24,
     chunk_size: int = 8,
 ) -> dict[str, Any]:
@@ -426,47 +448,138 @@ def compute_per_run_lyapunov(
     # --- Cross-run plots ---
     # Pair per-run Lyapunov with trajectory val loss (from wandb summary).
     success = [(rid, d) for rid, d in per_run.items() if d.get("error") is None]
-    if success:
+    if not success:
+        return per_run
+
+    cfgs = {r.id: dict(r.config) for r in all_runs}
+    summaries = {r.id: dict(r.summary) for r in all_runs}
+    true_arr = np.array(true_lyapunov, dtype=float) if true_lyapunov else None
+
+    # ------- Figure 1: overlay + lambda_max vs val loss scatter -------
+    try:
+        fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+
+        # Color each spectrum by its run's LC weight (log scale) so the plot
+        # stays legible without a 27-entry legend.
+        lc_vals = []
+        for rid, _ in success:
+            lc = _nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")
+            lc_vals.append(_to_float_or_none(lc) or 0.0)
+        lc_for_color = np.array([max(v, 1e-12) for v in lc_vals])
+        norm = matplotlib.colors.LogNorm(vmin=lc_for_color.min(), vmax=lc_for_color.max())
+        cmap = plt.cm.viridis
+        for (rid, d), lc in zip(success, lc_vals):
+            ax[0].plot(
+                d["lambda_spectrum"],
+                color=cmap(norm(max(lc, 1e-12))),
+                alpha=0.6, lw=1.0,
+            )
+        if true_arr is not None:
+            ax[0].plot(true_arr, color="black", lw=2.5, label="True spectrum", zorder=10)
+            ax[0].legend(loc="upper right")
+        ax[0].axhline(0, color="k", lw=0.5, ls="--")
+        ax[0].set_xlabel("Index (sorted desc)")
+        ax[0].set_ylabel(r"$\lambda_i$")
+        ax[0].set_title(f"Lyapunov spectra, {len(success)} runs  (color = LC weight)")
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
+        plt.colorbar(sm, ax=ax[0], label="LC weight", fraction=0.04, pad=0.04)
+
+        # Right panel: λ_max vs trajectory val loss
+        xs, ys, cs = [], [], []
+        for rid, d in success:
+            s = summaries.get(rid, {})
+            tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
+            if tl is None:
+                continue
+            xs.append(d["lambda_max"])
+            ys.append(float(tl))
+            cs.append(_to_float_or_none(_nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")) or 0.0)
+        if xs:
+            sc = ax[1].scatter(xs, ys, c=np.array(cs) + 1e-12, norm=norm, cmap=cmap, s=30)
+            ax[1].set_xlabel(r"$\lambda_{\max}$ (predicted)")
+            ax[1].set_ylabel("trajectory val loss")
+            ax[1].set_yscale("log")
+            ax[1].set_title("Leading Lyap. vs val loss")
+            plt.colorbar(sc, ax=ax[1], label="LC weight", fraction=0.04, pad=0.04)
+        fig.tight_layout()
+        path = figures_dir / "per_run_lyapunov.png"
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Wrote {path}")
+    except Exception as e:
+        logger.exception(f"per_run_lyapunov summary plot failed: {e}")
+
+    # ------- Figures 2 & 3: only if we have ground-truth Lyapunov -------
+    if true_arr is not None:
+        # Figure 2: small-multiples grid, one subplot per run, pred vs true
         try:
-            cfgs = {r.id: dict(r.config) for r in all_runs}
-            summaries = {r.id: dict(r.summary) for r in all_runs}
+            n = len(success)
+            ncol = 5
+            nrow = int(np.ceil(n / ncol))
+            fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 2.4 * nrow), squeeze=False)
+            L = len(true_arr)
+            for i, (rid, d) in enumerate(success):
+                row, col = i // ncol, i % ncol
+                a = axes[row][col]
+                pred = np.array(d["lambda_spectrum"])[:L]
+                a.plot(true_arr, "k-", lw=1.5, label="true")
+                a.plot(pred, "C0o-", lw=1, ms=3, label="pred")
+                a.axhline(0, color="gray", lw=0.5, ls="--")
+                s = summaries.get(rid, {})
+                tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
+                lc = _nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")
+                title = f"lc={_to_float_or_none(lc):.0e}" if _to_float_or_none(lc) is not None else rid[:8]
+                if tl is not None:
+                    title += f", tl={float(tl):.4f}"
+                a.set_title(title, fontsize=8)
+                a.tick_params(labelsize=7)
+                if i == 0:
+                    a.legend(fontsize=7, loc="upper right")
+            # Hide unused axes
+            for j in range(n, nrow * ncol):
+                axes[j // ncol][j % ncol].axis("off")
+            fig.suptitle("Per-run Lyapunov spectrum: predicted vs true", y=1.01)
+            fig.tight_layout()
+            path = figures_dir / "per_run_lyapunov_vs_true.png"
+            fig.savefig(path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"Wrote {path}")
+        except Exception as e:
+            logger.exception(f"per_run_lyapunov_vs_true grid failed: {e}")
 
-            fig, ax = plt.subplots(1, 2, figsize=(12, 5))
-            # (a) spectrum overlay
-            for rid, d in success:
-                ax[0].plot(d["lambda_spectrum"], alpha=0.4)
-            ax[0].axhline(0, color="k", lw=0.5, ls="--")
-            ax[0].set_xlabel("Index (sorted desc)")
-            ax[0].set_ylabel(r"$\lambda_i$")
-            ax[0].set_title(f"Lyapunov spectra, {len(success)} runs")
-
-            # (b) lambda_max vs traj_loss scatter, colored by LC weight
-            xs, ys, cs = [], [], []
+        # Figure 3: scatter of spectrum MSE vs trajectory val loss
+        try:
+            xs, ys, cs, rids = [], [], [], []
             for rid, d in success:
                 s = summaries.get(rid, {})
                 tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
                 if tl is None:
                     continue
-                lc = _nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")
-                xs.append(d["lambda_max"])
-                ys.append(float(tl))
-                cs.append(_to_float_or_none(lc) or 0.0)
+                pred = np.array(d["lambda_spectrum"])[:L]
+                spec_mse = float(np.mean((pred - true_arr) ** 2))
+                xs.append(float(tl))
+                ys.append(spec_mse)
+                cs.append(_to_float_or_none(_nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")) or 0.0)
+                rids.append(rid)
+                # Stash spec_mse back into per_run for the report
+                per_run[rid]["spectrum_mse_vs_true"] = spec_mse
             if xs:
-                sc = ax[1].scatter(xs, ys, c=np.array(cs) + 1e-12,
-                                   norm=matplotlib.colors.LogNorm(),
-                                   cmap="viridis", s=30)
-                ax[1].set_xlabel(r"$\lambda_{\max}$ (predicted)")
-                ax[1].set_ylabel("trajectory val loss")
-                ax[1].set_yscale("log")
-                ax[1].set_title("Leading Lyap. vs val loss")
-                plt.colorbar(sc, ax=ax[1], label="LC weight")
-            fig.tight_layout()
-            path = figures_dir / "per_run_lyapunov.png"
-            fig.savefig(path, dpi=120, bbox_inches="tight")
-            plt.close(fig)
-            logger.info(f"Wrote {path}")
+                fig, a = plt.subplots(figsize=(7, 5))
+                sc = a.scatter(xs, ys, c=np.array(cs) + 1e-12,
+                               norm=matplotlib.colors.LogNorm(),
+                               cmap="viridis", s=36)
+                a.set_xlabel("trajectory val loss")
+                a.set_ylabel("Lyapunov spectrum MSE (pred vs true)")
+                a.set_xscale("log"); a.set_yscale("log")
+                a.set_title("Spectrum recovery quality vs prediction loss")
+                plt.colorbar(sc, ax=a, label="LC weight")
+                fig.tight_layout()
+                path = figures_dir / "lyapunov_spectrum_mse_vs_val_loss.png"
+                fig.savefig(path, dpi=120, bbox_inches="tight")
+                plt.close(fig)
+                logger.info(f"Wrote {path}")
         except Exception as e:
-            logger.exception(f"per-run Lyapunov plot failed: {e}")
+            logger.exception(f"spectrum_mse vs val_loss failed: {e}")
 
     return per_run
 
@@ -535,9 +648,10 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
 
     # Run the heavy analytics (may load a model and compute Lyapunov exponents).
     figure_map = {}
+    analytics_log = ""
     analytics_error = None
     try:
-        figure_map = run_full_analytics(
+        figure_map, analytics_log = run_full_analytics(
             wandb_entity=wandb_entity,
             wandb_project=wandb_project,
             group=group,
@@ -561,11 +675,17 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
             group=group,
             save_dir=save_dir,
             output_dir=output_dir,
+            true_lyapunov=true_lyapunov,
         )
-        # Register the plot if produced
-        per_run_fig = output_dir / "figures" / "per_run_lyapunov.png"
-        if per_run_fig.is_file():
-            figure_map["per_run_lyapunov"] = str(per_run_fig)
+        # Register any produced per-run plots
+        for name in (
+            "per_run_lyapunov",
+            "per_run_lyapunov_vs_true",
+            "lyapunov_spectrum_mse_vs_val_loss",
+        ):
+            p = output_dir / "figures" / f"{name}.png"
+            if p.is_file():
+                figure_map[name] = str(p)
     except Exception as e:
         per_run_lyap_error = f"{type(e).__name__}: {e}"
         logger.exception("per-run Lyapunov computation raised")
@@ -581,6 +701,7 @@ def analyze(group: str, sweeps_dir: Path, save_dir: Path, true_lyapunov: list | 
         "figures": figure_map,
         "analytics_error": analytics_error,
         "true_lyapunov": true_lyapunov,
+        "analytics_log_file": "run_analytics.log",  # lives next to metrics.json
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics_doc, indent=2) + "\n")
     logger.info(f"Wrote analysis -> {output_dir}")

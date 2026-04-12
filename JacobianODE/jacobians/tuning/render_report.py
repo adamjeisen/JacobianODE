@@ -163,19 +163,65 @@ def build_figures_section(metrics_doc: dict, analysis_dir: Path) -> list[str]:
             lines.append(f"```\n{metrics_doc['analytics_error']}\n```")
         lines.append("")
         return lines
-    for section, path in figures.items():
-        # Make path relative to the analysis dir
+    # Preferred display order: sweep overview first, then prediction / mase,
+    # then Lyapunov plots. Unknown names go last in whatever order.
+    preferred = [
+        "sweep_overview", "sweep_pareto",
+        "prediction_windows", "mase",
+        "lyapunov", "lyapunov_top10",
+        "per_run_lyapunov",
+        "per_run_lyapunov_vs_true",
+        "lyapunov_spectrum_mse_vs_val_loss",
+    ]
+    seen = set()
+    ordered = []
+    for key in preferred:
+        if key in figures:
+            ordered.append((key, figures[key]))
+            seen.add(key)
+    for key, path in figures.items():
+        if key not in seen:
+            ordered.append((key, path))
+
+    for section, path in ordered:
         p = Path(path)
         try:
             rel = p.relative_to(analysis_dir)
         except ValueError:
-            # If absolute path into something else, use basename
             rel = Path("figures") / p.name
         lines.append(f"### {section}")
         lines.append("")
         lines.append(f"![{section}]({rel.as_posix()})")
         lines.append("")
     return lines
+
+
+def build_analytics_log_section(metrics_doc: dict, analysis_dir: Path) -> list[str]:
+    """Embed run_analytics's stdout as a collapsible <details> block."""
+    log_name = metrics_doc.get("analytics_log_file")
+    if not log_name:
+        return []
+    log_path = analysis_dir / log_name
+    if not log_path.is_file():
+        return []
+    content = log_path.read_text().strip()
+    if not content:
+        return []
+    # Truncate pathological logs to keep the report browsable
+    if len(content) > 60_000:
+        content = content[:60_000] + "\n\n... (log truncated — see run_analytics.log for full output)"
+    return [
+        "## `run_analytics` stdout",
+        "",
+        "<details><summary>Click to expand — full diagnostic output from <code>run_analytics</code></summary>",
+        "",
+        "```",
+        content,
+        "```",
+        "",
+        "</details>",
+        "",
+    ]
 
 
 def build_discussion(analysis_dir: Path) -> list[str]:
@@ -216,6 +262,7 @@ def build_markdown(analysis_dir: Path) -> str:
     lines += build_verdicts_section(metrics_doc)
     lines += build_figures_section(metrics_doc, analysis_dir)
     lines += build_discussion(analysis_dir)
+    lines += build_analytics_log_section(metrics_doc, analysis_dir)
     return "\n".join(lines)
 
 
