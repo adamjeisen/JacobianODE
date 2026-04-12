@@ -18,6 +18,22 @@ defaults:
   - override /hydra/sweeper: grid_lc_kl
   - _self_
 
+metadata:
+  description: |
+    Lorenz with PARTIAL observation (dim 0 only) + delay embedding, spline
+    coupling encoder with geometric_noise, 3D dynamic subspace. Sweeps
+    loop_closure_weight × kl_dyn_weight (81 runs). Tests whether the latent
+    model can recover 3D dynamics from a 1D observable + delays.
+  hypothesis: |
+    Given an overcomplete delay embedding of a 1D observable, the encoder
+    should route the underlying 3D dynamic state into z_dyn and the
+    redundant delays into the null space. Trajectory prediction and
+    Lyapunov spectrum should approach ground truth.
+  success_criteria:
+    - "λ₁ estimate matches Lorenz ground truth within ~20%"
+    - "Sum of estimated Lyapunov exponents correctly negative"
+    - "At least one config learns the attractor structure"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 

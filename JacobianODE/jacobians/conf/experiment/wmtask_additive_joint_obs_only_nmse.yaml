@@ -11,6 +11,19 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Joint additive-coupling training, observation-space loss only,
+    per-batch normalized_mse (nMSE) criterion. Compares nMSE vs MSE with
+    lpl disabled, isolating the effect of the loss-scaling choice.
+  hypothesis: |
+    Without lpl's double amplification, nMSE's per-batch variance
+    normalization should be mostly harmless — similar MASE to MSE baseline.
+  success_criteria:
+    - "val/trajectory_mase within ~5% of MSE baseline with lpl=0"
+    - "Loop closure bounded"
+    - "Confirms nMSE's problems stem from batch-noise × multiple losses, not nMSE alone"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_joint_obs_only_nmse__lc1e-4_obs0.05"

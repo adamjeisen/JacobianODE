@@ -11,6 +11,20 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Affine coupling with zero_init=true, no actnorm, frozen. The affine coupling
+    at zero_init is exactly identity (scale=1, shift=0), so the whole encoder
+    reduces to a dimension permutation. Cleanest possible test of the latent
+    pipeline — any gap vs. vanilla JacobianODE is a latent-pipeline bug.
+  hypothesis: |
+    Since the encoder is effectively a permutation (orthogonal, det=1), the
+    latent model's performance should match vanilla JacobianODE exactly.
+  success_criteria:
+    - "val/trajectory_mase matches vanilla baseline (~0.86)"
+    - "val/loop_closure_loss behaves like vanilla (no spikes)"
+    - "val/trajectory_r2_score matches vanilla (~0.991)"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "affine_trivial_frozen__lc1e-4_obs0.05"

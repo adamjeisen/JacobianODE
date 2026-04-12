@@ -12,6 +12,21 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Joint training of additive coupling encoder + Jacobian model with latent
+    prediction loss (weight 1.0) ADDED back in. MSE criterion. Tests whether
+    lpl (which broke loop closure with frozen spline encoder) is compatible
+    with a trainable well-conditioned encoder.
+  hypothesis: |
+    With a trainable encoder and clean gradients from additive coupling, the
+    latent prediction loss is useful signal rather than a pathology. lpl
+    should produce better dynamics fits than obs-only training.
+  success_criteria:
+    - "val/trajectory_mase < 0.75 (meaningfully better than obs-only, ~0.79)"
+    - "Loop closure bounded, no explosion"
+    - "lpl decreases during joint training; encoder shapes z_dyn productively"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_joint_with_lpl__lc1e-4_obs0.05"

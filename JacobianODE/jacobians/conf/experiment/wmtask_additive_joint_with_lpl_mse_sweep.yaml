@@ -10,6 +10,20 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Base config for the MSE version of the LC × obs_noise_scale sweep
+    (9 × 3 = 27 runs). Additive coupling, joint training, lpl enabled.
+    Sweep overrides loop_closure_weight and obs_noise_scale.
+  hypothesis: |
+    With plain MSE as criterion (fixed, absolute scale), the optimal
+    loop_closure_weight should be roughly consistent across obs_noise_scale
+    values, unlike the per-batch nMSE case where optima scatter.
+  success_criteria:
+    - "Optimal LC weight lies in the same order of magnitude across all obs_noise_scale"
+    - "Best MASE < 0.7 at some configuration"
+    - "No run exhibits loop closure explosion"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_joint_with_lpl_mse__lc1e-4_obs0.05"

@@ -18,6 +18,20 @@ defaults:
   - override /hydra/sweeper: grid_lc_kl
   - _self_
 
+metadata:
+  description: |
+    Lorenz (fully observed, 3D) with spline coupling encoder + geometric noise
+    (learned volume-preserving additive flow). Sweeps loop_closure_weight ×
+    kl_dyn_weight (81 runs). 3D dynamic subspace, no null space.
+  hypothesis: |
+    On the canonical chaotic Lorenz system, the latent JacobianODE with
+    dynamics-aware geometric noise should learn the attractor and match the
+    true Lyapunov spectrum for well-tuned LC and KL weights.
+  success_criteria:
+    - "Estimated Lyapunov spectrum correlates with ground truth (λ₁ > 0)"
+    - "Attractor geometry (Kaplan-Yorke dim) matches true value"
+    - "At least one sweep config achieves strong prediction (R² > 0.9)"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 

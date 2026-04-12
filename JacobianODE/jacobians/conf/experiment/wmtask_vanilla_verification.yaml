@@ -19,6 +19,19 @@ defaults:
   - override /model: mlp
   - _self_
 
+metadata:
+  description: |
+    Vanilla JacobianODE baseline on WMTask: MLP directly predicts Jacobians in
+    observation space, no encoder / decoder. Reproduces the original paper
+    config (loop_closure_weight=1e-4). Reference for all latent-pipeline tests.
+  hypothesis: |
+    Plain MSE trajectory loss + small loop-closure regularization learns
+    path-independent Jacobians that predict WMTask trajectories well.
+  success_criteria:
+    - "val/trajectory_r2_score >= 0.99"
+    - "val/trajectory_mase < 1.0 (beats persistence)"
+    - "val/loop_closure_loss decreases monotonically and plateaus < 0.5"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"

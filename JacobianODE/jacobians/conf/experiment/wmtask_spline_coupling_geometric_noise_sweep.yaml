@@ -18,6 +18,21 @@ defaults:
   - override /hydra/sweeper: grid_lc_kl
   - _self_
 
+metadata:
+  description: |
+    Spline coupling encoder on WMTask with geometric_noise (learned
+    volume-preserving additive flow) enabled. Sweeps loop_closure_weight ×
+    kl_dyn_weight (81 runs). Tests whether learned noise-routing improves
+    generalization over plain VAE noise.
+  hypothesis: |
+    Geometric noise routes VAE sampling through a learned diffeomorphism,
+    producing dynamics-aware noise distributions. This should improve
+    robustness and generalization over standard isotropic VAE noise.
+  success_criteria:
+    - "At least one (LC, KL) config matches or beats no-geometric-noise baseline"
+    - "Geometric-noise flow learns a non-identity transform"
+    - "Trajectory prediction remains strong (R² > 0.95)"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 

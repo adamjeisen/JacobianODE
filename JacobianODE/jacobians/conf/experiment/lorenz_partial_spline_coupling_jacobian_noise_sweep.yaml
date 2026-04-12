@@ -18,6 +18,22 @@ defaults:
   - override /hydra/sweeper: grid_lc_kl
   - _self_
 
+metadata:
+  description: |
+    Lorenz with partial observation + delay embedding, spline coupling encoder
+    with jacobian_noise (parameter-free orthogonalized Jacobian noise routing).
+    Sweeps loop_closure_weight × kl_dyn_weight (81 runs). Compares against
+    geometric_noise version.
+  hypothesis: |
+    Parameter-free Jacobian-based noise routing gets the benefits of
+    anisotropic noise (from the learned dynamics) without adding a separate
+    trainable flow, reducing model complexity while maintaining geometric
+    noise benefits.
+  success_criteria:
+    - "Matches or exceeds geometric_noise baseline on Lyapunov spectrum recovery"
+    - "No additional trainable parameters vs plain spline coupling"
+    - "Trajectory prediction remains strong"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 

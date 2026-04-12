@@ -17,6 +17,20 @@ defaults:
   - override /hydra/sweeper: grid_lc_kl
   - _self_
 
+metadata:
+  description: |
+    Spline coupling encoder on WMTask, from-scratch joint training. Sweeps
+    loop_closure_weight × kl_dyn_weight (9×9 = 81 runs). Uses VAE on the
+    dynamic subspace. Earlier exploration of spline coupling as the encoder.
+  hypothesis: |
+    There exists a combination of loop-closure and KL-dynamic weights that
+    yields good trajectory prediction while learning a reasonable latent
+    dynamics representation on WMTask.
+  success_criteria:
+    - "At least one configuration achieves strong trajectory prediction (R² > 0.95)"
+    - "KL sweep reveals a sensitivity curve around dynamic-subspace smoothness"
+    - "Loop closure converges for well-tuned LC weights"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 

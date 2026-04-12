@@ -12,6 +12,21 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    First real joint-training test: additive coupling (zero_init), 5 epochs
+    encoder warmup, then encoder + Jacobian model trained together.
+    Observation-space MSE loss only (latent_prediction_loss_weight = 0).
+    Uses MSE as criterion.
+  hypothesis: |
+    Additive coupling's clean gradient flow + no lpl competition should give
+    stable joint training. Loop closure remains bounded; MASE approaches or
+    beats vanilla baseline.
+  success_criteria:
+    - "val/trajectory_mase < 0.86 (matches or beats vanilla)"
+    - "No loop closure explosion during encoder warmup → joint transition"
+    - "recon_loss stays near zero (encoder remains effectively invertible)"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_joint_obs_only__lc1e-4_obs0.05"

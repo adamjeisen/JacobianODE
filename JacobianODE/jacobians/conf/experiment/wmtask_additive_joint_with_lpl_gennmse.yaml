@@ -15,6 +15,22 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Base config for the generalized_normalized_mse (gennMSE) version of the
+    LC × obs_noise_scale sweep. Uses a precomputed fixed denominator
+    det(Cov(x_recent))^(1/n_recent_dims) for all prediction losses. Compared
+    directly against MSE and per-batch nMSE sweeps.
+  hypothesis: |
+    A fixed, data-scale-aware denominator gives consistent scaling across
+    all prediction terms while eliminating the batch-noise pathology of
+    per-batch nMSE. Should match or slightly beat MSE baseline with
+    identical-shape optimal-LC landscape.
+  success_criteria:
+    - "Best MASE matches or beats MSE baseline"
+    - "Optimal LC weight is consistent across obs_noise_scale"
+    - "No batch-noise-driven instability in the loss landscape"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_joint_with_lpl_gennmse__lc1e-4_obs0.05"

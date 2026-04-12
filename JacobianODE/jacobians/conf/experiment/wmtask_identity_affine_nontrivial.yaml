@@ -11,6 +11,21 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Affine coupling with zero_init=false (non-trivial random initialization),
+    no actnorm, frozen. Creates a random but invertible bijection with a
+    moderately conditioned decoder Jacobian (cond ~29).
+  hypothesis: |
+    A non-identity but well-structured bijection should still let gradients
+    flow cleanly through the decoder. Some degradation vs. vanilla is
+    expected from the ~29x condition number but the model should still
+    learn meaningful dynamics.
+  success_criteria:
+    - "val/trajectory_mase < 1.2 (better than persistence-bound but worse than trivial)"
+    - "val/loop_closure_loss bounded, no explosion"
+    - "Learning is visibly slower than trivial-init affine but eventually converges"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "affine_nontrivial_frozen__lc1e-4_obs0.05"

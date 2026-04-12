@@ -17,6 +17,20 @@ defaults:
   - override /hydra/sweeper: grid_lc_obs_noise
   - _self_
 
+metadata:
+  description: |
+    Spline coupling encoder on WMTask, NO VAE, from-scratch joint training.
+    Sweeps loop_closure_weight × obs_noise_scale (9×3 = 27 runs). Deterministic
+    baseline for comparing against the VAE-enabled spline coupling runs.
+  hypothesis: |
+    Without VAE regularization, the spline encoder should learn a cleaner
+    deterministic mapping. The sweep reveals how obs noise interacts with
+    loop-closure regularization for this encoder class.
+  success_criteria:
+    - "At least one configuration achieves strong trajectory prediction"
+    - "Sensitivity to obs_noise_scale is interpretable"
+    - "Baseline for VAE comparison is clearly established"
+
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 

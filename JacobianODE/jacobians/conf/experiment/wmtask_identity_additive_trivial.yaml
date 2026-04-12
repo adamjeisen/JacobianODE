@@ -11,6 +11,22 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Additive (NICE-style) coupling with zero_init=true, no actnorm, frozen.
+    Volume-preserving by construction (det(J)=1). Translation-only; no scaling.
+    At zero_init, the encoder is a pure dimension permutation — identical to
+    affine trivial but with the stronger structural guarantee of volume
+    preservation.
+  hypothesis: |
+    Identical behavior to affine trivial (both reduce to permutation at
+    zero_init). Serves as a sanity check that additive + zero_init = affine +
+    zero_init when scaling is trivially 1.
+  success_criteria:
+    - "val/trajectory_mase matches vanilla baseline (~0.86)"
+    - "Results match affine_trivial within optimization noise"
+    - "val/loop_closure_loss decreases normally, no pathology"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_trivial_frozen__lc1e-4_obs0.05"

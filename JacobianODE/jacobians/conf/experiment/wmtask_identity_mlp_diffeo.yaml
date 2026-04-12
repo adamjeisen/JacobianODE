@@ -16,6 +16,22 @@ defaults:
   - override /model: latent_mlp_diffeo
   - _self_
 
+metadata:
+  description: |
+    MLP encoder/decoder (not invertible by construction) with diffeomorphism
+    cycle-consistency penalty enforcing approximate invertibility. Encoder
+    is warmed up for 20 epochs with recon + diffeo loss, then frozen while
+    dynamics are trained. Tests whether standard MLP backprop outperforms
+    coupling-flow architectures for gradient conditioning.
+  hypothesis: |
+    Standard MLP backprop (W^T per layer, well-conditioned with modern init)
+    should give cleaner gradients than coupling flows, potentially
+    outperforming even the identity coupling baselines.
+  success_criteria:
+    - "MASE after warmup+freeze reaches or beats vanilla baseline"
+    - "Training is stable through the warmup → dynamics transition"
+    - "Diffeomorphism loss stays low throughout training"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "mlp_diffeo_frozen__lc1e-4_obs0.05"

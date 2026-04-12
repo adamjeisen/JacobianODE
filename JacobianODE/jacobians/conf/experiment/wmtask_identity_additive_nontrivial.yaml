@@ -12,6 +12,22 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Additive (NICE-style) coupling with zero_init=false (random init), no
+    actnorm, frozen. Creates a random volume-preserving bijection with a
+    very well-conditioned decoder Jacobian (cond ~1.5) — unit diagonal
+    preserved across layers. Tests whether a non-trivial but well-conditioned
+    encoder lets dynamics training proceed cleanly.
+  hypothesis: |
+    With cond ~1.5 (vs ~29 for affine random, >>100 for spline), gradients
+    flow cleanly enough that the Jacobian MLP can learn dynamics in the
+    transformed space essentially as well as in obs space.
+  success_criteria:
+    - "val/trajectory_mase matches vanilla baseline (~0.86) within ~5%"
+    - "Noticeably better than affine_nontrivial (gradient conditioning matters)"
+    - "val/loop_closure_loss stays bounded"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_nontrivial_frozen__lc1e-4_obs0.05"

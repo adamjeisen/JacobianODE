@@ -11,6 +11,21 @@ defaults:
   - override /model: latent_spline_coupling
   - _self_
 
+metadata:
+  description: |
+    Joint additive training + lpl, with per-batch normalized_mse (nMSE).
+    Tests whether the nMSE scaling that broke frozen-spline + lpl also breaks
+    trainable-additive + lpl.
+  hypothesis: |
+    Per-batch nMSE amplifies both traj and lpl losses relative to loop closure
+    (a fixed-weight absolute loss), causing loop closure to spike early in
+    training. Even with a trainable encoder, this imbalance persists and
+    needs tuning.
+  success_criteria:
+    - "Observe whether loop closure spikes early in training (diagnostic)"
+    - "MASE vs MSE baseline comparison shows the cost of nMSE scaling"
+    - "Run as part of sweep over loop_closure_weight to find a compensating tuning"
+
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
 wandb_group: "additive_joint_with_lpl_nmse__lc1e-4_obs0.05"
