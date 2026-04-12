@@ -1,0 +1,524 @@
+"""JacobianODE sweep monitor daemon.
+
+Runs periodically (cron, every ~10 min) on engaging. Each cycle:
+
+1. Acquires an exclusive ``flock`` in ``$SWEEPS_DIR/active/monitor.lock`` to
+   prevent two monitor processes from stomping on each other.
+2. Enumerates active sweeps: ``$SWEEPS_DIR/active/*.expected.json`` that
+   don't yet have a corresponding ``$SWEEPS_DIR/done/<group>.done.json``
+   or ``$SWEEPS_DIR/processed/<group>.done.json``.
+3. For each such sweep:
+   a. Loads the expected.json (written by ``engaging-submit``) and the
+      existing state.json (if any).
+   b. Queries the W&B API for every run tagged with the sweep's group.
+   c. Matches each W&B run to a ``run_idx`` in the expected sweep grid by
+      comparing override values against the run's logged config.
+   d. Classifies each ``run_idx`` as running / done_* / failed_*.
+   e. Resubmits runs classified as ``failed_retrying`` via ``sbatch``, up
+      to the sweep's retry cap.
+   f. Writes a new ``state.json`` atomically.
+   g. If every ``run_idx`` is terminal and the sweep has been running
+      longer than the minimum-elapsed guard, writes the ``done.json``
+      sentinel atomically into ``$SWEEPS_DIR/done/``.
+
+Usage:
+    SWEEPS_DIR=/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps \\
+        python -m JacobianODE.jacobians.tuning.monitor
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .run_status import (
+    hit_slurm_walltime,
+    meets_early_stopping_criterion,
+)
+
+
+logger = logging.getLogger("JacobianODE.sweep_monitor")
+
+
+DEFAULT_SWEEPS_DIR = "/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps"
+
+TERMINAL_CLASSIFICATIONS = {
+    "done_finished", "done_early_stopped", "done_walltime", "failed_exhausted",
+}
+
+
+# ---------------------------------------------------------------------------
+# Atomic JSON IO
+# ---------------------------------------------------------------------------
+
+def iso_now() -> str:
+    """ISO-8601 UTC timestamp without microseconds, ending in 'Z'."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def atomic_write_json(path: Path, doc: dict) -> None:
+    """Atomically write ``doc`` as JSON to ``path`` via tmp file + rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_json(path: Path) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Run / SLURM state queries
+# ---------------------------------------------------------------------------
+
+def query_wandb_runs(entity: str, project: str, group: str):
+    """Return a list of wandb.apis.public.Run in the given group."""
+    import wandb
+    api = wandb.Api()
+    project_path = f"{entity}/{project}"
+    return list(api.runs(project_path, filters={"group": group}))
+
+
+def query_squeue_states(user: str = "eisenaj") -> dict[str, str]:
+    """Return dict of SLURM job_id -> current state string."""
+    try:
+        output = subprocess.check_output(
+            ["squeue", "-u", user, "-h", "-o", "%i|%T"], text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    result: dict[str, str] = {}
+    for line in output.strip().split("\n"):
+        if "|" not in line:
+            continue
+        jid, state = line.split("|", 1)
+        result[jid.strip()] = state.strip()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Matching wandb runs to expected run_idx
+# ---------------------------------------------------------------------------
+
+def _coerce(s: str):
+    """Coerce a string override value to Python for comparison."""
+    s = s.strip()
+    if s.lower() in ("true", "false"):
+        return s.lower() == "true"
+    if s.lower() in ("null", "none"):
+        return None
+    try:
+        f = float(s)
+        if f.is_integer() and "." not in s and "e" not in s.lower():
+            return int(f)
+        return f
+    except ValueError:
+        return s
+
+
+def _get_nested(d: Any, key: str, default=None):
+    """Look up ``d['a.b.c']`` as ``d['a']['b']['c']`` (works on dicts)."""
+    cur = d
+    for part in key.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
+
+
+def _values_match(wanted, actual) -> bool:
+    """Compare two values, allowing numeric fuzz."""
+    if actual is None:
+        return wanted is None
+    if isinstance(wanted, float) or isinstance(actual, float):
+        try:
+            w = float(wanted); a = float(actual)
+            return abs(w - a) <= 1e-9 * max(abs(w), abs(a), 1.0)
+        except (TypeError, ValueError):
+            return False
+    return wanted == actual
+
+
+def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
+    """Return the run_idx whose overrides match this run's config, or None.
+
+    Ambiguous matches (more than one) return None — we'd rather skip than
+    mislabel. Most override sets are uniquely identifying so this is rare.
+    """
+    matches: list[int] = []
+    for r in resolved_runs:
+        if all(
+            _values_match(
+                _coerce(ov.split("=", 1)[1]),
+                _get_nested(wandb_config, ov.split("=", 1)[0]),
+            )
+            for ov in r["overrides"]
+            if "=" in ov
+        ):
+            matches.append(r["run_idx"])
+    return matches[0] if len(matches) == 1 else None
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+def classify_wandb_run(run, slurm_timeout_min: float | None) -> str:
+    """Map a wandb run's state to our closed-set classification.
+
+    Returns one of: running, done_finished, done_early_stopped, done_walltime,
+    failed. The caller decides failed_retrying vs failed_exhausted based on
+    attempts vs retry cap.
+    """
+    state = (run.state or "").lower()
+    if state == "finished":
+        return "done_finished"
+    if state == "running":
+        return "running"
+    # Crashed/failed — see if it would have stopped on its own
+    try:
+        met, _ = meets_early_stopping_criterion(run)
+        if met:
+            return "done_early_stopped"
+    except Exception as e:
+        logger.debug(f"early_stopping_criterion check failed: {e}")
+    if slurm_timeout_min is not None:
+        try:
+            if hit_slurm_walltime(run, timeout_min=slurm_timeout_min):
+                return "done_walltime"
+        except Exception as e:
+            logger.debug(f"hit_slurm_walltime check failed: {e}")
+    return "failed"
+
+
+# ---------------------------------------------------------------------------
+# Resubmission
+# ---------------------------------------------------------------------------
+
+def resubmit_run(expected: dict, run_idx: int, sweeps_dir: Path) -> str:
+    """Submit a retry for ``run_idx`` via direct sbatch. Returns the new job
+    ID, or empty string on failure.
+    """
+    resolved = next(
+        r for r in expected["hydra"]["resolved_runs"] if r["run_idx"] == run_idx
+    )
+    experiment = resolved["experiment"]
+    overrides = resolved["overrides"]
+    repo_dir = expected["git"]["repo_dir"]
+    slurm = expected["slurm"]
+    group = expected["wandb"]["group"]
+
+    # Single-run (not --multirun) invocation — runs directly on the allocated node.
+    run_cmd_parts = [
+        "cd", repo_dir, "&&", "OPENBLAS_NUM_THREADS=4",
+        "/home/eisenaj/.local/bin/uv", "run", "--no-sync",
+        "python", "-m", "JacobianODE.jacobians.run_jacobians",
+        f"experiment={experiment}",
+    ] + list(overrides)
+    wrap_cmd = " ".join(run_cmd_parts)
+
+    gres_num = "1"
+    if isinstance(slurm.get("gres"), str) and ":" in slurm["gres"]:
+        gres_num = slurm["gres"].split(":")[-1]
+
+    log_dir = sweeps_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sbatch_args = [
+        "sbatch",
+        "--parsable",
+        f"--partition={slurm.get('partition', 'ou_bcs_normal')}",
+        f"--gpus-per-node={gres_num}",
+        f"--cpus-per-task={slurm.get('cpus_per_task', 4)}",
+        f"--mem={slurm.get('mem', '16GB')}",
+        f"--time={slurm.get('timeout_min', 180)}",
+        f"--job-name=jacobian_retry",
+        f"--output={log_dir}/retry_{group}_%j.out",
+        f"--error={log_dir}/retry_{group}_%j.err",
+        "--wrap", wrap_cmd,
+    ]
+
+    try:
+        result = subprocess.run(
+            sbatch_args, check=True, capture_output=True, text=True,
+        )
+        jid = result.stdout.strip()
+        logger.info(f"Resubmitted {group}/run_idx={run_idx} -> SLURM job {jid}")
+        return jid
+    except subprocess.CalledProcessError as e:
+        logger.error(
+            f"sbatch failed for {group}/run_idx={run_idx}: {e.stderr.strip()}"
+        )
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Main per-sweep logic
+# ---------------------------------------------------------------------------
+
+def load_or_init_state(sweeps_dir: Path, group: str, expected: dict) -> dict:
+    path = sweeps_dir / "active" / f"{group}.state.json"
+    if path.is_file():
+        return load_json(path)
+    return {
+        "schema_version": 1,
+        "group": group,
+        "last_updated": iso_now(),
+        "monitor_cycle": 0,
+        "runs": {},
+        "summary": {},
+    }
+
+
+def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
+    """One cycle of monitoring for a single sweep.
+
+    - Loads expected.json + current state.json.
+    - Queries wandb + squeue.
+    - Updates state and (maybe) writes the done sentinel.
+    """
+    expected = load_json(expected_path)
+    group = expected["wandb"]["group"]
+
+    done_path = sweeps_dir / "done" / f"{group}.done.json"
+    processed_path = sweeps_dir / "processed" / f"{group}.done.json"
+    if done_path.is_file() or processed_path.is_file():
+        return  # Already sentinel'd or analyzed
+
+    state = load_or_init_state(sweeps_dir, group, expected)
+    state["monitor_cycle"] = state.get("monitor_cycle", 0) + 1
+    state["last_updated"] = iso_now()
+
+    # Seed state.runs from expected if this is the first cycle
+    resolved = expected["hydra"]["resolved_runs"]
+    for r in resolved:
+        k = str(r["run_idx"])
+        if k not in state["runs"]:
+            state["runs"][k] = {
+                "wandb_run_ids": [],
+                "slurm_job_ids": [],
+                "attempts": 0,
+                "last_wandb_state": None,
+                "last_slurm_state": None,
+                "classification": "pending_resubmit",
+                "terminal": False,
+            }
+
+    try:
+        wandb_runs = query_wandb_runs(
+            expected["wandb"]["entity"],
+            expected["wandb"]["project"],
+            group,
+        )
+    except Exception as e:
+        logger.error(f"wandb query failed for group={group}: {e}")
+        return
+
+    slurm_states = query_squeue_states()
+    timeout_min = expected["slurm"].get("timeout_min", 180)
+
+    # Classify each wandb run into a run_idx bucket
+    for run in wandb_runs:
+        try:
+            cfg = dict(run.config)
+        except Exception:
+            continue
+        idx = match_run_to_idx(cfg, resolved)
+        if idx is None:
+            continue
+        k = str(idx)
+        entry = state["runs"][k]
+        if run.id not in entry["wandb_run_ids"]:
+            entry["wandb_run_ids"].append(run.id)
+            entry["attempts"] = len(entry["wandb_run_ids"])
+        entry["last_wandb_state"] = run.state
+        cls = classify_wandb_run(run, slurm_timeout_min=timeout_min)
+        # Promote to terminal classification if any attempt for this idx reached it
+        if cls in ("done_finished", "done_early_stopped", "done_walltime"):
+            entry["classification"] = cls
+            entry["terminal"] = True
+        elif cls == "running":
+            if not entry["terminal"]:
+                entry["classification"] = "running"
+        elif cls == "failed":
+            cap = expected.get("retry", {}).get("cap_per_run", 2)
+            if entry["attempts"] > cap:
+                entry["classification"] = "failed_exhausted"
+                entry["terminal"] = True
+            elif not entry["terminal"]:
+                entry["classification"] = "failed_retrying"
+
+    # Also fold in SLURM states for jobs we've tracked
+    for entry in state["runs"].values():
+        for jid in entry["slurm_job_ids"]:
+            if jid in slurm_states:
+                entry["last_slurm_state"] = slurm_states[jid]
+
+    # Resubmit anything currently marked failed_retrying and not already queued
+    for k, entry in state["runs"].items():
+        if entry["classification"] != "failed_retrying":
+            continue
+        # Skip if a prior attempt is still queued/running
+        if any(slurm_states.get(jid) in ("PENDING", "RUNNING", "CONFIGURING")
+               for jid in entry["slurm_job_ids"]):
+            continue
+        new_jid = resubmit_run(expected, int(k), sweeps_dir)
+        if new_jid:
+            entry["slurm_job_ids"].append(new_jid)
+
+    # Compute summary
+    runs = state["runs"]
+    state["summary"] = {
+        "terminal": sum(1 for e in runs.values() if e["terminal"]),
+        "in_flight": sum(1 for e in runs.values() if not e["terminal"]),
+        "failed_exhausted": sum(
+            1 for e in runs.values() if e["classification"] == "failed_exhausted"
+        ),
+        "effectively_done": sum(
+            1 for e in runs.values() if e["classification"].startswith("done_")
+        ),
+    }
+
+    # Write state.json atomically
+    state_path = sweeps_dir / "active" / f"{group}.state.json"
+    atomic_write_json(state_path, state)
+
+    # Sentinel check: all terminal AND elapsed time guard met
+    all_terminal = (
+        len(runs) == expected["expected_run_count"]
+        and all(e["terminal"] for e in runs.values())
+    )
+    if not all_terminal:
+        return
+
+    launched_at = datetime.fromisoformat(
+        expected["launched_at"].replace("Z", "+00:00")
+    )
+    elapsed = (datetime.now(timezone.utc) - launched_at).total_seconds()
+    min_elapsed = expected.get("retry", {}).get("min_elapsed_before_done_sec", 600)
+    if elapsed < min_elapsed:
+        logger.info(
+            f"{group}: all terminal but only {elapsed:.0f}s since launch "
+            f"(guard = {min_elapsed}s); waiting."
+        )
+        return
+
+    # Write done.json atomically
+    done_doc = {
+        "schema_version": 1,
+        "group": group,
+        "completed_at": iso_now(),
+        "outcome": (
+            "complete_clean"
+            if state["summary"]["failed_exhausted"] == 0
+            else "complete_with_failures"
+        ),
+        "expected_snapshot": expected,
+        "final_state_snapshot": state,
+        "successful_run_ids": [
+            rid
+            for e in runs.values()
+            if e["classification"].startswith("done_")
+            for rid in e["wandb_run_ids"]
+        ],
+        "failed_run_indices": [
+            int(k) for k, e in runs.items()
+            if e["classification"] == "failed_exhausted"
+        ],
+        "multirun_dir": expected["hydra"].get("multirun_dir"),
+    }
+    atomic_write_json(done_path, done_doc)
+    logger.info(f"Wrote sentinel: {done_path}")
+
+
+# ---------------------------------------------------------------------------
+# Lock + main
+# ---------------------------------------------------------------------------
+
+def acquire_lock(sweeps_dir: Path):
+    lock_path = sweeps_dir / "active" / "monitor.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fd.close()
+        return None
+    return fd
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--sweeps-dir", default=None,
+        help=f"Override $SWEEPS_DIR (default: {DEFAULT_SWEEPS_DIR})",
+    )
+    parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    args = parser.parse_args(argv)
+
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    sweeps_dir = Path(
+        args.sweeps_dir or os.environ.get("SWEEPS_DIR") or DEFAULT_SWEEPS_DIR
+    )
+    sweeps_dir.mkdir(parents=True, exist_ok=True)
+    for sub in ("active", "done", "processed", "logs"):
+        (sweeps_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    lock = acquire_lock(sweeps_dir)
+    if lock is None:
+        logger.info("Another monitor cycle is running; exiting.")
+        return 0
+
+    try:
+        expected_files = sorted(
+            (sweeps_dir / "active").glob("*.expected.json")
+        )
+        logger.info(f"Monitor cycle: {len(expected_files)} active sweep(s)")
+        for path in expected_files:
+            try:
+                check_sweep(path, sweeps_dir)
+            except Exception:
+                logger.exception(f"Error processing {path}")
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
