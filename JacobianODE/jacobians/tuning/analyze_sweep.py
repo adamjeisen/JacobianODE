@@ -79,37 +79,64 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
     api = wandb.Api()
     runs = list(api.runs(f"{wandb_entity}/{wandb_project}", filters={"group": group}))
     per_run: list[dict[str, Any]] = []
+    # Columns we want; handle both latent-model and vanilla-model key naming.
+    cols = [
+        "epoch",
+        "val/trajectory_loss", "trajectory val_loss",
+        "val/loop_closure_loss", "val loop closure loss",
+        "val/trajectory_mase", "trajectory val mase",
+        "val/trajectory_r2_score", "trajectory val r2_score",
+    ]
     for r in runs:
         cfg = dict(r.config)
         lc = _nested_get(cfg, "training.lightning.loop_closure_weight")
         ons = _nested_get(cfg, "training.lightning.obs_noise_scale")
-        # Fetch history metrics for best-by-run
-        hist = r.scan_history(
-            keys=[
-                "epoch",
-                "val/trajectory_loss", "trajectory val_loss",
-                "val/loop_closure_loss", "val loop closure loss",
-                "val/trajectory_mase", "trajectory val mase",
-                "val/trajectory_r2_score", "trajectory val r2_score",
-            ],
-            page_size=10000,
-        )
+
+        # `run.history()` returns a pandas DataFrame with ALL logged keys (no
+        # AND-filter trap like scan_history(keys=[...])). Request a large
+        # enough `samples` to cover all epochs.
+        try:
+            df = r.history(samples=10_000)
+        except Exception as e:
+            logger.warning(f"history() failed for run {r.id}: {e}")
+            continue
+
+        if df.empty:
+            continue
+
         rows = []
-        for row in hist:
-            tl = row.get("val/trajectory_loss") or row.get("trajectory val_loss")
-            if tl is None:
+        for _, row in df.iterrows():
+            # val/trajectory_loss is latent-model naming; `trajectory val_loss`
+            # (space, no slash) is vanilla-model naming.
+            tl = row.get("val/trajectory_loss")
+            if tl is None or (isinstance(tl, float) and tl != tl):  # NaN check
+                tl = row.get("trajectory val_loss")
+            if tl is None or (isinstance(tl, float) and tl != tl):
                 continue
+            lc_loss = row.get("val/loop_closure_loss")
+            if lc_loss is None or (isinstance(lc_loss, float) and lc_loss != lc_loss):
+                lc_loss = row.get("val loop closure loss")
+            mase = row.get("val/trajectory_mase")
+            if mase is None or (isinstance(mase, float) and mase != mase):
+                mase = row.get("trajectory val mase")
+            r2 = row.get("val/trajectory_r2_score")
+            if r2 is None or (isinstance(r2, float) and r2 != r2):
+                r2 = row.get("trajectory val r2_score")
             rows.append({
                 "epoch": row.get("epoch"),
-                "traj_loss": tl,
-                "lc_loss": row.get("val/loop_closure_loss") or row.get("val loop closure loss"),
-                "mase": row.get("val/trajectory_mase") or row.get("trajectory val mase"),
-                "r2": row.get("val/trajectory_r2_score") or row.get("trajectory val r2_score"),
+                "traj_loss": float(tl),
+                "lc_loss": float(lc_loss) if lc_loss is not None and lc_loss == lc_loss else None,
+                "mase": float(mase) if mase is not None and mase == mase else None,
+                "r2": float(r2) if r2 is not None and r2 == r2 else None,
             })
         if not rows:
             continue
         best_by_tl = min(rows, key=lambda d: d["traj_loss"])
-        best_by_mase = min(rows, key=lambda d: d["mase"]) if rows[0]["mase"] is not None else best_by_tl
+        rows_with_mase = [d for d in rows if d.get("mase") is not None]
+        best_by_mase = (
+            min(rows_with_mase, key=lambda d: d["mase"])
+            if rows_with_mase else best_by_tl
+        )
         per_run.append({
             "run_id": r.id,
             "state": r.state,
