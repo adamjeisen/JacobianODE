@@ -880,7 +880,20 @@ class LitLatentJacobianODE(LitBase):
             mu_dyn, _z_null = self._split_latent(z_full)
             z_dyn_sampled, _, _ = self._vae_reparameterize(mu_dyn)
             z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
-            z_dyn_clean = mu_dyn  # target is always the mean, not the sample
+            # Latent prediction target. When obs noise is injected, encoding
+            # the noisy batch produces a noisy version of the true latent
+            # trajectory — a poor regression target for latent_pred_loss.
+            # Re-encode the *clean* observations and use that as the target,
+            # detached so gradients from latent_pred_loss flow only through
+            # the noisy-encoder + dynamics path (the denoising-via-rollout
+            # signal), not through the target itself.
+            if obs_noise_scale > 0:
+                with torch.no_grad():
+                    z_full_clean = self.encode_trajectory(batch)
+                    mu_dyn_clean, _ = self._split_latent(z_full_clean)
+                z_dyn_clean = mu_dyn_clean
+            else:
+                z_dyn_clean = mu_dyn  # target is always the mean, not the sample
 
             # Add isotropic noise in latent space before propagation.
             if latent_noise_scale > 0:
