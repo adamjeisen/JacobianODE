@@ -310,8 +310,11 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
 
     done_path = sweeps_dir / "done" / f"{group}.done.json"
     processed_path = sweeps_dir / "processed" / f"{group}.done.json"
-    if done_path.is_file() or processed_path.is_file():
-        return  # Already sentinel'd or analyzed
+    failed_path = sweeps_dir / "failed" / f"{group}.done.json"
+    # Don't re-create a sentinel that's already been handed off (done/ or
+    # processed/) or permanently shelved by the analysis agent (failed/).
+    if done_path.is_file() or processed_path.is_file() or failed_path.is_file():
+        return
 
     state = load_or_init_state(sweeps_dir, group, expected)
     state["monitor_cycle"] = state.get("monitor_cycle", 0) + 1
