@@ -46,6 +46,54 @@ Pass any Hydra overrides as arguments. To check job status: `ssh engaging 'squeu
 `ssh` commands containing `uv run` — this is intentional since the guard is for the
 local Pascal GPU machine only.
 
+### Sweep automation pipeline (4 stages)
+
+1. **`engaging-submit`** (local → engaging): validates experiment YAML has a
+   `metadata:` block, resolves the sweep grid (from `sweep_grid:` YAML field
+   and/or CLI), writes `expected.json` to
+   `/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps/active/<group>.expected.json`,
+   then submits via `jsweep`.
+2. **Monitor cron on engaging** (`JacobianODE/jacobians/tuning/monitor.py`):
+   polls wandb + SLURM, writes `<group>.state.json`, emits `<group>.done.json`
+   sentinel into `sweeps/done/` when all runs terminal (and min elapsed time
+   passed). Checks `failed/` to prevent ping-pong with auto-analyze.
+3. **`engaging-analyze <group>`** (local, manual or via auto-analyze): SSHes
+   to engaging, submits an sbatch GPU job running
+   `JacobianODE.jacobians.tuning.analyze_sweep`, rsyncs results to
+   `~/Documents/jacobian-analyses/<group>/`, renders report.
+4. **`engaging-auto-analyze`** (systemd user timer on endeavour): every 15 min
+   checks `sweeps/done/` for new sentinels, runs `engaging-analyze`, moves
+   sentinel to `processed/` on success or `failed/` on failure.
+
+### Required experiment YAML fields
+
+Every file in `JacobianODE/jacobians/conf/experiment/*.yaml` must have a
+top-level `metadata:` block with `description`, `hypothesis`, and
+`success_criteria` (list). `prepare_sweep.py` enforces this before submission.
+
+To hardcode a sweep grid in the experiment (so you can launch with just
+`engaging-submit experiment=<name>` and no CLI overrides), add:
+
+```yaml
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-4,1e-2,1"
+  training.lightning.obs_noise_scale:     "0,0.01,0.05"
+```
+
+### Loss functions (`training.lightning.loss_func`)
+
+- `mse` — plain MSE (default).
+- `normalized_mse` — per-batch variance normalization; divides MSE by
+  `Var(target)` computed in the current batch. Equivalent to `1 - R²` per step.
+- `generalized_normalized_mse` — divides MSE by a **precomputed** scalar
+  `det(Cov(target))^(1/D)` (generalized variance). Stable across batches and
+  across the trajectory/reconstruction/loop-closure terms; preferred when you
+  want consistent loss scale regardless of where in the latent you are.
+
+The `latent_criterion` (for latent prediction loss) can use a separate denom
+via `gen_variance_mode=adaptive_latent`, which recomputes `det(Cov(z_dyn))^(1/D)`
+at the start of each epoch from 50 batches.
+
 ## Jupyter Notebooks
 
 Never use the default notebook read/edit/grep tools. Never try to read the raw `.ipynb`

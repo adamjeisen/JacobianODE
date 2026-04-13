@@ -380,6 +380,7 @@ def compute_per_run_lyapunov(
     true_lyapunov: list | None = None,
     n_sample_trajectories: int = 24,
     chunk_size: int = 8,
+    expected_snapshot: dict | None = None,
 ) -> dict[str, Any]:
     """Compute the Lyapunov spectrum for every run in the sweep.
 
@@ -536,6 +537,77 @@ def compute_per_run_lyapunov(
 
     cfgs = {r.id: dict(r.config) for r in all_runs}
     summaries = {r.id: dict(r.summary) for r in all_runs}
+
+    # ---- Detect swept keys + map wandb run -> run_idx -------------------
+    # Swept keys: config paths with >1 unique value across successful runs.
+    # Pulled from the sentinel's overrides_template when available, else
+    # discovered empirically by diffing cfgs.
+    swept_keys: list[str] = []
+    if expected_snapshot:
+        tpl = expected_snapshot.get("hydra", {}).get("overrides_template", []) or []
+        for ov in tpl:
+            if "=" not in ov:
+                continue
+            k, v = ov.split("=", 1)
+            if "," in v and k != "experiment":
+                swept_keys.append(k)
+    if not swept_keys:
+        # Fallback: discover from cfgs (any key whose value varies across runs)
+        from collections import defaultdict
+        seen: dict[str, set] = defaultdict(set)
+        # Walk only the leaves we already know about — the sweep grids in
+        # this project all live under training.lightning.* and data.*.
+        candidate_paths = [
+            "training.lightning.loop_closure_weight",
+            "training.lightning.obs_noise_scale",
+            "training.lightning.latent_prediction_loss_weight",
+            "training.lightning.reconstruction_loss_weight",
+            "training.lightning.loss_func",
+            "model.kl_null_weight",
+            "model.kl_dyn_weight",
+        ]
+        for rid, _ in success:
+            for p in candidate_paths:
+                seen[p].add(repr(_nested_get(cfgs.get(rid, {}), p)))
+        swept_keys = [p for p, vs in seen.items() if len(vs) > 1]
+
+    # Map wandb run id -> run_idx via the sentinel's resolved_runs (when
+    # available). Falls back to enumeration order.
+    rid_to_idx: dict[str, int | None] = {}
+    if expected_snapshot:
+        try:
+            from .monitor import match_run_to_idx
+            resolved_runs = expected_snapshot.get("hydra", {}).get("resolved_runs", [])
+            for rid, _ in success:
+                rid_to_idx[rid] = match_run_to_idx(cfgs.get(rid, {}), resolved_runs)
+        except Exception as e:
+            logger.warning(f"run_idx matching failed: {e}")
+    for i, (rid, _) in enumerate(success):
+        rid_to_idx.setdefault(rid, None)
+
+    def _short_param_label(key: str) -> str:
+        # Last segment of the dotted path, sans common prefixes.
+        return key.rsplit(".", 1)[-1]
+
+    def _fmt_param_value(v):
+        f = _to_float_or_none(v)
+        if f is None:
+            return str(v)
+        if f == 0:
+            return "0"
+        if abs(f) < 1e-2 or abs(f) >= 1e3:
+            return f"{f:.0e}"
+        return f"{f:g}"
+
+    def _per_run_title(rid: str) -> str:
+        idx = rid_to_idx.get(rid)
+        idx_str = f"idx={idx}" if idx is not None else f"id={rid[:8]}"
+        cfg = cfgs.get(rid, {})
+        parts = [idx_str]
+        for k in swept_keys:
+            v = _nested_get(cfg, k)
+            parts.append(f"{_short_param_label(k)}={_fmt_param_value(v)}")
+        return "  ".join(parts)
     # Preference: user-provided literature values > computed empirical spectrum.
     if true_lyapunov:
         true_arr = np.array(true_lyapunov, dtype=float)
@@ -606,9 +678,11 @@ def compute_per_run_lyapunov(
         # Figure 2: small-multiples grid, one subplot per run, pred vs true
         try:
             n = len(success)
-            ncol = 5
+            ncol = 4
             nrow = int(np.ceil(n / ncol))
-            fig, axes = plt.subplots(nrow, ncol, figsize=(4 * ncol, 2.4 * nrow), squeeze=False)
+            fig, axes = plt.subplots(
+                nrow, ncol, figsize=(5.0 * ncol, 3.6 * nrow), squeeze=False
+            )
             L = len(true_arr)
             for i, (rid, d) in enumerate(success):
                 row, col = i // ncol, i % ncol
@@ -620,18 +694,20 @@ def compute_per_run_lyapunov(
                 a.axhline(0, color="gray", lw=0.5, ls="--")
                 s = summaries.get(rid, {})
                 tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
-                lc = _nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")
-                title = f"lc={_to_float_or_none(lc):.0e}" if _to_float_or_none(lc) is not None else rid[:8]
+                title = _per_run_title(rid)
                 if tl is not None:
-                    title += f", tl={float(tl):.4f}"
-                a.set_title(title, fontsize=8)
-                a.tick_params(labelsize=7)
+                    title += f"\ntraj_loss={float(tl):.4f}"
+                a.set_title(title, fontsize=11)
+                a.tick_params(labelsize=10)
                 if i == 0:
-                    a.legend(fontsize=7, loc="upper right")
+                    a.legend(fontsize=10, loc="upper right")
             # Hide unused axes
             for j in range(n, nrow * ncol):
                 axes[j // ncol][j % ncol].axis("off")
-            fig.suptitle("Per-run Lyapunov spectrum: predicted vs true", y=1.01)
+            fig.suptitle(
+                "Per-run Lyapunov spectrum: predicted vs true",
+                y=1.01, fontsize=14,
+            )
             fig.tight_layout()
             path = figures_dir / "per_run_lyapunov_vs_true.png"
             fig.savefig(path, dpi=120, bbox_inches="tight")
@@ -781,6 +857,7 @@ def analyze(
             save_dir=save_dir,
             output_dir=output_dir,
             true_lyapunov=true_lyapunov,
+            expected_snapshot=sentinel.get("expected_snapshot", {}),
         )
         per_run_lyapunov = result.get("per_run", {})
         empirical_lyapunov_mean = result.get("empirical_mean")
