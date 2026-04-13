@@ -40,7 +40,7 @@ sweep_grid:
 # ── W&B / logging ─────────────────────────────────────────────────────────────
 wandb_entity: JacobianODE
 wandb_project: "Lorenz_INDall_N1_D1_NormTrue_T3__JacobianODE"
-wandb_group: "lorenz_additive_joint_gennmse__lc_x_obsnoise_sweep"
+wandb_group: "lorenz_additive_joint_gennmse__lc_x_obsnoise__cleantarget"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
