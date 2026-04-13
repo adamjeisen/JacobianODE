@@ -1,0 +1,64 @@
+# Latent JacobianODE with an additive (NICE-style) coupling encoder.
+#
+# Additive coupling is volume-preserving by construction (det(J)=1) and has
+# a lower-triangular per-layer Jacobian with unit diagonal, so the decoder
+# Jacobian stays well-conditioned (cond ≈ 1) and gradients flow cleanly
+# from observation-space losses back to the Jacobian MLP. This makes it
+# the preferred encoder for dynamics training, especially when paired
+# with a trainable encoder + latent prediction loss.
+#
+# Use-agnostic defaults are identical to latent_spline_coupling.yaml where
+# possible; the only structural difference is coupling_type and the
+# removal of spline-specific knobs (num_bins, tail_bound).
+
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_target_dims, set at runtime
+  hidden_dim: [256, 1024, 2048, 2048]
+  num_layers: 4
+  output_dim: null   # = n_target_dims², set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.coupling_flows.CouplingEncoder
+  n_input: null              # set at runtime (= n_delays * len(observed_indices))
+  n_coupling_layers: 8
+  coupling_type: additive    # NICE-style translation only; volume-preserving
+  use_actnorm: false         # per-dim affine; can break volume preservation if trained
+  hidden_dim: 128
+  n_hidden_layers: 2
+  zero_init: true            # identity at init (only dimension permutations remain)
+  permutation_seed: 42
+  use_loft: false
+  loft_tau: 100.0
+
+n_target_dims: 7              # drives MLP dims and subspace splitting
+kl_null_weight: null          # null-space MSE penalty (structural constraint)
+kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
+use_vae: false                # deterministic latent by default; flip on when you need VAE
+vae_sample_all_losses: false
+kl_warmup_epochs: 0
+prediction_steps: 30
+encoder_warmup_epochs: 0      # additive+zero_init is already identity, no warmup needed
+dynamics_warmup_epochs: 0
+jac_window_stride: null
+decode_only_recent: false
+
+# Geometric noise: learned volume-preserving map f: z_dyn -> u that warps
+# isotropic noise in u-space into dynamics-aware anisotropic noise in z-space.
+# Requires use_vae: true.
+geometric_noise:
+  enabled: false
+  n_coupling_layers: 6
+  hidden_dim: 128
+  n_hidden_layers: 2
+  permutation_seed: 0
+
+# Jacobian noise: parameter-free volume-preserving noise routing using the
+# Jacobian MLP. Requires use_vae: true. Mutually exclusive with geometric_noise.
+jacobian_noise:
+  enabled: false
+  lookahead_steps: null
+  orthogonalize: true

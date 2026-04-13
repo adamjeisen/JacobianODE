@@ -224,13 +224,29 @@ def build_expected(
 
     meta_by_exp: dict[str, Any] = {}
     docs_by_exp: dict[str, Any] = {}
+    sweep_grid_yaml: dict[str, list[str]] = {}
     for exp in experiments:
         doc = load_experiment_yaml(repo, exp)
         meta = validate_metadata(doc, exp)
         meta_by_exp[exp] = meta
         docs_by_exp[exp] = doc
+        # Merge any sweep_grid block declared in the YAML.
+        y_grid = doc.get("sweep_grid")
+        if y_grid:
+            for k, v in y_grid.items():
+                values = (
+                    [s.strip() for s in str(v).split(",")]
+                    if not isinstance(v, list)
+                    else [str(x) for x in v]
+                )
+                # CLI overrides (if any) take precedence over YAML values.
+                if k not in grid:
+                    sweep_grid_yaml[k] = values
 
-    resolved = resolve_sweep_grid(experiments, grid)
+    # CLI grid wins when both are present.
+    effective_grid = {**sweep_grid_yaml, **grid}
+
+    resolved = resolve_sweep_grid(experiments, effective_grid)
 
     # Use first experiment's YAML + the full override list (not just run[0]'s
     # subset) so that sweep-wide overrides like wandb_group=... are picked up.
@@ -290,6 +306,16 @@ def main(argv: list[str] | None = None) -> int:
         "--print-group", action="store_true",
         help="Instead of emitting JSON, print just the resolved wandb_group name.",
     )
+    parser.add_argument(
+        "--print-sweep-args", action="store_true",
+        help=(
+            "Print the effective sweep-grid overrides (from YAML + CLI) as "
+            "space-separated Hydra override strings, e.g.:\n"
+            "  training.lightning.loop_closure_weight=0,1e-6,...  "
+            "training.lightning.obs_noise_scale=0,0.01,0.05\n"
+            "Useful for engaging-submit to append these to the jsweep command."
+        ),
+    )
     parser.add_argument("overrides", nargs=argparse.REMAINDER)
 
     args = parser.parse_args(argv)
@@ -312,6 +338,27 @@ def main(argv: list[str] | None = None) -> int:
             print("ERROR: No wandb_group resolved for this sweep.", file=sys.stderr)
             return 2
         print(group)
+        return 0
+
+    if args.print_sweep_args:
+        # Reconstruct the effective grid from the resolved_runs by collecting
+        # the distinct values seen per override key.
+        seen: dict[str, list[str]] = {}
+        for r in doc["hydra"]["resolved_runs"]:
+            for ov in r["overrides"]:
+                if "=" not in ov:
+                    continue
+                k, v = ov.split("=", 1)
+                seen.setdefault(k, [])
+                if v not in seen[k]:
+                    seen[k].append(v)
+        # Only emit keys with >=2 distinct values (i.e. the actual sweep axes).
+        overrides = [
+            f"{k}={','.join(vs)}"
+            for k, vs in seen.items()
+            if len(vs) >= 2
+        ]
+        print(" ".join(overrides))
         return 0
 
     text = json.dumps(doc, indent=2, sort_keys=False)

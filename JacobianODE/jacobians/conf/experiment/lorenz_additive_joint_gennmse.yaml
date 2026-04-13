@@ -1,0 +1,88 @@
+# @package _global_
+#
+# Experiment: Lorenz × Additive Coupling — LC × obs_noise_scale sweep
+# --------------------------------------------------------------------
+# Fully-observed Lorenz (3D), additive coupling encoder (volume-preserving,
+# well-conditioned gradient flow), joint training of encoder + Jacobian
+# dynamics from the start. gennMSE loss.
+#
+# Sweep: 9 × 3 = 27 runs (see `sweep_grid` block below).
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Fully observed Lorenz-63 (all 3 dims, no delay embedding). Additive
+    coupling encoder with zero_init (starts at identity-permutation),
+    trained jointly with the Jacobian dynamics using gennMSE. Sweeps
+    loop_closure_weight × obs_noise_scale (9 × 3 = 27).
+  hypothesis: |
+    With a well-conditioned additive encoder and gennMSE's stable loss
+    scaling, the latent JacobianODE learns Lorenz's attractor and
+    recovers its Lyapunov spectrum (λ ≈ [0.91, 0, -14.57], λ₁ > 0).
+    Optimal LC should sit in the 1e-5 – 1e-3 range with a broad basin.
+  success_criteria:
+    - "Best run's leading Lyapunov exponent > 0 (chaos recovered)"
+    - "Best run's predicted Lyapunov spectrum within ~20% of empirical"
+    - "val/trajectory_r2_score > 0.95 at the best configuration"
+    - "Loop closure bounded and monotonically improving at low LC"
+
+# ── Sweep grid (consumed by prepare_sweep.py and engaging-submit) ─────────────
+# Hardcoded here so the experiment is reproducible without remembering CLI args.
+# Each key maps to comma-separated Hydra override values.
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+  training.lightning.obs_noise_scale:     "0,0.01,0.05"
+
+# ── W&B / logging ─────────────────────────────────────────────────────────────
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDall_N1_D1_NormTrue_T3__JacobianODE"
+wandb_group: "lorenz_additive_joint_gennmse__lc_x_obsnoise_sweep"
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 25            # traj_init_steps(15) + prediction_steps(10)
+    delay_embedding_params:
+      observed_indices: 'all' # all 3 Lorenz dims
+      n_delays: 1             # no delay embedding
+      delay_spacing: 1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# latent_additive_coupling already defaults to coupling_type=additive,
+# zero_init=true, use_actnorm=false, use_vae=false. Only experiment-specific
+# overrides go here.
+model:
+  n_target_dims: 3            # full 3D dynamic subspace; no null subspace
+  prediction_steps: 10
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 150
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: generalized_normalized_mse
+    loop_closure_weight: 0.0001       # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    obs_noise_scale: 0.01              # overridden by sweep_grid
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 10
