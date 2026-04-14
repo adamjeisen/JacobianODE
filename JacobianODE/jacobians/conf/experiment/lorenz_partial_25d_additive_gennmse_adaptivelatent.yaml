@@ -1,0 +1,101 @@
+# @package _global_
+#
+# Experiment: Partial-obs Lorenz, gennMSE with adaptive-latent denominator
+# -----------------------------------------------------------------------
+# Same as lorenz_partial_25d_additive_gennmse but the latent_criterion uses
+# gen_variance_mode='adaptive_latent': the denominator of the latent
+# prediction loss is det(Cov(z_dyn))^(1/D) recomputed from ~50 batches at
+# the start of each epoch, rather than the fixed observation-space
+# denominator used for the decoded-prediction and reconstruction terms.
+# Decouples the latent-prediction loss scale from the observation-space
+# loss scale, which is expected to matter on partial-obs where z_dyn is
+# a strict subspace of the 25-D delay embedding.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Partial-obs Lorenz (x only, 25 delays), z_dyn 3-D, gennMSE with
+    gen_variance_mode='adaptive_latent'. The latent prediction loss is
+    normalized by det(Cov(z_dyn))^(1/D), recomputed each epoch from
+    ~50 batches of the current encoder's output. Observation-space
+    terms (decoded trajectory, reconstruction, loop closure) keep the
+    fixed data-space gennMSE denominator. Otherwise identical to the
+    partial-obs gennMSE baseline: additive coupling, kl_null_weight=0,
+    reconstruction_mode='most_recent', obs_noise_scale=0, LC swept.
+
+  hypothesis: |
+    On partial-obs the z_dyn distribution is free to rescale during
+    training (the encoder is learning it as it goes). A fixed
+    data-space denominator for the latent prediction loss couples its
+    scale to whatever z_dyn's variance happens to be at any moment,
+    which can over- or under-weight the LPL term across epochs. The
+    adaptive-latent mode recomputes Cov(z_dyn) each epoch, keeping the
+    LPL effectively on a "unit generalized variance" scale as z_dyn
+    evolves. Expected effects: more stable LPL contribution to the
+    loss, better loop-closure / latent-prediction balance, and a
+    cleaner LC landscape compared to the fixed-denominator gennMSE
+    partial-obs sweep. If no meaningful improvement, the fixed
+    denominator was already fine on this problem.
+
+  success_criteria:
+    - "Best run's leading Lyapunov exponent > 0 (chaos recovered)"
+    - "Best run's predicted Lyapunov spectrum within ~30% of empirical"
+    - "LPL contribution stays numerically well-scaled across epochs (no blow-up or vanishing)"
+    - "Best-LC's trajectory_r2 and spectrum MSE match or beat the fixed-gennMSE partial-obs baseline"
+
+# ── Sweep grid (LC only) ─────────────────────────────────────────────────────
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+
+# ── W&B / logging ─────────────────────────────────────────────────────────────
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_N25_D1_NormTrue_T3__JacobianODE"
+wandb_group: "lorenz_partial_25d_additive_gennmse_adaptivelatent__lc_sweep"
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  postprocessing:
+    obs_noise: 0.0
+    normalize: true
+  train_test_params:
+    seq_length: 25
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 25
+      delay_spacing: 1
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  n_target_dims: 3
+  prediction_steps: 10
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: generalized_normalized_mse
+    gen_variance_mode: adaptive_latent
+    loop_closure_weight: 0.1                 # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'most_recent'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
