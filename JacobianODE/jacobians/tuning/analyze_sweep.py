@@ -434,12 +434,16 @@ def compute_per_run_lyapunov(
         run_id = run.id
         try:
             if i == 0:
+                # return_full_obs=True so that partial-obs / delay-embedded
+                # runs still have the underlying full state available for
+                # computing the empirical Lyapunov spectrum via eq.jac.
                 loaded = load_run(
                     f"{wandb_entity}/{wandb_project}",
                     run_id=run_id,
                     save_dir=str(save_dir),
                     generate_data=True,
                     verbose=False,
+                    return_full_obs=True,
                 )
             else:
                 loaded = load_run(

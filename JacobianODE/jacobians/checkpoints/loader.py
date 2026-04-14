@@ -80,6 +80,7 @@ def load_run(
     generate_data: bool = True,
     dt: Optional[float] = None,
     verbose: bool = False,
+    return_full_obs: Optional[bool] = None,
 ) -> Tuple[Any, Any, Any, Optional[float], Any, Any, Any, Any, Any, Any]:
     """Load a previous training run and its associated data.
 
@@ -227,7 +228,10 @@ def _load_recent_run(
                 _values_for_gv = values
             generalized_variance = compute_generalized_variance(_values_for_gv)
         # Create train and test sets
-        return_full = "LitEncoderDecoder" in str(cfg.training.lightning.get("_target_", ""))
+        if return_full_obs is None:
+            return_full = "LitEncoderDecoder" in str(cfg.training.lightning.get("_target_", ""))
+        else:
+            return_full = return_full_obs
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
             cfg, values, return_full_obs=return_full
         )
