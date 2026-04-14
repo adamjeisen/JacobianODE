@@ -127,7 +127,8 @@ def load_run(
 
     if est_dt > LEGACY_CUTOFF_DATE:
         return _load_recent_run(
-            run, project, save_dir, no_noise, generate_data, dt, verbose
+            run, project, save_dir, no_noise, generate_data, dt, verbose,
+            return_full_obs=return_full_obs,
         )
     else:
         return _load_legacy_run(
@@ -143,6 +144,7 @@ def _load_recent_run(
     generate_data: bool,
     dt: Optional[float],
     verbose: bool,
+    return_full_obs: Optional[bool] = None,
 ) -> Tuple[Any, Any, Any, Optional[float], Any, Any, Any, Any, Any, Any]:
     """Load a run created after the legacy cutoff date."""
     if verbose:
