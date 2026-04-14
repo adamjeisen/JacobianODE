@@ -604,10 +604,13 @@ def compute_per_run_lyapunov(
         return f"{f:g}"
 
     def _per_run_title(rid: str) -> str:
+        # Always include the short wandb run id so the subplot is
+        # unambiguously traceable back to wandb; add Hydra run_idx when
+        # available (matches sentinel's resolved_runs).
         idx = rid_to_idx.get(rid)
-        idx_str = f"idx={idx}" if idx is not None else f"id={rid[:8]}"
+        head = f"idx={idx} | {rid[:8]}" if idx is not None else rid[:8]
         cfg = cfgs.get(rid, {})
-        parts = [idx_str]
+        parts = [head]
         for k in swept_keys:
             v = _nested_get(cfg, k)
             parts.append(f"{_short_param_label(k)}={_fmt_param_value(v)}")
