@@ -785,14 +785,19 @@ def analyze(
     lyapunov_burn_in_drop: int = 100,
 ) -> Path:
     """Top-level: analyse one sweep's sentinel → produce analysis/<group>/."""
-    done_path = sweeps_dir / "done" / f"{group}.done.json"
-    if not done_path.is_file():
-        # Also check processed/ in case we're reanalysing an already-consumed sweep
-        alt = sweeps_dir / "processed" / f"{group}.done.json"
-        if alt.is_file():
-            done_path = alt
-        else:
-            raise FileNotFoundError(f"No sentinel found for group '{group}' in done/ or processed/")
+    # Accept the sentinel from any of done/, processed/, or failed/. Auto-analyze
+    # or a prior run may have already moved it; the sentinel content is the same
+    # regardless and re-running the analysis shouldn't require manually relocating it.
+    done_path = None
+    for sub in ("done", "processed", "failed"):
+        cand = sweeps_dir / sub / f"{group}.done.json"
+        if cand.is_file():
+            done_path = cand
+            break
+    if done_path is None:
+        raise FileNotFoundError(
+            f"No sentinel found for group '{group}' in done/, processed/, or failed/"
+        )
 
     sentinel = json.loads(done_path.read_text())
     wandb_info = sentinel.get("expected_snapshot", {}).get("wandb", {})
