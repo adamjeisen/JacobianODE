@@ -723,6 +723,69 @@ def compute_per_run_lyapunov(
         except Exception as e:
             logger.exception(f"per_run_lyapunov_vs_true grid failed: {e}")
 
+        # Figure 2b: per-run relative error per Lyapunov exponent
+        # For each run, show signed relative error of predicted vs true spectrum,
+        # as a bar chart indexed by exponent. The denominator is floored at a
+        # small fraction of the max empirical |λ| so near-zero exponents
+        # (Lorenz's λ₂ ≈ 0) don't blow up to infinity — caveat: those bars
+        # represent roughly "error in units of 0.1% of the largest |λ|", still
+        # informative. Y-axis clipped to ±500% for readability.
+        try:
+            n = len(success)
+            ncol = 4
+            nrow = int(np.ceil(n / ncol))
+            fig, axes = plt.subplots(
+                nrow, ncol, figsize=(5.0 * ncol, 3.6 * nrow), squeeze=False
+            )
+            L = len(true_arr)
+            denom_eps = max(1e-6, 1e-3 * float(np.max(np.abs(true_arr))))
+            denom = np.maximum(np.abs(true_arr), denom_eps)
+            x_idx = np.arange(L)
+            y_clip = 500.0
+            for i, (rid, d) in enumerate(success):
+                row, col = i // ncol, i % ncol
+                a = axes[row][col]
+                pred = np.array(d["lambda_spectrum"])[:L]
+                rel_err = 100.0 * (pred - true_arr) / denom
+                colors = ["C0" if e <= 0 else "C3" for e in rel_err]
+                a.bar(x_idx, np.clip(rel_err, -y_clip, y_clip), color=colors, alpha=0.85)
+                a.axhline(0, color="gray", lw=0.7)
+                # Annotate exact value above/below each bar (including clipped ones)
+                for xi, v in zip(x_idx, rel_err):
+                    a.text(
+                        xi,
+                        np.clip(v, -y_clip * 0.95, y_clip * 0.95),
+                        f"{v:+.0f}%",
+                        ha="center",
+                        va="bottom" if v >= 0 else "top",
+                        fontsize=9,
+                    )
+                a.set_xticks(x_idx)
+                a.set_xlabel(r"$\lambda$ index")
+                a.set_ylabel("rel. err (%)")
+                a.set_ylim(-y_clip, y_clip)
+                s = summaries.get(rid, {})
+                tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
+                title = _per_run_title(rid)
+                if tl is not None:
+                    title += f"\ntraj_loss={float(tl):.4f}"
+                a.set_title(title, fontsize=11)
+                a.tick_params(labelsize=10)
+            for j in range(n, nrow * ncol):
+                axes[j // ncol][j % ncol].axis("off")
+            fig.suptitle(
+                "Per-run Lyapunov relative error (pred vs "
+                f"{'literature' if true_lyapunov else 'empirical'})",
+                y=1.01, fontsize=14,
+            )
+            fig.tight_layout()
+            path = figures_dir / "per_run_lyapunov_relerr.png"
+            fig.savefig(path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"Wrote {path}")
+        except Exception as e:
+            logger.exception(f"per_run_lyapunov_relerr grid failed: {e}")
+
         # Figure 3: scatter of spectrum MSE vs trajectory val loss
         try:
             xs, ys, cs, rids = [], [], [], []
@@ -877,6 +940,7 @@ def analyze(
         for name in (
             "per_run_lyapunov",
             "per_run_lyapunov_vs_true",
+            "per_run_lyapunov_relerr",
             "lyapunov_spectrum_mse_vs_val_loss",
         ):
             p = output_dir / "figures" / f"{name}.png"

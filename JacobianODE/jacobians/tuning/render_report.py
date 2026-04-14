@@ -171,6 +171,7 @@ def build_figures_section(metrics_doc: dict, analysis_dir: Path) -> list[str]:
         "lyapunov", "lyapunov_top10",
         "per_run_lyapunov",
         "per_run_lyapunov_vs_true",
+        "per_run_lyapunov_relerr",
         "lyapunov_spectrum_mse_vs_val_loss",
     ]
     seen = set()
