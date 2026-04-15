@@ -152,7 +152,11 @@ logger_save_dirs: null
 logger:
   _target_: pytorch_lightning.loggers.WandbLogger
   save_dir: null
-  log_model: True
+  # Model checkpoints are saved locally via ModelCheckpoint to logger_save_dirs
+  # on engaging — no need to also upload them to wandb (they can be hundreds of
+  # MB per run and quickly blow past the wandb storage quota). Flip back to True
+  # only if you need cross-machine artifact distribution.
+  log_model: False
   
 trainer_params:
   # limit_train_batches: 1.0
