@@ -1,0 +1,605 @@
+#!/home/eisenaj/code/JacobianODE/.venv/bin/python
+"""engaging-controller — the engaging-side cron driver for git-based sweep automation.
+
+Once per cron tick (~5 min), this script:
+  1. flock to prevent overlap
+  2. git pull jacobian-reports
+  3. process new instructions/pending/*.yaml: run prepare_sweep + jsweep locally,
+     move file to instructions/claimed/ (annotated) or instructions/failed/.
+  4. invoke JacobianODE.jacobians.tuning.monitor (writes /orcd state.json + sentinels)
+  5. dispatch analysis sbatch for any new sentinels in /orcd/.../sweeps/done/
+  6. reap completed analysis sbatches: render report, copy into the repo, mv sentinel
+  7. write/update status/overview.json (only if changed)
+  8. git add+commit+push (rebase-and-retry on rejection)
+
+Replaces the previous endeavour-side SSH+systemd flow. Existing
+JacobianODE.jacobians.tuning.{monitor,prepare_sweep,analyze_sweep,render_report}
+modules are unchanged — this is a thin orchestrator.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import yaml
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths and constants
+# ---------------------------------------------------------------------------
+REPO_DIR = Path("/home/eisenaj/code/jacobian-reports")
+JACODE_REPO = Path("/home/eisenaj/code/JacobianODE")
+SWEEPS_DIR = Path("/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps")
+STATE_DIR = Path("/home/eisenaj/.engaging-controller")
+INFLIGHT_FILE = STATE_DIR / "in_flight.json"
+LOCK_FILE = STATE_DIR / "controller.lock"
+
+UV = "/home/eisenaj/.local/bin/uv"
+HOSTNAME = socket.gethostname()
+SUBMIT_POLL_SEC = 2
+SUBMIT_POLL_MAX = 90  # seconds total to wait for jsweep's SLURM jobs to appear
+ANALYZE_PARTITION = "ou_bcs_high"  # for analysis sbatch
+ANALYZE_TIMEOUT_MIN = 60
+ANALYZE_GPUS = 1
+ANALYZE_CPUS = 4
+ANALYZE_MEM_GB = 16
+
+
+# ---------------------------------------------------------------------------
+# Plumbing
+# ---------------------------------------------------------------------------
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_compact() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def log(msg: str) -> None:
+    print(f"[{utc_iso()}] {msg}", flush=True)
+
+
+def acquire_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        log("lock held by another instance; exiting")
+        sys.exit(0)
+
+
+def run(cmd, cwd=None, check=True, capture=True, env=None) -> subprocess.CompletedProcess:
+    """Thin wrapper around subprocess.run with sensible defaults."""
+    return subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        check=check,
+        capture_output=capture,
+        text=True,
+        env=env,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Git helpers (jacobian-reports repo)
+# ---------------------------------------------------------------------------
+def git(*args, check=True) -> subprocess.CompletedProcess:
+    return run(["git", *args], cwd=REPO_DIR, check=check)
+
+
+def git_pull_rebase() -> None:
+    git("pull", "--rebase", "--autostash")
+
+
+def git_pull_jacode() -> None:
+    """Pull JacobianODE so the controller picks up code changes (monitor /
+    analyze_sweep / prepare_sweep / sweep.py / and the controller itself,
+    since it now lives in the repo) without manual SSH intervention."""
+    try:
+        run(["git", "pull", "--rebase", "--autostash"], cwd=JACODE_REPO, check=True)
+    except subprocess.CalledProcessError as e:
+        log(f"git pull JacobianODE failed: {(e.stderr or '').strip()[:300]}")
+
+
+def git_status_dirty() -> bool:
+    return bool(git("status", "--porcelain").stdout.strip())
+
+
+def git_commit_and_push(msg: str, dry_run: bool) -> None:
+    if not git_status_dirty():
+        return
+    git("add", "-A")
+    git("commit", "-m", msg)
+    if dry_run:
+        log("dry-run: skipping push")
+        return
+    for attempt in range(3):
+        try:
+            git("pull", "--rebase", "--autostash")
+            git("push")
+            return
+        except subprocess.CalledProcessError as e:
+            log(f"push attempt {attempt + 1} failed: {e.stderr.strip()[:200]}")
+            time.sleep(2)
+    log("push failed after 3 attempts; will retry next cycle")
+
+
+# ---------------------------------------------------------------------------
+# In-flight state
+# ---------------------------------------------------------------------------
+def load_inflight() -> dict:
+    if INFLIGHT_FILE.exists():
+        return json.loads(INFLIGHT_FILE.read_text())
+    return {}
+
+
+def save_inflight(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    INFLIGHT_FILE.write_text(json.dumps(state, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# (3) Process pending instructions
+# ---------------------------------------------------------------------------
+def _read_yaml(path: Path) -> dict:
+    return yaml.safe_load(path.read_text())
+
+
+def _write_yaml(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+
+def _git_head_info() -> tuple[str, str]:
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=JACODE_REPO).stdout.strip()
+    commit = run(["git", "rev-parse", "--short", "HEAD"], cwd=JACODE_REPO).stdout.strip()
+    return branch, commit
+
+
+def _current_array_jobs() -> set[str]:
+    """Return the set of SLURM array job IDs currently visible in our queue."""
+    try:
+        out = run(
+            ["squeue", "-u", os.environ.get("USER", "eisenaj"), "-h", "-o", "%i"],
+            check=False,
+        ).stdout
+    except FileNotFoundError:
+        return set()
+    ids = set()
+    for line in out.splitlines():
+        m = re.match(r"(\d+)", line.strip())
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
+def _submit_one(exp: str, overrides: list[str]) -> dict:
+    """Run prepare_sweep + jsweep for one experiment. Returns dict of metadata
+    including the SLURM array id (or raises on failure).
+    """
+    branch, commit = _git_head_info()
+    expected_path = STATE_DIR / "expected_tmp.json"
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. prepare_sweep validates metadata + writes expected.json
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "JacobianODE.jacobians.tuning.prepare_sweep",
+        "--git-branch", branch,
+        "--git-commit", commit,
+        "--git-repo-dir", str(JACODE_REPO),
+        "--launched-from", HOSTNAME,
+        "--output", str(expected_path),
+        "--", f"experiment={exp}", *overrides,
+    ]
+    run(cmd, cwd=JACODE_REPO)
+
+    expected = json.loads(expected_path.read_text())
+    group = expected["wandb"].get("group")
+    if not group:
+        raise RuntimeError("expected.json has no wandb_group")
+    expected_run_count = expected.get("expected_run_count")
+
+    # 2. Move expected.json into place under /orcd/.../sweeps/active/
+    SWEEPS_DIR.joinpath("active").mkdir(parents=True, exist_ok=True)
+    final_expected = SWEEPS_DIR / "active" / f"{group}.expected.json"
+    shutil.move(str(expected_path), str(final_expected))
+
+    # 3. Pick up sweep_grid args from the YAML so user doesn't need to
+    #    repeat them on the CLI.
+    sg = run(
+        [UV, "run", "--no-sync", "python", "-m",
+         "JacobianODE.jacobians.tuning.prepare_sweep",
+         "--print-sweep-args", "--",
+         f"experiment={exp}", *overrides],
+        cwd=JACODE_REPO, check=False,
+    ).stdout.strip()
+    sg_args = shlex.split(sg) if sg else []
+
+    # 4. Submit jsweep (Hydra multirun + submitit). Capture SLURM array id by
+    #    polling squeue for new IDs.
+    before = _current_array_jobs()
+    jsweep_cmd = [
+        "bash", "-l", "-c",
+        f"cd {JACODE_REPO} && OPENBLAS_NUM_THREADS=4 jsweep "
+        + shlex.join([f"experiment={exp}", *overrides, *sg_args])
+    ]
+    proc = subprocess.Popen(
+        jsweep_cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+
+    array_id = None
+    deadline = time.time() + SUBMIT_POLL_MAX
+    stable_polls = 0
+    prev_new = 0
+    while time.time() < deadline:
+        time.sleep(SUBMIT_POLL_SEC)
+        after = _current_array_jobs()
+        new = after - before
+        if new:
+            if len(new) == prev_new:
+                stable_polls += 1
+            else:
+                stable_polls = 0
+            prev_new = len(new)
+            if stable_polls >= 3:
+                # Pick the lowest new array id (jsweep typically submits one)
+                array_id = sorted(new)[0]
+                break
+    # Cleanup: jsweep often hangs after submitit returns; kill it
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    if not array_id:
+        raise RuntimeError(
+            f"jsweep submission for {exp}: no new SLURM array job appeared within "
+            f"{SUBMIT_POLL_MAX}s"
+        )
+
+    return {
+        "wandb_group": group,
+        "expected_run_count": expected_run_count,
+        "slurm_array_id": array_id,
+        "slurm_submitted_at": utc_iso(),
+    }
+
+
+def process_pending_instructions(dry_run: bool) -> int:
+    pending_dir = REPO_DIR / "instructions" / "pending"
+    claimed_dir = REPO_DIR / "instructions" / "claimed"
+    failed_dir = REPO_DIR / "instructions" / "failed"
+    if not pending_dir.exists():
+        return 0
+
+    files = sorted(p for p in pending_dir.iterdir() if p.suffix == ".yaml")
+    n_processed = 0
+    for f in files:
+        try:
+            data = _read_yaml(f)
+        except Exception as e:
+            log(f"[{f.name}] FAILED to parse YAML: {e}")
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            target = failed_dir / f.name
+            shutil.move(str(f), str(target))
+            try:
+                target.write_text(target.read_text() + f"\nerror: parse: {e}\n")
+            except Exception:
+                pass
+            continue
+
+        exp = data.get("experiment")
+        if not exp:
+            log(f"[{f.name}] missing 'experiment' key; failing")
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(failed_dir / f.name))
+            continue
+
+        overrides = data.get("overrides") or []
+        if not isinstance(overrides, list):
+            overrides = [str(overrides)]
+        log(f"[{f.name}] submitting experiment={exp} overrides={overrides}")
+
+        try:
+            meta = _submit_one(exp, [str(o) for o in overrides])
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or e.stdout or "")[-2000:]
+            log(f"[{f.name}] FAILED: {err.strip()[:500]}")
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            target = failed_dir / f.name
+            shutil.move(str(f), str(target))
+            with target.open("a") as fh:
+                fh.write(f"\nerror: |\n  {err}\n")
+            continue
+        except Exception as e:
+            log(f"[{f.name}] FAILED: {e}")
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            target = failed_dir / f.name
+            shutil.move(str(f), str(target))
+            with target.open("a") as fh:
+                fh.write(f"\nerror: {e}\n")
+            continue
+
+        # Annotate + move to claimed
+        data.update(meta)
+        claimed_dir.mkdir(parents=True, exist_ok=True)
+        target = claimed_dir / f.name
+        _write_yaml(target, data)
+        f.unlink()
+        log(
+            f"[{f.name}] submitted: group={meta['wandb_group']} "
+            f"array={meta['slurm_array_id']} runs={meta['expected_run_count']}"
+        )
+        n_processed += 1
+    return n_processed
+
+
+# ---------------------------------------------------------------------------
+# (4) Run monitor cycle
+# ---------------------------------------------------------------------------
+def run_monitor_cycle() -> None:
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "JacobianODE.jacobians.tuning.monitor",
+    ]
+    env = os.environ.copy()
+    env["SWEEPS_DIR"] = str(SWEEPS_DIR)
+    try:
+        run(cmd, cwd=JACODE_REPO, check=True, env=env)
+    except subprocess.CalledProcessError as e:
+        log(f"monitor cycle FAILED: {(e.stderr or '').strip()[:500]}")
+
+
+# ---------------------------------------------------------------------------
+# (5) Dispatch analysis sbatches for new sentinels
+# ---------------------------------------------------------------------------
+def _list_done_sentinels() -> list[Path]:
+    done_dir = SWEEPS_DIR / "done"
+    if not done_dir.exists():
+        return []
+    return sorted(p for p in done_dir.iterdir() if p.name.endswith(".done.json"))
+
+
+def dispatch_pending_analyses(inflight: dict) -> int:
+    log_dir = SWEEPS_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    n_new = 0
+    for sentinel in _list_done_sentinels():
+        group = sentinel.name[: -len(".done.json")]
+        if group in inflight:
+            continue
+        job_name = f"analyze_{group}"
+        wrap = (
+            f"cd {JACODE_REPO} && OPENBLAS_NUM_THREADS=4 {UV} run --no-sync "
+            f"python -m JacobianODE.jacobians.tuning.analyze_sweep {group}"
+        )
+        sbatch_cmd = [
+            "sbatch", "--parsable",
+            f"--partition={ANALYZE_PARTITION}",
+            f"--gpus-per-node={ANALYZE_GPUS}",
+            f"--cpus-per-task={ANALYZE_CPUS}",
+            f"--mem={ANALYZE_MEM_GB}GB",
+            f"--time={ANALYZE_TIMEOUT_MIN}",
+            f"--job-name={job_name}",
+            f"--output={log_dir}/{job_name}_%j.out",
+            f"--error={log_dir}/{job_name}_%j.err",
+            f"--wrap={wrap}",
+        ]
+        try:
+            out = run(sbatch_cmd, check=True).stdout.strip()
+        except subprocess.CalledProcessError as e:
+            log(f"[analysis-sbatch {group}] FAILED: {(e.stderr or '').strip()[:300]}")
+            continue
+        job_id = out.strip().split(";")[0]
+        inflight[group] = {
+            "slurm_job_id": job_id,
+            "dispatched_at": utc_iso(),
+            "sentinel_path": str(sentinel),
+        }
+        log(f"[analysis-sbatch {group}] submitted as {job_id}")
+        n_new += 1
+    return n_new
+
+
+# ---------------------------------------------------------------------------
+# (6) Reap completed analyses
+# ---------------------------------------------------------------------------
+def _slurm_job_alive(job_id: str) -> bool:
+    out = run(["squeue", "-j", job_id, "-h", "-o", "%T"], check=False).stdout.strip()
+    return bool(out)
+
+
+def _render_report(analysis_dir: Path) -> None:
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "JacobianODE.jacobians.tuning.render_report",
+        str(analysis_dir),
+    ]
+    run(cmd, cwd=JACODE_REPO, check=True)
+
+
+def _publish_analysis(group: str) -> Path | None:
+    """Render report + copy analysis dir into the repo at <project>/<group>/.
+
+    Returns the in-repo path, or None on failure.
+    """
+    analysis_dir = SWEEPS_DIR / "analysis" / group
+    if not (analysis_dir / "metrics.json").exists():
+        return None
+    _render_report(analysis_dir)
+    ctx = json.loads((analysis_dir / "context.json").read_text())
+    project = ctx["wandb"].get("project")
+    if not project:
+        log(f"[publish {group}] context.json has no wandb.project")
+        return None
+    target = REPO_DIR / project / group
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    # Copy everything (figures/, *.json, *.md, *.html, *.log)
+    shutil.copytree(analysis_dir, target)
+    return target
+
+
+def reap_completed_analyses(inflight: dict) -> int:
+    n_reaped = 0
+    for group in list(inflight.keys()):
+        info = inflight[group]
+        job_id = info["slurm_job_id"]
+        if _slurm_job_alive(job_id):
+            continue
+        # Job no longer in queue. Try to publish.
+        try:
+            published = _publish_analysis(group)
+        except subprocess.CalledProcessError as e:
+            log(f"[reap {group}] render_report FAILED: {(e.stderr or '').strip()[:300]}")
+            published = None
+        sentinel = Path(info["sentinel_path"])
+        target_dir = "processed" if published else "failed"
+        dest = SWEEPS_DIR / target_dir
+        dest.mkdir(parents=True, exist_ok=True)
+        if sentinel.exists():
+            shutil.move(str(sentinel), str(dest / sentinel.name))
+        if published:
+            log(f"[reap {group}] OK -> {published.relative_to(REPO_DIR)}")
+        else:
+            log(f"[reap {group}] FAILED (no metrics.json or render error)")
+        del inflight[group]
+        n_reaped += 1
+    return n_reaped
+
+
+# ---------------------------------------------------------------------------
+# (7) Status overview
+# ---------------------------------------------------------------------------
+def _scan_sweep_state(sweep_subdir: str) -> list[str]:
+    d = SWEEPS_DIR / sweep_subdir
+    if not d.exists():
+        return []
+    if sweep_subdir == "active":
+        return sorted({p.name[: -len(".expected.json")]
+                       for p in d.iterdir() if p.name.endswith(".expected.json")})
+    return sorted({p.name[: -len(".done.json")]
+                   for p in d.iterdir() if p.name.endswith(".done.json")})
+
+
+def _maybe_load_state_summary(group: str) -> dict | None:
+    p = SWEEPS_DIR / "active" / f"{group}.state.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text()).get("summary")
+    except Exception:
+        return None
+
+
+def update_status_overview(inflight: dict) -> bool:
+    """Returns True if status/overview.json changed."""
+    overview = {
+        "schema_version": 1,
+        "last_updated": utc_iso(),
+        "sweeps": {},
+    }
+    seen = set()
+    for status, sub in [("active", "active"), ("done", "done"),
+                         ("processed", "processed"), ("failed", "failed")]:
+        for group in _scan_sweep_state(sub):
+            if group in seen:
+                continue
+            seen.add(group)
+            entry = {"status": status}
+            summary = _maybe_load_state_summary(group)
+            if summary is not None:
+                entry["runs_summary"] = summary
+            if group in inflight:
+                entry["analysis"] = {
+                    "slurm_job_id": inflight[group]["slurm_job_id"],
+                    "dispatched_at": inflight[group]["dispatched_at"],
+                    "status": "running",
+                }
+            overview["sweeps"][group] = entry
+
+    # Write only if changed (compare ignoring last_updated)
+    target = REPO_DIR / "status" / "overview.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        try:
+            current = json.loads(target.read_text())
+            current_cmp = {**current, "last_updated": None}
+            new_cmp = {**overview, "last_updated": None}
+            if current_cmp == new_cmp:
+                return False
+        except Exception:
+            pass
+    target.write_text(json.dumps(overview, indent=2) + "\n")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="run all steps but skip git push")
+    args = ap.parse_args()
+
+    lock = acquire_lock()
+    log(f"controller cycle start  (host={HOSTNAME}  dry_run={args.dry_run})")
+
+    try:
+        try:
+            git_pull_rebase()
+        except subprocess.CalledProcessError as e:
+            log(f"git pull failed: {(e.stderr or '').strip()[:300]} — aborting cycle")
+            return 1
+
+        # Pull JacobianODE so monitor/analyze_sweep/prepare_sweep are current.
+        # Critical: this controller script also lives in the repo (since the
+        # in-repo move), so updating it requires the next cron tick to pull.
+        git_pull_jacode()
+
+        n_new = process_pending_instructions(args.dry_run)
+        if n_new:
+            log(f"processed {n_new} instruction(s)")
+        run_monitor_cycle()
+
+        inflight = load_inflight()
+        n_disp = dispatch_pending_analyses(inflight)
+        n_reaped = reap_completed_analyses(inflight)
+        save_inflight(inflight)
+        if n_disp or n_reaped:
+            log(f"analyses: dispatched={n_disp}  reaped={n_reaped}  "
+                f"in_flight_total={len(inflight)}")
+
+        changed = update_status_overview(inflight)
+        if changed:
+            log("status/overview.json updated")
+
+        try:
+            git_commit_and_push(f"controller cycle {utc_iso()}", args.dry_run)
+        except subprocess.CalledProcessError as e:
+            log(f"git push failed: {(e.stderr or '').strip()[:300]}")
+            return 2
+    finally:
+        log("controller cycle end")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
