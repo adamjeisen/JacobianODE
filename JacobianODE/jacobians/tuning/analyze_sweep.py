@@ -505,17 +505,25 @@ def compute_per_run_lyapunov(
                     "No cached test trajectories — first run must have generate_data=True"
                 )
 
-            # Compute Jacobians along the test trajectories (chunked).
+            # Compute Jacobians along the test trajectories (chunked). Vanilla
+            # JacobianODE (LitMLP) has no encoder — operate directly on the
+            # observation-space trajectory. Latent models route through the
+            # encoder + dyn-subspace split first.
+            is_vanilla = not hasattr(lit_model, "encode_trajectory")
             lambdas = []
             with torch.no_grad():
                 for start in range(0, test_trajs_cached.shape[0], chunk_size):
                     chunk = test_trajs_cached[start : start + chunk_size]
-                    z_full = lit_model.encode_trajectory(chunk)
-                    mu_dyn, _ = lit_model._split_latent(z_full)
-                    jacs = lit_model.compute_jacobians(mu_dyn)  # (B, T, D, D)
+                    if is_vanilla:
+                        jacs = lit_model.compute_jacobians(chunk)  # (B, T, D, D)
+                    else:
+                        z_full = lit_model.encode_trajectory(chunk)
+                        mu_dyn, _ = lit_model._split_latent(z_full)
+                        jacs = lit_model.compute_jacobians(mu_dyn)  # (B, T, D, D)
+                        del z_full, mu_dyn
                     lams = LitLatentJacobianODE.compute_lyapunov_exponents(jacs, dt)
                     lambdas.append(lams.detach().cpu())
-                    del z_full, mu_dyn, jacs
+                    del jacs
             lambda_per_traj = torch.cat(lambdas, dim=0).numpy()  # (B, D)
             lambda_mean = lambda_per_traj.mean(axis=0)            # (D,)
             lambda_max = float(lambda_mean.max())
