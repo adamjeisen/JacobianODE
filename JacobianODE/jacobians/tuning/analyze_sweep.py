@@ -458,20 +458,27 @@ def compute_per_run_lyapunov(
             if i == 0:
                 dt_cached = dt
                 if trajs is not None and "test_trajs" in trajs:
-                    test_seq = trajs["test_trajs"].sequence
-                    test_trajs_cached = test_seq[:n_sample_trajectories].to(device)
+                    # Prefer train_trajs for both the model Jacobians and the
+                    # empirical Jacobians — it's the longest contiguous slice
+                    # available (80% of the timeline vs 5% for test), which
+                    # matters because Lyapunov exponents need many Lyapunov
+                    # times to converge. Using the same train slice for both
+                    # also keeps the comparison apples-to-apples (same time
+                    # range, same trajectories).
+                    if "train_trajs" in trajs:
+                        model_seq = trajs["train_trajs"].sequence
+                    else:
+                        model_seq = trajs["test_trajs"].sequence
+                    test_trajs_cached = model_seq[:n_sample_trajectories].to(device)
 
                     # Compute empirical spectrum ONCE (same data/eq across runs).
                     mu_val = cfg.data.postprocessing.get("mu", 0.0)
                     sigma_val = cfg.data.postprocessing.get("sigma", 1.0)
-                    # Use the full raw `values` trajectory (all 32 ICs × full
-                    # n_periods × pts_per_period timesteps), not just the 5%
-                    # test slice. Lyapunov exponents need many Lyapunov times
-                    # to converge, and the short test slice gives a noisy
-                    # estimate that varies noticeably sweep-to-sweep.
-                    # Fall back to test_trajs_full only if `values` is None
-                    # (shouldn't happen when generate_data=True).
-                    if values is not None:
+                    # Empirical needs the raw full-dim state (for eq.jac).
+                    # train_trajs_full matches train_trajs's time range.
+                    if "train_trajs_full" in trajs:
+                        traj_for_emp = trajs["train_trajs_full"].sequence
+                    elif values is not None:
                         traj_for_emp = values
                     else:
                         traj_for_emp = (
