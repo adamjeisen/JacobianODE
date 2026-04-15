@@ -67,40 +67,50 @@ to avoid the re-resolve. Never bypass uv by calling a bare `python` / `pip`.
 To submit JacobianODE training jobs on the Engaging cluster, use:
 
 ```
-engaging-submit experiment=wmtask_identity_encoder_verification
+j-submit lorenz_full_additive_mse_p30
+j-submit lorenz_full_additive_mse_p30 hydra.launcher.partition=ou_bcs_normal
 ```
 
-This script (located at `~/bin/engaging-submit`):
-1. Commits and pushes any local changes on the current branch
-2. Pulls latest on engaging from the repo at `/home/eisenaj/code/JacobianODE`
-3. Runs `jsweep` (Hydra multirun + submitit) via SSH
-4. Polls `squeue` until the SLURM job appears
-5. Kills the hanging Hydra process and exits cleanly
+`j-submit` (`~/bin/j-submit`) writes a YAML "instruction" file under
+`~/Documents/jacobian-analyses/instructions/pending/` and pushes it to the
+`jacobian-reports` GitHub repo. The engaging-side cron `engaging-controller`
+picks it up within ~5 minutes and runs `jsweep` locally on engaging — no SSH
+between endeavour and engaging is involved in routine operation.
 
-Pass any Hydra overrides as arguments. To check job status: `ssh engaging 'squeue -u eisenaj'`
+### Sweep automation pipeline (git-based, 3 stages)
 
-**Important**: The SSH hook exemption in `.claude/hooks/uv-cu118-guard.sh` allows
-`ssh` commands containing `uv run` — this is intentional since the guard is for the
-local Pascal GPU machine only.
+1. **`j-submit`** (endeavour → github): writes
+   `instructions/pending/<ts>-<exp>.yaml` to the local `jacobian-analyses`
+   clone of the `jacobian-reports` repo, commits, pushes. Format documented
+   in `~/Documents/jacobian-analyses/instructions/README.md`.
+2. **`engaging-controller`** (cron on engaging, every 5 min): pulls
+   `jacobian-reports` AND `JacobianODE` (so code changes auto-deploy);
+   processes each pending instruction (validates via `prepare_sweep`, runs
+   `jsweep` locally, captures SLURM array id, moves the file to
+   `instructions/claimed/` annotated with the array id); runs a monitor
+   cycle (`JacobianODE.jacobians.tuning.monitor`); dispatches analysis
+   sbatches for any new sentinels in `/orcd/.../sweeps/done/`; reaps
+   completed analyses by rendering the report and copying the analysis dir
+   into the repo at `<wandb_project>/<wandb_group>/`; updates
+   `status/overview.json`; pushes everything in one commit. The controller
+   script lives at `JacobianODE/bin/engaging-controller` so updates ride
+   along with normal `git pull`.
+3. **`jacobian-discuss`** (systemd user timer on endeavour, every 15 min):
+   pulls `jacobian-reports`; for each report missing a fresh `discussion.md`,
+   invokes `claude --print` to generate one against the local analysis dir;
+   re-renders `report.md` / `report.html` to embed the discussion; commits
+   and pushes back. This is GitHub-only, no SSH to engaging required.
 
-### Sweep automation pipeline (4 stages)
+To check status: `cd ~/Documents/jacobian-analyses && git pull && cat
+status/overview.json`. New reports show up under `<project>/<group>/`.
 
-1. **`engaging-submit`** (local → engaging): validates experiment YAML has a
-   `metadata:` block, resolves the sweep grid (from `sweep_grid:` YAML field
-   and/or CLI), writes `expected.json` to
-   `/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps/active/<group>.expected.json`,
-   then submits via `jsweep`.
-2. **Monitor cron on engaging** (`JacobianODE/jacobians/tuning/monitor.py`):
-   polls wandb + SLURM, writes `<group>.state.json`, emits `<group>.done.json`
-   sentinel into `sweeps/done/` when all runs terminal (and min elapsed time
-   passed). Checks `failed/` to prevent ping-pong with auto-analyze.
-3. **`engaging-analyze <group>`** (local, manual or via auto-analyze): SSHes
-   to engaging, submits an sbatch GPU job running
-   `JacobianODE.jacobians.tuning.analyze_sweep`, rsyncs results to
-   `~/Documents/jacobian-analyses/<group>/`, renders report.
-4. **`engaging-auto-analyze`** (systemd user timer on endeavour): every 15 min
-   checks `sweeps/done/` for new sentinels, runs `engaging-analyze`, moves
-   sentinel to `processed/` on success or `failed/` on failure.
+The previous SSH-based system (`engaging-submit`, `engaging-analyze`,
+`engaging-auto-analyze`, `engaging-submit-many` + `engaging-auto-analyze`
+systemd timer) is archived to `~/bin/_old/` and disabled. Engaging SSH
+master (`engaging-ssh-master.service`) remains installed but disabled by
+default — start manually only when interactive debugging on engaging is
+needed (then it'll multiplex subsequent `ssh engaging` calls without
+re-Duo'ing).
 
 ### Required experiment YAML fields
 
