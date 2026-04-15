@@ -85,15 +85,23 @@ print(f"trajectories: {values.shape} (n_trajs, T, D)   dt = {dt}")
 VISUAL = slice(0, 64)
 COGNITIVE = slice(64, 128)
 
-N_BATCH = 4          # number of trajectories to analyse (start small)
-WINDOW_SIZE = 20     # timesteps per Gramian window
-STRIDE = 10          # stride between windows
+N_BATCH = 128        # number of trajectories to analyse
+WINDOW_SIZE = None   # None -> use the full trajectory length as one window
+STRIDE = None        # ignored when WINDOW_SIZE is full length
+
+n_available = values.shape[0]
+if N_BATCH > n_available:
+    print(f"Requested N_BATCH={N_BATCH} > available {n_available}, capping.")
+    N_BATCH = n_available
 
 traj_batch = values[:N_BATCH]
 T_total = traj_batch.shape[1]
+if WINDOW_SIZE is None:
+    WINDOW_SIZE = T_total
+    STRIDE = T_total  # only one window per trajectory
 n_windows = (T_total - WINDOW_SIZE) // STRIDE + 1
 print(
-    f"Using {N_BATCH} trajs × {n_windows} windows "
+    f"Using {N_BATCH} trajs × {n_windows} window(s) "
     f"(size {WINDOW_SIZE}, stride {STRIDE}) over T={T_total}. "
     f"Total batched windows: {N_BATCH * n_windows}"
 )

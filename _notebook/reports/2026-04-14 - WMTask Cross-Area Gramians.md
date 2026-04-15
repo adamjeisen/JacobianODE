@@ -4,10 +4,10 @@ Ground-truth Jacobians (via `eq.jac`) of the trained `init_mode_random` biologic
 
 ## Configuration
 
-- Trajectories analysed: **4**
+- Trajectories analysed: **128**
 - Trajectory length T: **49**
-- Window size / stride: **20 / 10**
-- Windows per trajectory: **3** (total batch = 12)
+- Window size / stride: **49 / 49**
+- Windows per trajectory: **1** (total batch = 128)
 - dt: **0.02**
 - Rescaled square-root QR: **True**
 
@@ -19,12 +19,12 @@ Ground-truth Jacobians (via `eq.jac`) of the trained `init_mode_random` biologic
 
 | pair | gramian | log_trace_final ± std | log_min_final ± std |
 |------|---------|-----------------------|---------------------|
-| visual→cognitive | reach | +4.541 ± 0.289 | -6.835 ± 0.186 |
-| visual→cognitive | ctrl | +2.741 ± 0.065 | -13.699 ± 0.281 |
-| visual→cognitive | obs | +0.262 ± 0.113 | -19.419 ± 1.473 |
-| cognitive→visual | reach | +2.150 ± 0.144 | -7.946 ± 0.257 |
-| cognitive→visual | ctrl | +0.262 ± 0.113 | -19.419 ± 1.473 |
-| cognitive→visual | obs | +2.741 ± 0.065 | -13.699 ± 0.281 |
+| visual→cognitive | reach | +4.893 ± 0.385 | -6.624 ± 0.172 |
+| visual→cognitive | ctrl | +2.787 ± 0.051 | -13.473 ± 0.200 |
+| visual→cognitive | obs | +0.321 ± 0.138 | -18.894 ± 1.338 |
+| cognitive→visual | reach | +2.678 ± 0.178 | -7.771 ± 0.384 |
+| cognitive→visual | ctrl | +0.321 ± 0.138 | -18.894 ± 1.338 |
+| cognitive→visual | obs | +2.787 ± 0.051 | -13.473 ± 0.200 |
 
 ## Reading the figure
 
