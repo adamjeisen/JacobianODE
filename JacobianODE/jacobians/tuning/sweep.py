@@ -373,8 +373,23 @@ def select_from_wandb_runs(
 
 
 def _is_jac_ode_run(run) -> bool:
-    """Return True if this W&B run has an encoder (i.e. is a JacobianODE run)."""
-    return "model" in run.config and "encoder" in run.config.get("model", {})
+    """Return True if this W&B run is a JacobianODE-family training run.
+
+    Accepts both latent models (have ``model.encoder``) and vanilla
+    JacobianODE (``LitMLP``, no encoder). Identified via the
+    ``training.lightning._target_`` fully-qualified class name to keep
+    future additions auto-compatible.
+    """
+    if "model" in run.config and "encoder" in run.config.get("model", {}):
+        return True
+    try:
+        target = run.config.get("training", {}).get("lightning", {}).get("_target_", "")
+    except AttributeError:
+        target = ""
+    return any(
+        cls in str(target)
+        for cls in ("LitMLP", "LitLatentJacobianODE", "LitEncoderDecoder")
+    )
 
 
 def _get_loop_closure_weight(run) -> Optional[float]:
