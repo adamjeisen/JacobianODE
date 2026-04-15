@@ -464,13 +464,21 @@ def compute_per_run_lyapunov(
                     # Compute empirical spectrum ONCE (same data/eq across runs).
                     mu_val = cfg.data.postprocessing.get("mu", 0.0)
                     sigma_val = cfg.data.postprocessing.get("sigma", 1.0)
-                    # Use FULL test set (not subsampled) for empirical since
-                    # ground-truth Jacobians are cheap.
-                    traj_for_emp = (
-                        trajs["test_trajs_full"].sequence
-                        if "test_trajs_full" in trajs
-                        else trajs["test_trajs"].sequence
-                    )
+                    # Use the full raw `values` trajectory (all 32 ICs × full
+                    # n_periods × pts_per_period timesteps), not just the 5%
+                    # test slice. Lyapunov exponents need many Lyapunov times
+                    # to converge, and the short test slice gives a noisy
+                    # estimate that varies noticeably sweep-to-sweep.
+                    # Fall back to test_trajs_full only if `values` is None
+                    # (shouldn't happen when generate_data=True).
+                    if values is not None:
+                        traj_for_emp = values
+                    else:
+                        traj_for_emp = (
+                            trajs["test_trajs_full"].sequence
+                            if "test_trajs_full" in trajs
+                            else trajs["test_trajs"].sequence
+                        )
                     logger.info("Computing empirical ground-truth Lyapunov spectrum...")
                     empirical_mean, empirical_per_traj = _compute_empirical_lyapunov(
                         eq, traj_for_emp, dt, mu_val, sigma_val, device,
@@ -725,11 +733,11 @@ def compute_per_run_lyapunov(
 
         # Figure 2b: per-run relative error per Lyapunov exponent
         # For each run, show signed relative error of predicted vs true spectrum,
-        # as a bar chart indexed by exponent. The denominator is floored at a
-        # small fraction of the max empirical |λ| so near-zero exponents
-        # (Lorenz's λ₂ ≈ 0) don't blow up to infinity — caveat: those bars
-        # represent roughly "error in units of 0.1% of the largest |λ|", still
-        # informative. Y-axis clipped to ±500% for readability.
+        # as a bar chart indexed by exponent. Raw |λ_true| denominator — no
+        # epsilon floor. For empirically-near-zero exponents (e.g. Lorenz's
+        # λ₂ ≈ 0) a small absolute error becomes a huge relative error, which
+        # is the faithful representation: the prediction is genuinely off by
+        # a large fraction of the true (tiny) value.
         try:
             n = len(success)
             ncol = 4
@@ -738,20 +746,26 @@ def compute_per_run_lyapunov(
                 nrow, ncol, figsize=(5.0 * ncol, 3.6 * nrow), squeeze=False
             )
             L = len(true_arr)
-            denom_eps = max(1e-6, 1e-3 * float(np.max(np.abs(true_arr))))
-            denom = np.maximum(np.abs(true_arr), denom_eps)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                denom = np.abs(true_arr)
             x_idx = np.arange(L)
-            y_clip = 500.0
+            y_clip = 2000.0
             for i, (rid, d) in enumerate(success):
                 row, col = i // ncol, i % ncol
                 a = axes[row][col]
                 pred = np.array(d["lambda_spectrum"])[:L]
-                rel_err = 100.0 * (pred - true_arr) / denom
-                colors = ["C0" if e <= 0 else "C3" for e in rel_err]
-                a.bar(x_idx, np.clip(rel_err, -y_clip, y_clip), color=colors, alpha=0.85)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    rel_err = 100.0 * (pred - true_arr) / denom
+                # Replace +/-inf (true==0) with a sentinel value so bars render.
+                rel_err_finite = np.where(np.isfinite(rel_err), rel_err, np.nan)
+                colors = ["C0" if (np.isnan(e) or e <= 0) else "C3" for e in rel_err_finite]
+                clipped = np.clip(rel_err_finite, -y_clip, y_clip)
+                a.bar(x_idx, np.nan_to_num(clipped, nan=0.0), color=colors, alpha=0.85)
                 a.axhline(0, color="gray", lw=0.7)
-                # Annotate exact value above/below each bar (including clipped ones)
                 for xi, v in zip(x_idx, rel_err):
+                    if not np.isfinite(v):
+                        a.text(xi, 0, "N/A", ha="center", va="center", fontsize=9, color="gray")
+                        continue
                     a.text(
                         xi,
                         np.clip(v, -y_clip * 0.95, y_clip * 0.95),
