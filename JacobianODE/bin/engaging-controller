@@ -48,7 +48,9 @@ HOSTNAME = socket.gethostname()
 SUBMIT_POLL_SEC = 2
 SUBMIT_POLL_MAX = 90  # seconds total to wait for jsweep's SLURM jobs to appear
 ANALYZE_PARTITION = "ou_bcs_high"  # for analysis sbatch
-ANALYZE_TIMEOUT_MIN = 60
+# Vanilla LitMLP analysis on WMTask is ~100 min (40M params, ~7 s/batch x 100
+# batches x 9 runs). Latent runs are much faster but the same timeout is fine.
+ANALYZE_TIMEOUT_MIN = 240
 ANALYZE_GPUS = 1
 ANALYZE_CPUS = 4
 ANALYZE_MEM_GB = 16
@@ -424,6 +426,29 @@ def _slurm_job_alive(job_id: str) -> bool:
     return bool(out)
 
 
+def _slurm_job_succeeded(job_id: str) -> bool:
+    """Return True iff the SLURM job's terminal state is COMPLETED.
+
+    Uses sacct (state-tracking, persists past job exit). Anything else
+    (FAILED / CANCELLED / TIMEOUT / OUT_OF_MEMORY / ...) means the analysis
+    didn't finish cleanly and we should NOT treat it as a successful reap.
+    """
+    out = run(
+        ["sacct", "-j", f"{job_id}.batch", "-n", "--format=State", "-P"],
+        check=False,
+    ).stdout.strip()
+    if not out:
+        # Fall back to the parent job step
+        out = run(
+            ["sacct", "-j", job_id, "-n", "--format=State", "-P"],
+            check=False,
+        ).stdout.strip()
+    # State strings sometimes have trailing reason markers ("CANCELLED+", "CANCELLED by 0").
+    # Just check the leading word.
+    state_word = out.split()[0].rstrip("+") if out else ""
+    return state_word == "COMPLETED"
+
+
 def _render_report(analysis_dir: Path) -> None:
     cmd = [
         UV, "run", "--no-sync", "python", "-m",
@@ -463,7 +488,26 @@ def reap_completed_analyses(inflight: dict) -> int:
         job_id = info["slurm_job_id"]
         if _slurm_job_alive(job_id):
             continue
-        # Job no longer in queue. Try to publish.
+
+        # Job no longer in queue. Verify it actually succeeded — if it was
+        # CANCELLED / TIMEOUT / FAILED we MUST NOT publish because metrics.json
+        # may be stale from a prior run and would silently overwrite a good
+        # report with stale content.
+        succeeded = _slurm_job_succeeded(job_id)
+        if not succeeded:
+            log(
+                f"[reap {group}] sbatch {job_id} did not COMPLETE — "
+                f"moving sentinel to failed/, not publishing"
+            )
+            sentinel = Path(info["sentinel_path"])
+            dest = SWEEPS_DIR / "failed"
+            dest.mkdir(parents=True, exist_ok=True)
+            if sentinel.exists():
+                shutil.move(str(sentinel), str(dest / sentinel.name))
+            del inflight[group]
+            n_reaped += 1
+            continue
+
         try:
             published = _publish_analysis(group)
         except subprocess.CalledProcessError as e:
@@ -478,7 +522,7 @@ def reap_completed_analyses(inflight: dict) -> int:
         if published:
             log(f"[reap {group}] OK -> {published.relative_to(REPO_DIR)}")
         else:
-            log(f"[reap {group}] FAILED (no metrics.json or render error)")
+            log(f"[reap {group}] FAILED (publish error)")
         del inflight[group]
         n_reaped += 1
     return n_reaped
