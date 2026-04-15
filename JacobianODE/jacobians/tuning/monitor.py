@@ -172,16 +172,34 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
 
     Ambiguous matches (more than one) return None — we'd rather skip than
     mislabel. Most override sets are uniquely identifying so this is rare.
+
+    Overrides on keys that hydra-consumes-and-strips before config reaches
+    the training loop (``hydra.*``, ``experiment=...``) are ignored — those
+    don't appear in the wandb run config and would cause spurious
+    non-matches for every run.
     """
+    def _is_matchable(ov: str) -> bool:
+        if "=" not in ov:
+            return False
+        key = ov.split("=", 1)[0]
+        if key.startswith("hydra."):
+            return False
+        if key == "experiment":
+            return False
+        return True
+
     matches: list[int] = []
     for r in resolved_runs:
+        filtered_overrides = [ov for ov in r["overrides"] if _is_matchable(ov)]
+        if not filtered_overrides:
+            # All overrides were launcher/experiment — can't disambiguate.
+            continue
         if all(
             _values_match(
                 _coerce(ov.split("=", 1)[1]),
                 _get_nested(wandb_config, ov.split("=", 1)[0]),
             )
-            for ov in r["overrides"]
-            if "=" in ov
+            for ov in filtered_overrides
         ):
             matches.append(r["run_idx"])
     return matches[0] if len(matches) == 1 else None
