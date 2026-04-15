@@ -657,20 +657,29 @@ class LitLatentJacobianODE(LitBase):
 
         return tangent_space_entropy(dz_sample, J_all, mode=self.tangent_entropy_mode)
 
-    def _weighted_obs_loss(self, targets, predictions):
+    def _weighted_obs_loss(self, targets, predictions, mode=None):
         """Observation-space loss with ``reconstruction_mode`` weighting.
 
         Applied to both reconstruction and trajectory prediction losses.
         Uses ``self.criterion`` (configured via ``loss_func``) as the
         underlying loss function, so the scale is consistent with other
         loss terms (e.g. loop closure).
+
+        Parameters
+        ----------
+        mode : Optional[str]
+            Override for ``self.reconstruction_mode``. Primary use case:
+            validation passes ``mode='most_recent'`` so the monitored val
+            loss reflects forward-rollout fidelity on the live frame,
+            independent of what training uses for its gradient.
         """
-        if self.reconstruction_mode == 'harmonic':
+        effective = mode if mode is not None else self.reconstruction_mode
+        if effective == 'harmonic':
             # sq_err = F.mse_loss(predictions, targets, reduction='none')
             # TODO: fix this because normalized_mse doesn't support reduction='none'
             sq_err = self.criterion(targets, predictions)
             return (sq_err * self.recon_weights).mean()
-        elif self.reconstruction_mode == 'most_recent':
+        elif effective == 'most_recent':
             d = self._n_recent_dims
             if d is not None:
                 return self.criterion(targets[..., :d], predictions[..., :d])
@@ -839,6 +848,7 @@ class LitLatentJacobianODE(LitBase):
         verbose=False,
         return_decoded=False,
         strided=True,
+        reconstruction_mode=None,
     ):
         """Trajectory prediction step in latent space.
 
@@ -991,13 +1001,25 @@ class LitLatentJacobianODE(LitBase):
             )  # same shape as decoded_pred
 
         with self._timed("traj/6.loss_and_metrics"):
-            # Observation-space loss with reconstruction_mode weighting
-            loss = self._weighted_obs_loss(obs_targets, decoded_pred)
+            # Observation-space loss with reconstruction_mode weighting.
+            # When ``reconstruction_mode`` kwarg is given (e.g. by
+            # validation_step as 'most_recent'), it overrides
+            # self.reconstruction_mode for THIS call only — so training can
+            # use a wider-window mode (e.g. 'uniform') while validation's
+            # monitored loss reflects forward-rollout fidelity on the live
+            # frame.
+            effective_mode = (
+                reconstruction_mode if reconstruction_mode is not None
+                else self.reconstruction_mode
+            )
+            loss = self._weighted_obs_loss(
+                obs_targets, decoded_pred, mode=effective_mode,
+            )
 
             # Metrics — when most_recent mode, evaluate on index 0 only so
             # that the unsupervised chaotic tail doesn't corrupt diagnostics.
             metric_vals = {}
-            if self.reconstruction_mode == 'most_recent':
+            if effective_mode == 'most_recent':
                 d = self._n_recent_dims
                 if d is not None:
                     obs_for_metrics = obs_targets[..., :d]
@@ -1637,10 +1659,18 @@ class LitLatentJacobianODE(LitBase):
         """
         batch = batch.type(self.dtype)
 
+        # Validation always monitors the 'most_recent' (live-frame) variant
+        # of the trajectory loss — this is the quantity that actually
+        # tracks forward-rollout fidelity and is what's used by
+        # EarlyStopping / ModelCheckpoint. Training can still use a wider
+        # reconstruction_mode (e.g. 'uniform') to get a richer gradient
+        # from all delay-embedded components; that choice doesn't affect
+        # which checkpoint gets selected.
         model_step_kwargs = {
             'alpha_teacher_forcing': self.alpha_validation,
             'obs_noise_scale': 0,
             'latent_noise_scale': 0,
+            'reconstruction_mode': 'most_recent',
         }
 
         val_rets = {}
