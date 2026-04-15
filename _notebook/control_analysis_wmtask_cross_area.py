@@ -379,3 +379,213 @@ lines.append(
 
 report_path.write_text("\n".join(lines) + "\n")
 print(f"Wrote report → {report_path}")
+
+# %% [markdown]
+# ---
+#
+# # Predicted Gramians from a trained vanilla JacobianODE
+#
+# Loads a specific trained vanilla JacobianODE run (no latent encoder —
+# predicts J directly from observation space), evaluates its predicted
+# Jacobians on the **same** trajectories used above, and overlays the
+# resulting Gramian spectra on the empirical curves via `twinx` so we can
+# judge *relative* shape and slope without worrying about different
+# absolute scales.
+#
+# Run identifier:
+# - project: `WMTask_identity_encoder_verification`
+# - group:   `vanilla__lc1e-4_obs0.0`
+# - run_id:  `632q2xus`
+
+# %%
+from JacobianODE.jacobians.checkpoints.loader import load_run, load_checkpoint
+
+PRED_PROJECT = "WMTask_identity_encoder_verification"
+PRED_RUN_ID = "632q2xus"
+PRED_SAVE_DIR = "/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs"
+
+(pred_run_obj, pred_cfg, _pred_eq, _pred_dt, _pred_values, _, _, _,
+ _pred_trajs, pred_lit_model) = load_run(
+    f"JacobianODE/{PRED_PROJECT}",
+    run_id=PRED_RUN_ID,
+    save_dir=PRED_SAVE_DIR,
+    generate_data=False,  # reuse the values/trajs already loaded above
+    verbose=False,
+)
+load_checkpoint(
+    pred_run_obj, pred_cfg, pred_lit_model,
+    save_dir=PRED_SAVE_DIR, verbose=False,
+)
+pred_lit_model = pred_lit_model.to(device).eval()
+print(f"Loaded {type(pred_lit_model).__name__} from run {PRED_RUN_ID}")
+
+# %%
+with torch.no_grad():
+    pred_J_full = pred_lit_model.compute_jacobians(traj_batch)  # (N, T, 128, 128)
+print(f"pred_J_full shape: {tuple(pred_J_full.shape)}")
+assert pred_J_full.shape == J_full.shape, (
+    f"predicted J shape {tuple(pred_J_full.shape)} != empirical {tuple(J_full.shape)}"
+)
+
+# %%
+pred_J_windows = _roll_windows(pred_J_full, WINDOW_SIZE, STRIDE)
+
+print("PRED  VISUAL → COGNITIVE")
+p_vc_spec_r, p_vc_spec_c, p_vc_spec_o = run_area_gramians(
+    pred_J_windows, target=COGNITIVE, source=VISUAL, dt=dt,
+)
+print("PRED  COGNITIVE → VISUAL")
+p_cv_spec_r, p_cv_spec_c, p_cv_spec_o = run_area_gramians(
+    pred_J_windows, target=VISUAL, source=COGNITIVE, dt=dt,
+)
+
+pred_summaries = {
+    "visual→cognitive": {
+        "reach": _summary(p_vc_spec_r),
+        "ctrl":  _summary(p_vc_spec_c),
+        "obs":   _summary(p_vc_spec_o),
+    },
+    "cognitive→visual": {
+        "reach": _summary(p_cv_spec_r),
+        "ctrl":  _summary(p_cv_spec_c),
+        "obs":   _summary(p_cv_spec_o),
+    },
+}
+
+# %% [markdown]
+# ## Overlay plot: predicted vs empirical (twinx)
+#
+# Left axis (solid, blue/red): empirical log trace / log min-eig.
+# Right axis (dashed, cyan/magenta): predicted.
+
+# %%
+fig2, axes2 = plt.subplots(2, 3, figsize=(15, 7), sharex=True)
+for row, pair in enumerate(summaries):
+    for col, gk in enumerate(["reach", "ctrl", "obs"]):
+        ax = axes2[row][col]
+        e = summaries[pair][gk]
+        p = pred_summaries[pair][gk]
+
+        # Left axis: empirical
+        ax.plot(t_axis, e["log_trace_mean"], "C0-", lw=2, label="empirical trace")
+        ax.fill_between(t_axis, e["log_trace_mean"] - e["log_trace_std"],
+                        e["log_trace_mean"] + e["log_trace_std"],
+                        color="C0", alpha=0.18)
+        ax.plot(t_axis, e["log_min_mean"], "C3-", lw=2, label="empirical min-eig")
+        ax.fill_between(t_axis, e["log_min_mean"] - e["log_min_std"],
+                        e["log_min_mean"] + e["log_min_std"],
+                        color="C3", alpha=0.18)
+        ax.set_ylabel("log λ  (empirical)", color="k")
+        ax.grid(True, alpha=0.3)
+
+        # Right axis (twin): predicted
+        axp = ax.twinx()
+        axp.plot(t_axis, p["log_trace_mean"], "c--", lw=2, label="pred trace")
+        axp.fill_between(t_axis, p["log_trace_mean"] - p["log_trace_std"],
+                         p["log_trace_mean"] + p["log_trace_std"],
+                         color="c", alpha=0.18)
+        axp.plot(t_axis, p["log_min_mean"], "m--", lw=2, label="pred min-eig")
+        axp.fill_between(t_axis, p["log_min_mean"] - p["log_min_std"],
+                         p["log_min_mean"] + p["log_min_std"],
+                         color="m", alpha=0.18)
+        axp.set_ylabel("log λ  (predicted)", color="gray")
+        axp.tick_params(axis="y", labelcolor="gray")
+
+        # Combined legend (first subplot only, to keep the others clean)
+        if row == 0 and col == 0:
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = axp.get_legend_handles_labels()
+            ax.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left")
+
+        ax.set_title(f"{pair}  |  {gk}")
+        ax.set_xlabel("window time (s)")
+
+fig2.suptitle(
+    f"Empirical (solid) vs trained vanilla JacobianODE run {PRED_RUN_ID} (dashed) — twin axes",
+    y=1.02,
+)
+fig2.tight_layout()
+
+fig2_path = FIG_DIR / "wmtask_cross_area_gramians_pred_vs_empirical.png"
+fig2.savefig(fig2_path, dpi=130, bbox_inches="tight")
+print(f"Saved overlay figure → {fig2_path}")
+
+# %%
+pred_table_rows = []
+for pair, by_g in pred_summaries.items():
+    for gk, s in by_g.items():
+        pred_table_rows.append({
+            "pair": pair,
+            "gramian": gk,
+            "log_trace_final": float(s["log_trace_mean"][-1]),
+            "log_trace_std_final": float(s["log_trace_std"][-1]),
+            "log_min_final": float(s["log_min_mean"][-1]),
+            "log_min_std_final": float(s["log_min_std"][-1]),
+        })
+pred_table = pd.DataFrame(pred_table_rows).set_index(["pair", "gramian"])
+print(pred_table.round(3))
+
+# %% [markdown]
+# ## Append predicted-vs-empirical section to report
+
+# %%
+pred_section = []
+pred_section.append("")
+pred_section.append("---")
+pred_section.append("")
+pred_section.append(
+    f"## Predicted vs empirical Gramians — vanilla JacobianODE run `{PRED_RUN_ID}`"
+)
+pred_section.append("")
+pred_section.append(
+    f"Same trajectories, same area block decomposition, but the Jacobians "
+    f"come from a trained **vanilla JacobianODE** (no latent encoder — the "
+    f"MLP predicts `J(x)` directly from the 128-D state). Loaded from "
+    f"W&B project `{PRED_PROJECT}`, group `vanilla__lc1e-4_obs0.0`, "
+    f"run `{PRED_RUN_ID}`. The overlay uses `twinx` so empirical and "
+    f"predicted log-λ curves can share an x-axis without their absolute "
+    f"scales conflating."
+)
+pred_section.append("")
+pred_section.append(
+    f"![pred-vs-empirical]"
+    f"(figures/wmtask_cross_area_gramians_pred_vs_empirical.png)"
+)
+pred_section.append("")
+pred_section.append("### Predicted-Jacobian terminal-step summary")
+pred_section.append("")
+pred_section.append(_md_header)
+pred_section.append(_md_sep)
+for (pair, gk), row in pred_table.round(3).iterrows():
+    pred_section.append(
+        f"| {pair} | {gk} | "
+        f"{row['log_trace_final']:+.3f} ± {row['log_trace_std_final']:.3f} | "
+        f"{row['log_min_final']:+.3f} ± {row['log_min_std_final']:.3f} |"
+    )
+pred_section.append("")
+pred_section.append("### Reading the overlay")
+pred_section.append("")
+pred_section.append(
+    "- **Relative shape** is what matters, not absolute scale — the "
+    "predicted and empirical Jacobians have different per-entry "
+    "magnitudes, so log-λ offsets don't translate to 'predicted is "
+    "wrong by X.' What's diagnostic is whether the slopes, curvature, "
+    "and trace-vs-min-eig spread track each other."
+)
+pred_section.append(
+    "- If predicted curves rise in parallel with empirical, the model "
+    "has captured the dominant growth rate. If predicted lines are "
+    "flat while empirical grows, the model is under-representing "
+    "unstable directions. If predicted grows much faster, the model "
+    "has over-amplified directions that empirically are near-neutral."
+)
+pred_section.append(
+    "- Compare the two pairs (`visual→cognitive` vs `cognitive→visual`): "
+    "the asymmetry of cross-area coupling (visual drives cognitive more "
+    "than vice-versa, in empirical) should show up in the predicted "
+    "trace slopes too if the model has learned the cross-block structure."
+)
+
+with report_path.open("a") as _f:
+    _f.write("\n".join(pred_section) + "\n")
+print(f"Appended predicted-vs-empirical section to {report_path}")
