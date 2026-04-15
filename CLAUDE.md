@@ -1,3 +1,40 @@
+## Working style — caution, clarification, tests
+
+Default to cautious and careful in every implementation. Concretely:
+
+- **Ask on substantive ambiguity — don't ask on routine ops.** The
+  clarification bar is for algorithmic / ML-design / mathematical
+  decisions where a wrong guess is expensive to undo: tensor shapes and
+  conventions, sign / block-ordering choices, which loss term to
+  penalise, whether a knob defaults on/off in a way that shapes the
+  experiment, loss/metric semantics, which Jacobian block maps where,
+  etc. When there are multiple reasonable interpretations at that
+  level, list them and stop. For routine operational stuff (file paths,
+  tmux session names, whether to use an obvious CLI flag, which exact
+  directory to make) just pick the most literal reading and proceed;
+  you can always fix a misnamed folder, you can't easily redo a
+  swept-over-the-wrong-loss experiment. When genuinely unsure whether
+  something is "substantive" or "routine," err on the side of proceeding
+  and explaining what you did.
+- **Write careful tests.** For any non-trivial logic (tensor reshapes,
+  index/block extraction, recursion updates, numerical routines),
+  include a focused sanity check before declaring done. Prefer small
+  closed-form cases where the expected output is known, plus an
+  invariant check (e.g. symmetry, known identity, shape/dtype). When
+  touching shared code paths, run whatever existing tests exist; if
+  there are none, write one.
+- **Verify before asserting.** When a result looks surprisingly good or
+  bad, cross-check it (recompute with a different path, compare against
+  an untrained / random-init baseline, inspect a hand-picked entry).
+  Don't report a result as correct until it survives at least one
+  independent check.
+- **Prefer narrow changes.** Don't sweep surrounding code into the edit
+  unless asked. If you notice a second issue, flag it, don't fix it
+  silently.
+- **Say what you changed, and what you didn't.** End-of-turn summaries
+  should name the specific files/functions modified and call out
+  anything you chose not to touch despite being tempted.
+
 ## Scientific Skills
 
 Before starting domain-specific work, call `find_helpful_skills` to check for relevant
