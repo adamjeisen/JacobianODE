@@ -722,11 +722,10 @@ def compute_per_run_lyapunov(
             fig, axes = plt.subplots(
                 nrow, ncol, figsize=(5.0 * ncol, 3.6 * nrow), squeeze=False
             )
-            L = len(true_arr)
             for i, (rid, d) in enumerate(success):
                 row, col = i // ncol, i % ncol
                 a = axes[row][col]
-                pred = np.array(d["lambda_spectrum"])[:L]
+                pred = np.array(d["lambda_spectrum"])
                 lit_label = "literature" if true_lyapunov else "empirical"
                 a.plot(true_arr, "k-", lw=1.5, label=lit_label)
                 a.plot(pred, "C0o-", lw=1, ms=3, label="pred")
@@ -769,18 +768,27 @@ def compute_per_run_lyapunov(
             fig, axes = plt.subplots(
                 nrow, ncol, figsize=(5.0 * ncol, 3.6 * nrow), squeeze=False
             )
-            L = len(true_arr)
+            L_true = len(true_arr)
             with np.errstate(divide="ignore", invalid="ignore"):
                 denom = np.abs(true_arr)
-            x_idx = np.arange(L)
+            # Figure out full spectrum length (max over all runs). Positions
+            # beyond L_true are shown with no comparable true value, so the
+            # rel-err entries for those indices are N/A — matches the existing
+            # handling for true≈0 where denom is undefined.
+            L_pred = max((len(d["lambda_spectrum"]) for _, d in success), default=L_true)
+            x_idx = np.arange(L_pred)
             y_clip = 2000.0
             for i, (rid, d) in enumerate(success):
                 row, col = i // ncol, i % ncol
                 a = axes[row][col]
-                pred = np.array(d["lambda_spectrum"])[:L]
+                pred_full = np.array(d["lambda_spectrum"])
+                rel_err = np.full(L_pred, np.nan)
+                n_compare = min(L_true, len(pred_full))
                 with np.errstate(divide="ignore", invalid="ignore"):
-                    rel_err = 100.0 * (pred - true_arr) / denom
-                # Replace +/-inf (true==0) with a sentinel value so bars render.
+                    rel_err[:n_compare] = (
+                        100.0 * (pred_full[:n_compare] - true_arr[:n_compare])
+                        / denom[:n_compare]
+                    )
                 rel_err_finite = np.where(np.isfinite(rel_err), rel_err, np.nan)
                 colors = ["C0" if (np.isnan(e) or e <= 0) else "C3" for e in rel_err_finite]
                 clipped = np.clip(rel_err_finite, -y_clip, y_clip)
