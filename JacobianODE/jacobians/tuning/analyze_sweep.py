@@ -51,11 +51,16 @@ DEFAULT_SAVE_DIR = "/orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent
 
 ANALYTICS_SECTIONS = [
     "sweep_overview",
+    "reconstruction",
+    "mase",
+    "latent_utilization",
     "lyapunov",
+    "kaplan_yorke",
     "prediction_windows",
     "prediction_detail",
     "long_trajectory",
-    "mase",
+    "encoder_decoder_jacobians",
+    "amplification",
 ]
 
 
@@ -207,8 +212,9 @@ def run_full_analytics(
     true_lyapunov: list | None = None,
     lyapunov_burn_in_steps: int = 400,
     lyapunov_burn_in_drop: int = 100,
+    sections_override: list[str] | None = None,
 ) -> tuple[dict[str, str], str]:
-    """Invoke run_analytics with the standard section set.
+    """Invoke run_analytics with the standard (or overridden) section set.
 
     Captures run_analytics's stdout into ``output_dir/run_analytics.log`` so
     the printed per-run diagnostics / Lyapunov tables end up in the report.
@@ -221,10 +227,11 @@ def run_full_analytics(
 
     from ..run_analytics import run_analytics
 
+    sections = sections_override if sections_override is not None else ANALYTICS_SECTIONS
     figures_dir = output_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Running run_analytics for group={group}, sections={ANALYTICS_SECTIONS}")
+    logger.info(f"Running run_analytics for group={group}, sections={sections}")
 
     # Capture stdout (the bulk of run_analytics's diagnostic output prints
     # to stdout) into a string buffer and mirror to a log file.
@@ -247,7 +254,7 @@ def run_full_analytics(
             true_lyapunov=true_lyapunov,
             output=["save", "return"],
             output_dir=str(figures_dir),
-            sections=ANALYTICS_SECTIONS,
+            sections=sections,
             ranking_method="best_traj_loss",
             lyapunov_burn_in_steps=lyapunov_burn_in_steps,
             lyapunov_burn_in_drop=lyapunov_burn_in_drop,
@@ -1000,9 +1007,110 @@ def analyze(
     return output_dir
 
 
+def backfill(
+    group: str, sweeps_dir: Path, save_dir: Path,
+    true_lyapunov: list | None = None,
+    lyapunov_burn_in_steps: int = 400,
+    lyapunov_burn_in_drop: int = 100,
+) -> Path:
+    """Re-run only missing analytics sections for an existing report.
+
+    Reads ``analysis/<group>/metrics.json`` to find which figure files
+    already exist, computes the missing sections (by comparing against
+    ``ANALYTICS_SECTIONS``), then merges the new figures into the
+    existing report without re-running per-run diagnostics or
+    per-run Lyapunov computation.
+    """
+    output_dir = sweeps_dir / "analysis" / group
+    metrics_path = output_dir / "metrics.json"
+    if not metrics_path.exists():
+        raise FileNotFoundError(
+            f"No existing metrics.json for '{group}' — run full analyze first"
+        )
+
+    metrics_doc = json.loads(metrics_path.read_text())
+    existing_figures = set(metrics_doc.get("figures", {}).keys())
+
+    # Figure out which ANALYTICS_SECTIONS would produce new figures.
+    # Each section's figure key is typically the section name itself.
+    missing_sections = [
+        s for s in ANALYTICS_SECTIONS
+        if s not in existing_figures
+    ]
+    if not missing_sections:
+        logger.info(f"[backfill {group}] all sections present, nothing to do")
+        return output_dir
+
+    logger.info(
+        f"[backfill {group}] missing sections: {missing_sections}  "
+        f"(existing: {sorted(existing_figures)})"
+    )
+
+    # Read sentinel for wandb info
+    done_path = None
+    for sub in ("done", "processed", "failed"):
+        cand = sweeps_dir / sub / f"{group}.done.json"
+        if cand.is_file():
+            done_path = cand
+            break
+    # Fall back to context.json if sentinel is gone
+    if done_path is not None:
+        sentinel = json.loads(done_path.read_text())
+        wandb_info = sentinel.get("expected_snapshot", {}).get("wandb", {})
+    else:
+        ctx = json.loads((output_dir / "context.json").read_text())
+        wandb_info = ctx.get("wandb", {})
+
+    wandb_entity = wandb_info.get("entity")
+    wandb_project = wandb_info.get("project")
+    if not (wandb_entity and wandb_project):
+        raise ValueError(f"Cannot determine wandb entity/project for backfill of {group}")
+
+    # Run only the missing sections via run_analytics.
+    try:
+        new_figures, analytics_log = run_full_analytics(
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            group=group,
+            save_dir=save_dir,
+            output_dir=output_dir,
+            true_lyapunov=true_lyapunov,
+            lyapunov_burn_in_steps=lyapunov_burn_in_steps,
+            lyapunov_burn_in_drop=lyapunov_burn_in_drop,
+            sections_override=missing_sections,
+        )
+    except Exception as e:
+        logger.exception(f"[backfill {group}] run_analytics raised: {e}")
+        new_figures = {}
+        analytics_log = ""
+
+    # Merge new figures into existing metrics_doc
+    figure_map = metrics_doc.get("figures", {})
+    figure_map.update(new_figures)
+    metrics_doc["figures"] = figure_map
+    metrics_doc["analyzed_at"] = iso_now()
+    metrics_path.write_text(json.dumps(metrics_doc, indent=2) + "\n")
+
+    # Append analytics log
+    log_path = output_dir / "run_analytics.log"
+    with log_path.open("a") as f:
+        f.write(f"\n\n--- backfill {iso_now()} sections={missing_sections} ---\n")
+        f.write(analytics_log)
+
+    logger.info(
+        f"[backfill {group}] added {len(new_figures)} figure(s): "
+        f"{sorted(new_figures.keys())}"
+    )
+    return output_dir
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("group", help="wandb group name of the completed sweep")
+    parser.add_argument("--backfill", action="store_true",
+                        help="Only run missing analytics sections (skip per-run "
+                             "diagnostics and Lyapunov). Reads existing metrics.json "
+                             "to determine what's already present.")
     parser.add_argument("--sweeps-dir", default=None)
     parser.add_argument("--save-dir", default=None,
                         help="Directory containing Lightning checkpoints")
@@ -1033,7 +1141,8 @@ def main(argv: list[str] | None = None) -> int:
         true_lyapunov = [float(x) for x in args.true_lyapunov.split(",")]
 
     try:
-        analyze(
+        fn = backfill if args.backfill else analyze
+        fn(
             args.group, sweeps_dir, save_dir,
             true_lyapunov=true_lyapunov,
             lyapunov_burn_in_steps=args.lyapunov_burn_in_steps,

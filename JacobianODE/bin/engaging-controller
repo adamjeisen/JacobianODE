@@ -305,6 +305,37 @@ def process_pending_instructions(dry_run: bool) -> int:
                 pass
             continue
 
+        action = data.get("action", "submit")
+
+        # --- BACKFILL action: re-run only missing analytics sections ---
+        if action == "backfill":
+            group = data.get("group")
+            if not group:
+                log(f"[{f.name}] backfill missing 'group'; failing")
+                failed_dir.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(failed_dir / f.name))
+                continue
+            log(f"[{f.name}] backfill group={group}")
+            backfill_cmd = [
+                UV, "run", "--no-sync", "python", "-m",
+                "JacobianODE.jacobians.tuning.analyze_sweep",
+                "--backfill", group,
+            ]
+            try:
+                run(backfill_cmd, cwd=JACODE_REPO, check=True, capture=False)
+                # Copy updated analysis into repo
+                analysis_dir = SWEEPS_DIR / "analysis" / group
+                if analysis_dir.exists():
+                    _publish_analysis(group)
+            except Exception as e:
+                log(f"[{f.name}] backfill FAILED: {e}")
+            claimed_dir.mkdir(parents=True, exist_ok=True)
+            target = claimed_dir / f.name
+            shutil.move(str(f), str(target))
+            n_processed += 1
+            continue
+
+        # --- Default: SUBMIT action ---
         exp = data.get("experiment")
         if not exp:
             log(f"[{f.name}] missing 'experiment' key; failing")
