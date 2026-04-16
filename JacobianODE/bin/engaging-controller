@@ -583,8 +583,13 @@ def _maybe_load_state_summary(group: str) -> dict | None:
         return None
 
 
-def _get_squeue_info() -> dict[str, dict]:
-    """Query SLURM for running/pending jobs, return per-group info."""
+def _get_squeue_info() -> tuple[dict[str, dict], dict]:
+    """Query SLURM for running/pending jobs.
+
+    Returns (per_group_analysis, global_training_summary) where:
+    - per_group_analysis maps group -> {analysis_jobs: [...]}
+    - global_training_summary = {n_running, n_pending, n_total, jobs: [...]}
+    """
     try:
         out = run(
             ["squeue", "-u", os.environ.get("USER", "eisenaj"),
@@ -592,8 +597,9 @@ def _get_squeue_info() -> dict[str, dict]:
             check=False,
         ).stdout
     except FileNotFoundError:
-        return {}
+        return {}, {}
     per_group: dict[str, dict] = {}
+    training: dict = {"n_running": 0, "n_pending": 0, "n_total": 0, "jobs": []}
     for line in out.strip().splitlines():
         parts = line.split()
         if len(parts) < 3:
@@ -601,8 +607,6 @@ def _get_squeue_info() -> dict[str, dict]:
         job_id, name, state = parts[0], parts[1], parts[2]
         elapsed = parts[3] if len(parts) > 3 else ""
         timelimit = parts[4] if len(parts) > 4 else ""
-        # Training jobs: name = "run_jacobians"; group is in the multirun dir.
-        # Analysis jobs: name = "analyze_<group>".
         if name.startswith("analyze_"):
             group = name[len("analyze_"):]
             per_group.setdefault(group, {"analysis_jobs": []})
@@ -610,7 +614,18 @@ def _get_squeue_info() -> dict[str, dict]:
                 "job_id": job_id, "state": state,
                 "elapsed": elapsed, "timelimit": timelimit,
             })
-    return per_group
+        else:
+            # Training jobs (run_jacobians or similar)
+            training["n_total"] += 1
+            if state == "RUNNING":
+                training["n_running"] += 1
+            elif state == "PENDING":
+                training["n_pending"] += 1
+            training["jobs"].append({
+                "job_id": job_id, "name": name, "state": state,
+                "elapsed": elapsed,
+            })
+    return per_group, training
 
 
 def update_status_overview(inflight: dict) -> bool:
@@ -629,7 +644,7 @@ def update_status_overview(inflight: dict) -> bool:
         for group in _scan_sweep_state(sub):
             group_status[group] = status
 
-    squeue_info = _get_squeue_info()
+    squeue_info, training_summary = _get_squeue_info()
 
     # Also scan instruction dirs for pending/claimed sweeps
     pending_instructions = []
@@ -657,6 +672,13 @@ def update_status_overview(inflight: dict) -> bool:
 
     if pending_instructions:
         overview["pending_instructions"] = pending_instructions
+
+    if training_summary and training_summary["n_total"] > 0:
+        overview["slurm_training"] = {
+            "n_running": training_summary["n_running"],
+            "n_pending": training_summary["n_pending"],
+            "n_total": training_summary["n_total"],
+        }
 
     # Always write so the dashboard shows a fresh heartbeat timestamp.
     # The diff is just one line (last_updated) on no-change cycles.
