@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import signal
+import sys
 from pathlib import Path
 from typing import Any, List, Optional, Union
 
@@ -35,6 +37,43 @@ class _WandbFlushCallback(L.Callback):
         logger_ = trainer.logger
         if logger_ is not None and hasattr(logger_, "experiment"):
             logger_.experiment.log({})
+
+
+def _install_walltime_shutdown_handler() -> None:
+    """On SIGUSR2, finish wandb cleanly and exit.
+
+    submitit sends SIGUSR2 shortly before SLURM walltime expires. Its default
+    handler raises UncompletedJobError, which crashes Python without calling
+    wandb.finish(). The wandb run then lingers in state "running" for ~24h
+    (until wandb's heartbeat timeout kicks in), so the sweep monitor never
+    sees a terminal state and the sentinel can't fire.
+
+    Replacing submitit's handler with this one ensures the run reaches a
+    clean "finished" state in wandb as soon as walltime hits, which
+    classify_wandb_run recognises as done_finished. The best-by-metric
+    checkpoint from ModelCheckpoint is already on disk at that point, so
+    downstream analysis has what it needs. We deliberately do NOT try to
+    requeue — consistent with the "stop and analyze on walltime" policy.
+    """
+    def _handler(signum, frame):
+        try:
+            logger.warning(
+                f"[walltime] Received {signal.Signals(signum).name}; "
+                "finishing wandb and exiting cleanly."
+            )
+        except Exception:
+            pass
+        try:
+            wandb.finish(exit_code=0)
+        except Exception:
+            pass
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGUSR2, _handler)
+    except (ValueError, OSError) as e:
+        # Can't set signal handler outside main thread; not fatal.
+        logger.debug(f"Could not install SIGUSR2 handler: {e}")
 
 
 def _resume_state_dir(cfg: DictConfig) -> Optional[Path]:
@@ -100,6 +139,10 @@ def train_model(
         The training strategy is automatically set to 'ddp_notebook' if running
         in a Jupyter environment.
     """
+    # Replace submitit's SIGUSR2 handler with our own so walltime ends the
+    # run cleanly (wandb.finish + sys.exit) instead of raising mid-training.
+    _install_walltime_shutdown_handler()
+
     entity  = cfg.wandb_entity
     project = cfg.wandb_project
     group   = cfg.wandb_group
@@ -174,15 +217,20 @@ def train_model(
 
     resume_cbs: List[L.Callback] = []
     if resume_dir is not None:
-        # save_top_k=0 with save_last=True => only last.ckpt is maintained in
-        # this dir. Best-by-metric checkpoints continue to live at the default
-        # (WandbLogger-managed) path unchanged.
+        # Checkpoint at every epoch, keep only one file (the most recent),
+        # and mirror it as last.ckpt for resume. In Lightning ModelCheckpoint,
+        # save_last is triggered "whenever a checkpoint file gets saved", so
+        # it requires save_top_k > 0 to actually fire — save_top_k=0 silently
+        # disables the whole thing. monitor=None means "save on time, not on
+        # metric".
         resume_cbs.append(
             ModelCheckpoint(
                 dirpath=str(resume_dir),
                 save_last=True,
-                save_top_k=0,
-                filename="resume",  # ignored when save_top_k=0
+                save_top_k=1,
+                monitor=None,
+                every_n_epochs=1,
+                filename="resume-{epoch}",
             )
         )
 
