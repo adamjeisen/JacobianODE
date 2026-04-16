@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import torch
@@ -33,6 +35,34 @@ class _WandbFlushCallback(L.Callback):
         logger_ = trainer.logger
         if logger_ is not None and hasattr(logger_, "experiment"):
             logger_.experiment.log({})
+
+
+def _resume_state_dir(cfg: DictConfig) -> Optional[Path]:
+    """Deterministic per-job directory for preempt-safe checkpoints.
+
+    SLURM preserves SLURM_ARRAY_JOB_ID / SLURM_ARRAY_TASK_ID / SLURM_JOB_ID
+    across ``REQUEUE`` (which is the preemption behaviour on ou_bcs_low and
+    mit_preemptable). Keying the resume dir on those IDs gives us a path
+    that's stable across preempt cycles, so a fresh process launched by
+    SLURM can find the last.ckpt from the previous attempt.
+
+    Returns ``None`` when we're not running under SLURM or when
+    ``logger_save_dirs`` is unset — in those cases resume is disabled and
+    the training path is unchanged.
+    """
+    base_dir = cfg.training.get("logger_save_dirs")
+    if not base_dir:
+        return None
+    array_job = os.environ.get("SLURM_ARRAY_JOB_ID")
+    array_task = os.environ.get("SLURM_ARRAY_TASK_ID")
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if array_job and array_task:
+        key = f"{array_job}_{array_task}"
+    elif job_id:
+        key = job_id
+    else:
+        return None
+    return Path(base_dir) / "_resume_state" / key
 
 
 def train_model(
@@ -75,14 +105,51 @@ def train_model(
     group   = cfg.wandb_group
     name    = name or cfg.get("run_name", None)
 
+    # ----------------------------------------------------------------- #
+    # Preempt-safe resume state
+    # ----------------------------------------------------------------- #
+    # If we've been requeued by SLURM after a preempt, look for the
+    # last.ckpt + wandb_run_id saved by the previous attempt and wire
+    # them into trainer.fit / WandbLogger so training continues instead
+    # of restarting from epoch 0.
+    resume_dir = _resume_state_dir(cfg)
+    ckpt_path_resume: Optional[str] = None
+    wandb_resume_id: Optional[str] = None
+    if resume_dir is not None:
+        resume_dir.mkdir(parents=True, exist_ok=True)
+        last_file = resume_dir / "last.ckpt"
+        if last_file.is_file():
+            ckpt_path_resume = str(last_file)
+            id_file = resume_dir / "wandb_run_id.txt"
+            if id_file.is_file():
+                wandb_resume_id = id_file.read_text().strip() or None
+            logger.info(
+                f"[resume] Found {last_file}; resuming training from it"
+                + (f" (wandb id={wandb_resume_id})" if wandb_resume_id else "")
+            )
+
     logger_kwargs = {
         "name": name,
         "project": project,
         "entity": entity,
         "group": group,
     }
+    if wandb_resume_id:
+        # Continue the same wandb run so the step counter stays monotonic.
+        logger_kwargs["id"] = wandb_resume_id
+        logger_kwargs["resume"] = "allow"
 
     experiment_logger = instantiate(cfg.training.logger, **logger_kwargs)
+
+    # Persist the wandb run id on first start so future requeues continue
+    # the same run rather than creating a new one each cycle.
+    if resume_dir is not None:
+        try:
+            run_id = experiment_logger.experiment.id
+            if run_id:
+                (resume_dir / "wandb_run_id.txt").write_text(str(run_id))
+        except Exception as e:
+            logger.warning(f"[resume] Could not persist wandb run id: {e}")
 
     # Only update the logger config in the main process (rank 0)
     if os.getenv("LOCAL_RANK") == "0" or os.getenv("LOCAL_RANK") is None:
@@ -90,7 +157,8 @@ def train_model(
             OmegaConf.to_container(cfg, resolve=True)
         )
 
-    # Set up callbacks
+    # Set up callbacks — "best" checkpoints track top-k by metric as before;
+    # the new "last" checkpoint enables preempt-safe resume (see resume_dir).
     checkpoint_callback = ModelCheckpoint(
         monitor=cfg.training.model_checkpoint.monitor,
         save_top_k=cfg.training.model_checkpoint.save_top_k,
@@ -103,6 +171,20 @@ def train_model(
         mode="min",
         filename="traj-best-{epoch:02d}-{trajectory val_loss:.4f}",
     )
+
+    resume_cbs: List[L.Callback] = []
+    if resume_dir is not None:
+        # save_top_k=0 with save_last=True => only last.ckpt is maintained in
+        # this dir. Best-by-metric checkpoints continue to live at the default
+        # (WandbLogger-managed) path unchanged.
+        resume_cbs.append(
+            ModelCheckpoint(
+                dirpath=str(resume_dir),
+                save_last=True,
+                save_top_k=0,
+                filename="resume",  # ignored when save_top_k=0
+            )
+        )
 
     if cfg.training.early_stopping.early_stopping_mode == "percent_thresh":
         early_stopping_callback = PercentEarlyStopping(
@@ -120,6 +202,7 @@ def train_model(
         )
 
     callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback()]
+    callbacks.extend(resume_cbs)
     if extra_callbacks:
         callbacks.extend(extra_callbacks)
 
@@ -210,7 +293,18 @@ def train_model(
         model=lit_model,
         train_dataloaders=train_dataloaders,
         val_dataloaders=val_dataloaders,
+        ckpt_path=ckpt_path_resume,
     )
+
+    # trainer.fit returning normally means training finished (early stop or
+    # max_epochs). A SLURM preempt would have SIGTERM'd us before reaching
+    # here, so it's safe to wipe the resume dir — we're done and don't
+    # want stale last.ckpt files lingering on disk.
+    if resume_dir is not None and resume_dir.is_dir():
+        try:
+            shutil.rmtree(str(resume_dir))
+        except Exception as e:
+            logger.warning(f"[resume] Could not clean up {resume_dir}: {e}")
 
     wandb.finish()
     logger.info(f"Training complete for run: {name}")
