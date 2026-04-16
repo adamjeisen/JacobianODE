@@ -71,7 +71,16 @@ def log(msg: str) -> None:
     print(f"[{utc_iso()}] {msg}", flush=True)
 
 
+CONTROLLER_HOST = "login006"  # pin to one login node to avoid NFS cache races
+
+
 def acquire_lock():
+    # Only run on the pinned host. Other login nodes that cron fires on
+    # exit immediately — avoids NFS attribute-cache races where a stale
+    # version of this script runs on a different node and overwrites the
+    # correct overview.json with outdated data.
+    if HOSTNAME != CONTROLLER_HOST:
+        sys.exit(0)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     f = open(LOCK_FILE, "w")
     try:
