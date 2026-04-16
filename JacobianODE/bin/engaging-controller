@@ -221,12 +221,42 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
     group = expected["wandb"].get("group")
     if not group:
         raise RuntimeError("expected.json has no wandb_group")
-    expected_run_count = expected.get("expected_run_count")
+    batch_count = expected.get("expected_run_count") or len(
+        expected["hydra"]["resolved_runs"]
+    )
 
-    # 2. Move expected.json into place under /orcd/.../sweeps/active/
+    # 2. Move expected.json into place under /orcd/.../sweeps/active/.
+    #    If a sweep with this group already exists, EXTEND it: offset the new
+    #    resolved_runs' run_idx so they don't collide with previously-tracked
+    #    runs (whose terminal flags live in state.json). This lets the monitor
+    #    count old completed runs + new in-flight runs together.
     SWEEPS_DIR.joinpath("active").mkdir(parents=True, exist_ok=True)
     final_expected = SWEEPS_DIR / "active" / f"{group}.expected.json"
-    shutil.move(str(expected_path), str(final_expected))
+    if final_expected.is_file():
+        old = json.loads(final_expected.read_text())
+        old_runs = old.get("hydra", {}).get("resolved_runs", [])
+        next_idx = max((r["run_idx"] for r in old_runs), default=-1) + 1
+        appended = [
+            {**r, "run_idx": next_idx + r["run_idx"]}
+            for r in expected["hydra"]["resolved_runs"]
+        ]
+        merged = dict(old)
+        merged.setdefault("hydra", {})["resolved_runs"] = old_runs + appended
+        merged["expected_run_count"] = len(old_runs) + len(appended)
+        merged_meta = dict(old.get("experiment_metadata") or {})
+        merged_meta.update(expected.get("experiment_metadata") or {})
+        if merged_meta:
+            merged["experiment_metadata"] = merged_meta
+        final_expected.write_text(json.dumps(merged, indent=2) + "\n")
+        expected_path.unlink(missing_ok=True)
+        log(
+            f"[{exp}] extended {group}: +{len(appended)} runs "
+            f"(total now {merged['expected_run_count']})"
+        )
+        expected_run_count = batch_count
+    else:
+        shutil.move(str(expected_path), str(final_expected))
+        expected_run_count = batch_count
 
     # 3. Pick up sweep_grid args from the YAML so user doesn't need to
     #    repeat them on the CLI.
