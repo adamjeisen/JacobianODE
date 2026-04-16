@@ -38,12 +38,16 @@ metadata:
     - "val/trajectory_r2 at best kl_null within a few % of the 0-kl_null baseline"
     - "Clear U-shape (or monotone direction) across the 6 kl_null values"
 
+# IMPORTANT: kl_null_weight lives in training.lightning (the Lightning
+# constructor's single source of truth), NOT in model. model_factory.py
+# deliberately skips model-level kl_null_weight. Sweeping
+# model.kl_null_weight silently has no effect.
 sweep_grid:
-  model.kl_null_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
+  training.lightning.kl_null_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
 
 wandb_entity: JacobianODE
 wandb_project: "Lorenz_INDpartial_N100_D1_NormTrue_T7__JacobianODE"
-wandb_group: "lorenz_partial_100d_7lat_additive_mse__klnull_sweep"
+wandb_group: "lorenz_partial_100d_7lat_additive_mse__klnull_sweep_v2"
 
 data:
   postprocessing:
@@ -81,6 +85,7 @@ training:
     reconstruction_mode: 'most_recent'
     obs_noise_scale: 0.0
     n_eigval_jacobians: 8
+    kl_null_weight: 0.0                    # overridden by sweep_grid
   early_stopping:
     early_stopping_patience: 5
     min_epochs: 20
