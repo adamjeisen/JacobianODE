@@ -53,6 +53,8 @@ ANALYTICS_SECTIONS = [
     "sweep_overview",
     "lyapunov",
     "prediction_windows",
+    "prediction_detail",
+    "long_trajectory",
     "mase",
 ]
 

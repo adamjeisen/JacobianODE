@@ -167,7 +167,8 @@ def build_figures_section(metrics_doc: dict, analysis_dir: Path) -> list[str]:
     # then Lyapunov plots. Unknown names go last in whatever order.
     preferred = [
         "sweep_overview", "sweep_pareto",
-        "prediction_windows", "mase",
+        "prediction_windows", "prediction_detail", "long_trajectory",
+        "mase",
         "lyapunov", "lyapunov_top10",
         "per_run_lyapunov",
         "per_run_lyapunov_vs_true",
