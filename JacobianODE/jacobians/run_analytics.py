@@ -1229,6 +1229,19 @@ def run_analytics(
                 recon_mse_val = ((recon - targets) ** 2).mean().item()
                 recon_nmse_val = recon_mse_val / targets.var().item()
 
+                # Training-equivalent reconstruction loss: routes through the
+                # dyn subspace and applies the model's reconstruction_mode
+                # weighting ('most_recent' or 'uniform'). Matches exactly what
+                # the lightning loop minimises, unlike recon_mse/nMSE above
+                # which are raw sequence-wide metrics.
+                try:
+                    train_recon_loss_val = float(
+                        lit_model._reconstruction_loss(batch).item()
+                    )
+                except Exception as e:
+                    print(f"  (skipped training-eqv reconstruction loss: {e})")
+                    train_recon_loss_val = None
+
                 inv_err_val: float | None = None
                 null_rms_val: float | None = None
                 if is_coupling:
@@ -1280,6 +1293,11 @@ def run_analytics(
                 f"R²        : {r2_val:.6f}",
                 f"recon nMSE: {recon_nmse_val:.6f}",
             ]
+            if train_recon_loss_val is not None:
+                mode = getattr(lit_model, "reconstruction_mode", "?")
+                _recon_lines.append(
+                    f"Training recon loss ({mode}): {train_recon_loss_val:.6f}"
+                )
             if is_coupling and inv_err_val is not None:
                 _recon_lines.append(f"Inverse consistency MSE: {inv_err_val:.2e}")
                 if null_rms_val is not None:
