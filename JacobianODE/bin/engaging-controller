@@ -635,6 +635,15 @@ def main() -> int:
         if changed:
             log("status/overview.json updated")
 
+        # Rebuild the dashboard manifest so the GitHub Pages site picks up
+        # new/updated reports.
+        manifest_script = REPO_DIR / "build_manifest.py"
+        if manifest_script.exists():
+            try:
+                run([sys.executable, str(manifest_script)], cwd=REPO_DIR, check=True)
+            except subprocess.CalledProcessError as e:
+                log(f"build_manifest.py failed: {(e.stderr or '').strip()[:200]}")
+
         try:
             git_commit_and_push(f"controller cycle {utc_iso()}", args.dry_run)
         except subprocess.CalledProcessError as e:
