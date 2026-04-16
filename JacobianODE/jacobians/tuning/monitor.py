@@ -188,7 +188,12 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
             return False
         return True
 
-    matches: list[int] = []
+    # (run_idx, specificity) for each matching resolved_run; specificity is
+    # the number of matchable overrides the resolved_run constrains. When
+    # expected.json was extended with a finer sweep axis (e.g. obs_noise),
+    # old runs have fewer overrides than new runs — without a specificity
+    # tiebreak a new wandb run would match both and be dropped as ambiguous.
+    matches: list[tuple[int, int]] = []
     for r in resolved_runs:
         filtered_overrides = [ov for ov in r["overrides"] if _is_matchable(ov)]
         if not filtered_overrides:
@@ -201,8 +206,12 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
             )
             for ov in filtered_overrides
         ):
-            matches.append(r["run_idx"])
-    return matches[0] if len(matches) == 1 else None
+            matches.append((r["run_idx"], len(filtered_overrides)))
+    if not matches:
+        return None
+    max_spec = max(s for _, s in matches)
+    top = [idx for idx, s in matches if s == max_spec]
+    return top[0] if len(top) == 1 else None
 
 
 # ---------------------------------------------------------------------------
