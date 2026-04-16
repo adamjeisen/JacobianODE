@@ -552,6 +552,36 @@ def _maybe_load_state_summary(group: str) -> dict | None:
         return None
 
 
+def _get_squeue_info() -> dict[str, dict]:
+    """Query SLURM for running/pending jobs, return per-group info."""
+    try:
+        out = run(
+            ["squeue", "-u", os.environ.get("USER", "eisenaj"),
+             "-h", "-o", "%i %j %T %M %l"],
+            check=False,
+        ).stdout
+    except FileNotFoundError:
+        return {}
+    per_group: dict[str, dict] = {}
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        job_id, name, state = parts[0], parts[1], parts[2]
+        elapsed = parts[3] if len(parts) > 3 else ""
+        timelimit = parts[4] if len(parts) > 4 else ""
+        # Training jobs: name = "run_jacobians"; group is in the multirun dir.
+        # Analysis jobs: name = "analyze_<group>".
+        if name.startswith("analyze_"):
+            group = name[len("analyze_"):]
+            per_group.setdefault(group, {"analysis_jobs": []})
+            per_group[group]["analysis_jobs"].append({
+                "job_id": job_id, "state": state,
+                "elapsed": elapsed, "timelimit": timelimit,
+            })
+    return per_group
+
+
 def update_status_overview(inflight: dict) -> bool:
     """Returns True if status/overview.json changed."""
     overview = {
@@ -559,24 +589,43 @@ def update_status_overview(inflight: dict) -> bool:
         "last_updated": utc_iso(),
         "sweeps": {},
     }
-    seen = set()
+
+    # Collect groups from each state dir. Higher-priority states override:
+    # processed > failed > done > active.
+    group_status: dict[str, str] = {}
     for status, sub in [("active", "active"), ("done", "done"),
-                         ("processed", "processed"), ("failed", "failed")]:
+                         ("failed", "failed"), ("processed", "processed")]:
         for group in _scan_sweep_state(sub):
-            if group in seen:
-                continue
-            seen.add(group)
-            entry = {"status": status}
-            summary = _maybe_load_state_summary(group)
-            if summary is not None:
-                entry["runs_summary"] = summary
-            if group in inflight:
-                entry["analysis"] = {
-                    "slurm_job_id": inflight[group]["slurm_job_id"],
-                    "dispatched_at": inflight[group]["dispatched_at"],
-                    "status": "running",
-                }
-            overview["sweeps"][group] = entry
+            group_status[group] = status
+
+    squeue_info = _get_squeue_info()
+
+    # Also scan instruction dirs for pending/claimed sweeps
+    pending_instructions = []
+    for sub in ("pending", "claimed"):
+        d = REPO_DIR / "instructions" / sub
+        if d.exists():
+            for f in sorted(d.iterdir()):
+                if f.suffix == ".yaml":
+                    pending_instructions.append({"file": f.name, "status": sub})
+
+    for group, status in sorted(group_status.items()):
+        entry: dict = {"status": status}
+        summary = _maybe_load_state_summary(group)
+        if summary is not None:
+            entry["runs_summary"] = summary
+        if group in inflight:
+            entry["analysis"] = {
+                "slurm_job_id": inflight[group]["slurm_job_id"],
+                "dispatched_at": inflight[group]["dispatched_at"],
+                "status": "running",
+            }
+        if group in squeue_info:
+            entry["slurm"] = squeue_info[group]
+        overview["sweeps"][group] = entry
+
+    if pending_instructions:
+        overview["pending_instructions"] = pending_instructions
 
     # Write only if changed (compare ignoring last_updated)
     target = REPO_DIR / "status" / "overview.json"
