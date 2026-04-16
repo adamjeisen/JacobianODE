@@ -658,18 +658,10 @@ def update_status_overview(inflight: dict) -> bool:
     if pending_instructions:
         overview["pending_instructions"] = pending_instructions
 
-    # Write only if changed (compare ignoring last_updated)
+    # Always write so the dashboard shows a fresh heartbeat timestamp.
+    # The diff is just one line (last_updated) on no-change cycles.
     target = REPO_DIR / "status" / "overview.json"
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        try:
-            current = json.loads(target.read_text())
-            current_cmp = {**current, "last_updated": None}
-            new_cmp = {**overview, "last_updated": None}
-            if current_cmp == new_cmp:
-                return False
-        except Exception:
-            pass
     target.write_text(json.dumps(overview, indent=2) + "\n")
     return True
 
