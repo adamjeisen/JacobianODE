@@ -716,6 +716,11 @@ def update_status_overview(inflight: dict) -> bool:
             entry["analysis_slurm"] = analysis_jobs[group]
         if group in training_jobs:
             entry["training_slurm"] = training_jobs[group]
+            # If there are live SLURM training jobs, the group is active
+            # even if its sentinel has been processed (e.g. new runs were
+            # added to the same group after the original analysis).
+            if training_jobs[group].get("n_total", 0) > 0:
+                entry["status"] = "active"
         overview["sweeps"][group] = entry
 
     if pending_instructions:
