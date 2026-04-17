@@ -55,6 +55,13 @@ TERMINAL_CLASSIFICATIONS = {
     "done_finished", "done_early_stopped", "done_walltime", "failed_exhausted",
 }
 
+# SLURM job states we treat as "not yet terminated" — if an array task is in
+# any of these, the corresponding run_idx classifies as `running` (even if
+# wandb briefly flips to crashed/failed during a preempt+requeue).
+ALIVE_SLURM_STATES = (
+    "PENDING", "RUNNING", "CONFIGURING", "REQUEUED", "SUSPENDED",
+)
+
 
 # ---------------------------------------------------------------------------
 # Atomic JSON IO
@@ -247,6 +254,120 @@ def classify_wandb_run(run, slurm_timeout_min: float | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Stateless run_idx classification
+# ---------------------------------------------------------------------------
+
+def _ckpt_base(expected: dict) -> Path | None:
+    """Where Lightning wrote checkpoints for this sweep, or None if
+    unknown. Format: ``{logger_save_dirs}/{wandb_project}``."""
+    save_dir = (
+        expected.get("training", {}).get("logger_save_dirs")
+        or expected.get("training", {}).get("logger", {}).get("save_dir")
+    )
+    proj = expected.get("wandb", {}).get("project")
+    if not save_dir or not proj:
+        return None
+    return Path(save_dir) / proj
+
+
+def classify_run_idx(
+    run_idx: int,
+    resolved_run: dict,
+    wandb_runs: list,
+    slurm_states: dict[str, str],
+    ckpt_base: Path | None,
+    slurm_arrays: dict[str, str],
+    slurm_timeout_min: float | None,
+) -> tuple[str, list[str], str | None]:
+    """Pure classification of a single ``run_idx`` from current observables.
+
+    This is the core of the stateless control-plane rewrite: instead of
+    accumulating ``terminal=True`` across cycles and letting it stick
+    regardless of later evidence, each cycle recomputes a run_idx's
+    classification from (wandb runs, SLURM queue, checkpoint existence).
+
+    Decision order:
+      1. If any SLURM array task ``{array_id}_{run_idx}`` is in an alive
+         state (PENDING/RUNNING/…) → ``running``. This wins over any
+         transient wandb state, so a preempt's brief crashed-window
+         doesn't mis-classify the run.
+      2. If no wandb runs are matched yet → ``pending``.
+      3. If any matched run has state=finished AND a checkpoint dir →
+         ``done_finished``.
+      4. If any matched run (that has a checkpoint dir) meets the
+         early-stopping criterion → ``done_early_stopped``.
+      5. If any matched run (that has a checkpoint dir) hit SLURM walltime
+         → ``done_walltime``.
+      6. Otherwise → ``failed`` (no alive SLURM task, no satisfied
+         completion criterion).
+
+    Returns
+    -------
+    (classification, matched_wandb_run_ids, last_wandb_state_seen)
+    """
+    k = str(run_idx)
+    matched = []
+    for r in wandb_runs:
+        try:
+            cfg = dict(r.config)
+        except Exception:
+            continue
+        if match_run_to_idx(cfg, [resolved_run]) == run_idx:
+            matched.append(r)
+
+    # (1) Alive SLURM array task — wins over any wandb state.
+    array_id = slurm_arrays.get(k)
+    if array_id is not None:
+        task_id = f"{array_id}_{k}"
+        if slurm_states.get(task_id) in ALIVE_SLURM_STATES:
+            last = (matched[-1].state if matched else None)
+            return ("running", [r.id for r in matched], last)
+
+    if not matched:
+        return ("pending", [], None)
+
+    # Sort matched by heartbeat_at (or updated_at) descending so we look at
+    # the most recent attempt first when picking the "best" classification.
+    def _sort_key(r):
+        return r.heartbeat_at or r.updated_at or ""
+    matched_sorted = sorted(matched, key=_sort_key, reverse=True)
+
+    def _has_ckpt(r) -> bool:
+        if ckpt_base is None:
+            return True  # can't verify; don't penalise
+        return (ckpt_base / r.id / "checkpoints").is_dir()
+
+    ckpt_runs = [r for r in matched_sorted if _has_ckpt(r)]
+
+    # (3) Best wandb run is finished AND has a checkpoint dir.
+    for r in ckpt_runs:
+        if (r.state or "").lower() == "finished":
+            return ("done_finished", [r.id for r in matched], r.state)
+
+    # (4) Converged.
+    for r in ckpt_runs:
+        try:
+            converged, _ = meets_early_stopping_criterion(r)
+            if converged:
+                return ("done_early_stopped", [r.id for r in matched], r.state)
+        except Exception:
+            continue
+
+    # (5) Hit walltime.
+    if slurm_timeout_min is not None:
+        for r in ckpt_runs:
+            try:
+                if hit_slurm_walltime(r, timeout_min=slurm_timeout_min):
+                    return ("done_walltime", [r.id for r in matched], r.state)
+            except Exception:
+                continue
+
+    # (6) Failed — has wandb evidence but none of the done_* criteria met.
+    last = matched_sorted[0].state
+    return ("failed", [r.id for r in matched], last)
+
+
+# ---------------------------------------------------------------------------
 # Resubmission
 # ---------------------------------------------------------------------------
 
@@ -374,66 +495,75 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
 
     slurm_states = query_squeue_states()
     timeout_min = expected["slurm"].get("timeout_min", 180)
+    slurm_arrays = expected.get("slurm_arrays") or {}
+    ckpt_base = _ckpt_base(expected)
+    retry_cap = expected.get("retry", {}).get("cap_per_run", 2)
 
-    # Classify each wandb run into a run_idx bucket
-    for run in wandb_runs:
-        try:
-            cfg = dict(run.config)
-        except Exception:
-            continue
-        idx = match_run_to_idx(cfg, resolved)
-        if idx is None:
-            continue
-        k = str(idx)
-        entry = state["runs"][k]
-        if run.id not in entry["wandb_run_ids"]:
-            entry["wandb_run_ids"].append(run.id)
-            entry["attempts"] = len(entry["wandb_run_ids"])
-        entry["last_wandb_state"] = run.state
-        cls = classify_wandb_run(run, slurm_timeout_min=timeout_min)
-        # Promote to terminal classification if any attempt for this idx reached it
-        if cls in ("done_finished", "done_early_stopped", "done_walltime"):
-            entry["classification"] = cls
-            entry["terminal"] = True
-        elif cls == "running":
-            if not entry["terminal"]:
-                entry["classification"] = "running"
-        elif cls == "failed":
-            cap = expected.get("retry", {}).get("cap_per_run", 2)
-            if entry["attempts"] > cap:
-                entry["classification"] = "failed_exhausted"
-                entry["terminal"] = True
-            elif not entry["terminal"]:
-                entry["classification"] = "failed_retrying"
+    # STATELESS classification: recompute each run_idx's classification from
+    # scratch every cycle. This replaces the previous sticky-terminal logic
+    # where `entry["terminal"] = True` once-set-never-unset — that model
+    # broke badly on preempt+requeue cycles where wandb state oscillates.
+    for r in resolved:
+        k = str(r["run_idx"])
+        entry = state["runs"].setdefault(k, {
+            "wandb_run_ids": [],
+            "slurm_job_ids": [],
+            "attempts": 0,
+            "last_wandb_state": None,
+            "last_slurm_state": None,
+            "classification": "pending",
+            "terminal": False,
+        })
 
-    # Also fold in SLURM states for jobs we've tracked
+        cls, wids, last_wb = classify_run_idx(
+            run_idx=r["run_idx"],
+            resolved_run=r,
+            wandb_runs=wandb_runs,
+            slurm_states=slurm_states,
+            ckpt_base=ckpt_base,
+            slurm_arrays=slurm_arrays,
+            slurm_timeout_min=timeout_min,
+        )
+
+        # Translate "failed" into the retry lifecycle (failed_retrying vs
+        # failed_exhausted). Retry logic itself lives below and still uses
+        # state.runs[k].slurm_job_ids for monitor-initiated retries; the
+        # classification -> retry hookup is the only stateful piece that
+        # remains, and Phase 4 of the redesign will retire it.
+        if cls == "failed":
+            if len(wids) > retry_cap:
+                cls = "failed_exhausted"
+            else:
+                cls = "failed_retrying"
+
+        entry["wandb_run_ids"] = wids
+        entry["attempts"] = len(wids)
+        entry["last_wandb_state"] = last_wb
+        entry["classification"] = cls
+        entry["terminal"] = cls in TERMINAL_CLASSIFICATIONS
+
+    # Fold in SLURM states for monitor-retry jobs we've tracked (still used by
+    # the resubmit loop below to decide whether a retry is already queued).
     for entry in state["runs"].values():
         for jid in entry["slurm_job_ids"]:
             if jid in slurm_states:
                 entry["last_slurm_state"] = slurm_states[jid]
 
     # Resubmit anything currently marked failed_retrying and not already queued.
-    # Two must-skip conditions:
-    #   (1) a prior retry (tracked in slurm_job_ids) is still queued/running
-    #   (2) the ORIGINAL jsweep array task is still alive — for partitions with
-    #       PreemptMode=REQUEUE (e.g. ou_bcs_low), a brief "crashed" wandb
-    #       window during a preempt can trip classify_wandb_run into failed,
-    #       but SLURM is about to requeue the task and training will continue.
-    #       Double-scheduling there produces orphan retries that then all
-    #       compete for the run_idx.
-    slurm_arrays = expected.get("slurm_arrays") or {}
-    array_alive_states = ("PENDING", "RUNNING", "CONFIGURING", "REQUEUED", "SUSPENDED")
+    # Note: with the stateless classify_run_idx, the alive-array-task check
+    # is redundant (a run_idx with an alive array task classifies as
+    # "running", never reaching "failed_retrying"). Keeping the guard for
+    # defense-in-depth until Phase 4 retires this retry path entirely.
     for k, entry in state["runs"].items():
         if entry["classification"] != "failed_retrying":
             continue
-        if any(slurm_states.get(jid) in ("PENDING", "RUNNING", "CONFIGURING")
+        if any(slurm_states.get(jid) in ALIVE_SLURM_STATES
                for jid in entry["slurm_job_ids"]):
             continue
-        # Check the original array task's liveness (array_id + "_" + run_idx).
         array_id = slurm_arrays.get(k)
         if array_id:
             orig_task = f"{array_id}_{k}"
-            if slurm_states.get(orig_task) in array_alive_states:
+            if slurm_states.get(orig_task) in ALIVE_SLURM_STATES:
                 logger.info(
                     f"{expected['wandb']['group']}/run_idx={k}: original SLURM "
                     f"task {orig_task} still alive — skipping monitor retry"
@@ -479,6 +609,31 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             f"(guard = {min_elapsed}s); waiting."
         )
         return
+
+    # Orphan cleanup: sentinel is about to fire, so any SLURM array task
+    # still alive for this group is wasted compute (training continues on a
+    # wandb run the sweep already considers terminal). Scancel them before
+    # writing done.json so the orphan doesn't keep flipping wandb state and
+    # confusing downstream analysis.
+    orphan_ids = []
+    for k, arr_id in slurm_arrays.items():
+        task = f"{arr_id}_{k}"
+        if slurm_states.get(task) in ALIVE_SLURM_STATES:
+            orphan_ids.append(task)
+    # Also pick up any monitor-retry jobs still queued/running.
+    for entry in runs.values():
+        for jid in entry.get("slurm_job_ids", []):
+            if slurm_states.get(jid) in ALIVE_SLURM_STATES:
+                orphan_ids.append(jid)
+    if orphan_ids:
+        logger.info(
+            f"{group}: scancelling {len(orphan_ids)} orphan SLURM task(s) "
+            f"before sentinel: {orphan_ids}"
+        )
+        try:
+            subprocess.run(["scancel", *orphan_ids], check=False)
+        except Exception as e:
+            logger.warning(f"orphan scancel failed: {e}")
 
     # Write done.json atomically
     done_doc = {
