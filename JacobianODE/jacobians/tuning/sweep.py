@@ -748,7 +748,7 @@ def select_best_from_sweep(
     _ckpt_base = _Path(save_dir) / wandb_project
     kept = [(r, l, t, k) for r, l, t, k in zip(
         discovered.run_ids, discovered.lambdas,
-        discovered.te_weights, discovered.kd_weights,
+        discovered.tangent_entropy_weights, discovered.kl_dyn_weights,
     ) if (_ckpt_base / r / "checkpoints").is_dir()]
     dropped = [r for r in discovered.run_ids
                if not (_ckpt_base / r / "checkpoints").is_dir()]
@@ -758,8 +758,9 @@ def select_best_from_sweep(
         discovered = DiscoveredSweep(
             run_ids=[k[0] for k in kept],
             lambdas=[k[1] for k in kept],
-            te_weights=[k[2] for k in kept],
-            kd_weights=[k[3] for k in kept],
+            tangent_entropy_weights=[k[2] for k in kept],
+            kl_dyn_weights=[k[3] for k in kept],
+            crashed_ids=discovered.crashed_ids,
         )
 
     if not discovered.run_ids:
