@@ -667,6 +667,45 @@ def _build_array_to_group_map() -> dict[str, str]:
     return mapping
 
 
+def _count_array_tasks(job_id: str) -> int:
+    """Count how many array tasks ``job_id`` refers to.
+
+    SLURM squeue compresses pending tasks into one row using a bracket spec
+    that may be a single task (``job_11``), a range (``job_[11-39]``), or a
+    comma-separated list with optional ranges and a ``%K`` concurrency
+    suffix (``job_[2,12-39%45]``). Parse all of those.
+    """
+    # Running tasks have no brackets: ``jobid_11``.
+    if "[" not in job_id:
+        return 1
+    # Extract the bracket content.
+    m = re.search(r"\[([^\]]+)\]", job_id)
+    if not m:
+        return 1
+    content = m.group(1)
+    # Strip ``%K`` concurrency limit if present.
+    content = content.split("%", 1)[0]
+    total = 0
+    for piece in content.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "-" in piece:
+            try:
+                lo_s, hi_s = piece.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+                total += max(0, hi - lo + 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                int(piece)
+                total += 1
+            except ValueError:
+                continue
+    return total if total > 0 else 1
+
+
 def _get_squeue_info() -> tuple[dict[str, dict], dict[str, dict]]:
     """Query SLURM for running/pending jobs.
 
@@ -712,13 +751,7 @@ def _get_squeue_info() -> tuple[dict[str, dict], dict[str, dict]]:
             if not group:
                 continue
             entry = per_group.setdefault(group, {"n_running": 0, "n_pending": 0, "n_total": 0})
-            # Array notation like [0-8%9] represents multiple tasks
-            array_match = re.search(r"\[(\d+)-(\d+)", job_id)
-            if array_match:
-                lo, hi = int(array_match.group(1)), int(array_match.group(2))
-                count = hi - lo + 1
-            else:
-                count = 1
+            count = _count_array_tasks(job_id)
             entry["n_total"] += count
             if state == "RUNNING":
                 entry["n_running"] += count
