@@ -50,6 +50,27 @@ def _fmt_float(v, digits=4):
     return _fmt(v, f".{digits}f")
 
 
+def _fmt_swept_value(v) -> str:
+    """Compact representation of a swept-config value for table cells.
+
+    Small integers and floats in a reasonable range render as-is; very small
+    or large floats switch to scientific notation; everything else is str(v)."""
+    if v is None:
+        return "None"
+    if isinstance(v, bool):
+        return "True" if v else "False"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v == 0:
+            return "0"
+        absv = abs(v)
+        if absv < 1e-3 or absv >= 1e5:
+            return f"{v:.1e}"
+        return f"{v:g}"
+    return str(v)
+
+
 def build_header(ctx: dict) -> list[str]:
     lines: list[str] = []
     lines.append(f"# Sweep Analysis: `{ctx.get('group')}`")
@@ -100,22 +121,78 @@ def build_experiment_section(ctx: dict) -> list[str]:
 def build_results_section(metrics_doc: dict) -> list[str]:
     lines: list[str] = ["## Results", ""]
     summary = metrics_doc.get("metrics_summary") or {}
-    best = summary.get("overall_best_mase") or {}
-    lines.append(
-        f"**Overall best MASE**: {_fmt_float(best.get('best_mase'))} "
-        f"(LC weight = {_fmt(best.get('lc_weight'), '.1e')}, "
-        f"obs_noise_scale = {_fmt_float(best.get('obs_noise_scale'), 2)})"
+    swept_paths: list[str] = summary.get("swept_paths") or []
+    # Featured run: the one selected by the ranking criterion
+    # (`overall_chosen_run`, added in metrics schema v2). Fall back to the
+    # legacy best-by-MASE entry for older metrics files.
+    chosen = (
+        summary.get("overall_chosen_run")
+        or summary.get("overall_best_mase")
+        or {}
     )
+
+    # Axes-swept summary line (helps readers see the design of the sweep at a
+    # glance, independent of which specific run was picked).
+    if swept_paths:
+        lines.append(f"**Swept axes** ({len(swept_paths)}): "
+                     + ", ".join(f"`{p}`" for p in swept_paths))
+        lines.append("")
+
+    # Chosen-run summary — includes its values on every swept axis.
+    chosen_cfg = chosen.get("swept_config") or {}
+    chosen_axis_frag = ""
+    if chosen_cfg:
+        chosen_axis_frag = " · ".join(
+            f"`{p}`={_fmt_swept_value(chosen_cfg.get(p))}" for p in swept_paths
+        )
     lines.append(
-        f"**Overall best traj loss**: {_fmt_float(best.get('best_traj_loss'), 5)} "
-        f"at epoch {best.get('best_traj_loss_epoch')}"
+        f"**Chosen run** (by `best_traj_loss`): "
+        f"`{chosen.get('run_id', '—')}` — "
+        f"traj_loss={_fmt_float(chosen.get('best_traj_loss'), 5)}, "
+        f"MASE={_fmt_float(chosen.get('best_mase'))}, "
+        f"R²={_fmt_float(chosen.get('r2_at_best_tl'))}, "
+        f"LC loss={_fmt_float(chosen.get('lc_loss_at_best_tl'), 3)}, "
+        f"epoch={chosen.get('best_traj_loss_epoch')}"
     )
+    if chosen_axis_frag:
+        lines.append("")
+        lines.append(f"Swept-axis values at chosen run: {chosen_axis_frag}")
+    lines.append("")
     lines.append(f"**Runs analyzed**: {summary.get('n_runs')}")
     lines.append("")
 
-    # Best per obs_noise_scale table
+    # Per-run table with dynamic columns for every swept axis. Sorted by
+    # traj_loss ascending (best first) so readers can eyeball the ranking.
+    per_run: list[dict] = summary.get("per_run") or []
+    if per_run:
+        lines.append("### Per-run results")
+        lines.append("")
+        header_cols = ["run_id"] + [f"`{p}`" for p in swept_paths] + [
+            "best_traj_loss", "best_MASE", "R²", "LC loss", "epoch",
+        ]
+        lines.append("| " + " | ".join(header_cols) + " |")
+        lines.append("|" + "|".join(["---"] * len(header_cols)) + "|")
+        sorted_rows = sorted(
+            per_run,
+            key=lambda r: r.get("best_traj_loss") if r.get("best_traj_loss") is not None else float("inf"),
+        )
+        for r in sorted_rows:
+            cfg = r.get("swept_config") or {}
+            cells = [f"`{r.get('run_id', '—')}`"]
+            cells.extend(_fmt_swept_value(cfg.get(p)) for p in swept_paths)
+            cells.append(_fmt_float(r.get("best_traj_loss"), 5))
+            cells.append(_fmt_float(r.get("best_mase")))
+            cells.append(_fmt_float(r.get("r2_at_best_tl")))
+            cells.append(_fmt_float(r.get("lc_loss_at_best_tl"), 3))
+            cells.append(str(r.get("best_traj_loss_epoch") or "—"))
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+    # Best per obs_noise_scale table — retained for back-compat with the
+    # obs_noise joint sweeps where obs_noise_scale is itself an axis. Skipped
+    # when there's only one value (redundant with the Chosen Run summary).
     by_ons = summary.get("best_by_obs_noise_scale") or {}
-    if by_ons:
+    if len(by_ons) > 1:
         lines.append("### Best run per `obs_noise_scale`")
         lines.append("")
         lines.append("| obs_noise_scale | Best LC weight | Best traj loss | MASE at best | R² | LC loss | epoch |")
@@ -167,13 +244,17 @@ def build_figures_section(metrics_doc: dict, analysis_dir: Path) -> list[str]:
     # then Lyapunov plots. Unknown names go last in whatever order.
     preferred = [
         "sweep_overview", "sweep_pareto",
+        "reconstruction",
         "prediction_windows", "prediction_detail", "long_trajectory",
         "mase",
-        "lyapunov", "lyapunov_top10",
+        "latent_utilization",
+        "lyapunov", "lyapunov_top10", "kaplan_yorke",
         "per_run_lyapunov",
         "per_run_lyapunov_vs_true",
         "per_run_lyapunov_relerr",
         "lyapunov_spectrum_mse_vs_val_loss",
+        "encoder_decoder_jacobians",
+        "amplification",
     ]
     seen = set()
     ordered = []

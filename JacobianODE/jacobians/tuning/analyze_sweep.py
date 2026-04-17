@@ -73,19 +73,76 @@ def iso_now() -> str:
     )
 
 
+_SWEPT_PATH_EXCLUDES_PREFIX = ("hydra.", "_wandb")
+_SWEPT_PATH_EXCLUDES_EXACT = {
+    "wandb_entity",
+    "wandb_project",
+    "wandb_group",
+    "wandb_id",
+    "wandb_name",
+    # Paths that trivially vary across runs but aren't scientifically swept.
+    "training.logger.save_dir",
+    "training.logger_save_dirs",
+}
+
+
+def _flatten_config(obj: Any, prefix: str = "") -> dict[str, Any]:
+    """Flatten a nested dict into dotted-path keys.
+
+    Non-dict values are recorded as-is. Lists are treated as leaves
+    (we don't index into them, since list-position doesn't correspond to
+    a Hydra override path)."""
+    out: dict[str, Any] = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                out.update(_flatten_config(v, path))
+            else:
+                out[path] = v
+    return out
+
+
+def _discover_swept_paths(configs: list[dict[str, Any]]) -> list[str]:
+    """Return the sorted list of flattened config paths whose value varies
+    across ``configs`` (more than one distinct stringified value)."""
+    if len(configs) < 2:
+        return []
+    flat = [_flatten_config(c) for c in configs]
+    all_paths = set().union(*flat) if flat else set()
+    varying: list[str] = []
+    for p in all_paths:
+        if any(p.startswith(pre) for pre in _SWEPT_PATH_EXCLUDES_PREFIX):
+            continue
+        if p in _SWEPT_PATH_EXCLUDES_EXACT:
+            continue
+        vals = {repr(f.get(p)) for f in flat}
+        if len(vals) > 1:
+            varying.append(p)
+    return sorted(varying)
+
+
 def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str) -> dict:
     """Pull per-run best metrics from wandb and group them by obs_noise_scale.
 
     Returns a dict of:
         {
-            "per_run": [{lc_weight, obs_noise_scale, best_traj_loss, best_mase, ...}],
-            "best_by_obs_noise_scale": {ons: {lc_weight, best_traj_loss, best_mase, ...}},
-            "overall_best_mase": {run_id, lc_weight, obs_noise_scale, best_mase, ...},
+            "per_run": [{run_id, lc_weight, obs_noise_scale, best_traj_loss,
+                         best_mase, swept_config: {path: value}, ...}],
+            "best_by_obs_noise_scale": {ons: {...}},
+            "overall_chosen_run": {run_id, ..., swept_config},  # by best_traj_loss
+            "overall_best_mase": {...},                          # legacy, by best_mase
+            "swept_paths": [path, ...],
         }
     """
     import wandb
     api = wandb.Api()
     runs = list(api.runs(f"{wandb_entity}/{wandb_project}", filters={"group": group}))
+    # Capture every run's config (keyed by run.id) up front so we can discover
+    # which paths actually vary across the sweep. The discovered list drives
+    # the per-run `swept_config` column set below.
+    configs_by_rid: dict[str, dict[str, Any]] = {r.id: dict(r.config) for r in runs}
+    swept_paths = _discover_swept_paths(list(configs_by_rid.values()))
     per_run: list[dict[str, Any]] = []
     # Columns we want; handle both latent-model and vanilla-model key naming.
     cols = [
@@ -145,6 +202,8 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
             min(rows_with_mase, key=lambda d: d["mase"])
             if rows_with_mase else best_by_tl
         )
+        flat_cfg = _flatten_config(cfg)
+        swept_config = {p: flat_cfg.get(p) for p in swept_paths}
         per_run.append({
             "run_id": r.id,
             "state": r.state,
@@ -157,6 +216,8 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
             "lc_loss_at_best_tl": best_by_tl["lc_loss"],
             "r2_at_best_tl": best_by_tl["r2"],
             "n_epochs": len(rows),
+            # All swept axes, so the report can show *which* config a row is.
+            "swept_config": swept_config,
         })
 
     # Group best per obs_noise_scale
@@ -171,7 +232,17 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
         best = min(rows_with_tl, key=lambda r: r["best_traj_loss"])
         best_by_ons[str(ons)] = best
 
-    overall_best = min(
+    # `overall_chosen_run` matches the ranking criterion used by
+    # `run_analytics` (best_traj_loss among survivors). This is the run whose
+    # checkpoint gets loaded for the deep analysis and whose figures end up in
+    # the report — so it's what the Results section should feature.
+    # `overall_best_mase` is retained for back-compat (older consumers).
+    overall_chosen = min(
+        (r for r in per_run if r["best_traj_loss"] is not None),
+        key=lambda r: r["best_traj_loss"],
+        default=None,
+    )
+    overall_best_mase = min(
         (r for r in per_run if r["best_mase"] is not None),
         key=lambda r: r["best_mase"],
         default=None,
@@ -179,7 +250,9 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
     return {
         "per_run": per_run,
         "best_by_obs_noise_scale": best_by_ons,
-        "overall_best_mase": overall_best,
+        "overall_chosen_run": overall_chosen,
+        "overall_best_mase": overall_best_mase,
+        "swept_paths": swept_paths,
         "n_runs": len(per_run),
     }
 
@@ -291,9 +364,16 @@ def evaluate_success_criteria(criteria: list[str], metrics_summary: dict) -> lis
     """
     import re
 
-    best_mase = (metrics_summary.get("overall_best_mase") or {}).get("best_mase")
-    best_lc_loss = (metrics_summary.get("overall_best_mase") or {}).get("lc_loss_at_best_tl")
-    best_r2 = (metrics_summary.get("overall_best_mase") or {}).get("r2_at_best_tl")
+    # Prefer the run chosen by the ranking criterion (best_traj_loss); fall
+    # back to the legacy best-by-MASE entry for pre-schema-2 metrics files.
+    featured = (
+        metrics_summary.get("overall_chosen_run")
+        or metrics_summary.get("overall_best_mase")
+        or {}
+    )
+    best_mase = featured.get("best_mase")
+    best_lc_loss = featured.get("lc_loss_at_best_tl")
+    best_r2 = featured.get("r2_at_best_tl")
 
     verdicts = []
     for c in criteria:
@@ -1014,7 +1094,9 @@ def analyze(
         logger.exception("per-run Lyapunov computation raised")
 
     metrics_doc = {
-        "schema_version": 1,
+        # v2 adds: metrics_summary.swept_paths, metrics_summary.overall_chosen_run,
+        # and per_run[*].swept_config (see summarize_sweep_from_wandb).
+        "schema_version": 2,
         "group": group,
         "analyzed_at": iso_now(),
         "metrics_summary": metrics_summary,
