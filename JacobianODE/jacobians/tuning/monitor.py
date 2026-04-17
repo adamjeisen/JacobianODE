@@ -412,14 +412,33 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             if jid in slurm_states:
                 entry["last_slurm_state"] = slurm_states[jid]
 
-    # Resubmit anything currently marked failed_retrying and not already queued
+    # Resubmit anything currently marked failed_retrying and not already queued.
+    # Two must-skip conditions:
+    #   (1) a prior retry (tracked in slurm_job_ids) is still queued/running
+    #   (2) the ORIGINAL jsweep array task is still alive — for partitions with
+    #       PreemptMode=REQUEUE (e.g. ou_bcs_low), a brief "crashed" wandb
+    #       window during a preempt can trip classify_wandb_run into failed,
+    #       but SLURM is about to requeue the task and training will continue.
+    #       Double-scheduling there produces orphan retries that then all
+    #       compete for the run_idx.
+    slurm_arrays = expected.get("slurm_arrays") or {}
+    array_alive_states = ("PENDING", "RUNNING", "CONFIGURING", "REQUEUED", "SUSPENDED")
     for k, entry in state["runs"].items():
         if entry["classification"] != "failed_retrying":
             continue
-        # Skip if a prior attempt is still queued/running
         if any(slurm_states.get(jid) in ("PENDING", "RUNNING", "CONFIGURING")
                for jid in entry["slurm_job_ids"]):
             continue
+        # Check the original array task's liveness (array_id + "_" + run_idx).
+        array_id = slurm_arrays.get(k)
+        if array_id:
+            orig_task = f"{array_id}_{k}"
+            if slurm_states.get(orig_task) in array_alive_states:
+                logger.info(
+                    f"{expected['wandb']['group']}/run_idx={k}: original SLURM "
+                    f"task {orig_task} still alive — skipping monitor retry"
+                )
+                continue
         new_jid = resubmit_run(expected, int(k), sweeps_dir)
         if new_jid:
             entry["slurm_job_ids"].append(new_jid)

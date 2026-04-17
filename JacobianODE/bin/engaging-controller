@@ -311,6 +311,14 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
         merged_meta.update(expected.get("experiment_metadata") or {})
         if merged_meta:
             merged["experiment_metadata"] = merged_meta
+        # Record the array id of this SUBMISSION so monitor can check the
+        # original array task's liveness before triggering a retry (prevents
+        # monitor from double-scheduling while SLURM REQUEUE is still
+        # in-flight). Per-run offset: next_idx .. len-1 belong to this submit.
+        slurm_arrays = dict(old.get("slurm_arrays") or {})
+        for r in appended:
+            slurm_arrays[str(r["run_idx"])] = array_id
+        merged["slurm_arrays"] = slurm_arrays
         final_expected.write_text(json.dumps(merged, indent=2) + "\n")
         expected_path.unlink(missing_ok=True)
         log(
@@ -319,6 +327,13 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
         )
         expected_run_count = batch_count
     else:
+        # Stamp the array id on each run_idx before moving into place.
+        fresh = json.loads(expected_path.read_text())
+        fresh["slurm_arrays"] = {
+            str(r["run_idx"]): array_id
+            for r in fresh["hydra"]["resolved_runs"]
+        }
+        expected_path.write_text(json.dumps(fresh, indent=2) + "\n")
         shutil.move(str(expected_path), str(final_expected))
         expected_run_count = batch_count
 
