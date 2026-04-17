@@ -716,8 +716,12 @@ def _get_squeue_info() -> tuple[dict[str, dict], dict[str, dict]]:
     """
     try:
         out = run(
+            # %200i widens the JOBID column so SLURM doesn't truncate the
+            # array bracket spec — without this, a long pending range like
+            # ``[2-3,9-10,12-22,24,30-39]`` arrives as ``[2-3,9-10,12-22,24,30-``
+            # with no closing ``]``, breaking the count parser downstream.
             ["squeue", "-u", os.environ.get("USER", "eisenaj"),
-             "-h", "-o", "%i %j %T"],
+             "-h", "-o", "%200i %j %T"],
             check=False,
         ).stdout
     except FileNotFoundError:
