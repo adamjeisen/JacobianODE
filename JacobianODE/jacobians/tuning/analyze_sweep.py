@@ -420,13 +420,30 @@ def compute_per_run_lyapunov(
     figures_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # List the group's runs (in wandb order)
+    # List the group's runs (in wandb order). We used to filter on
+    # state="finished" but that misses runs still actively training (state
+    # "running") or preempt-crashed but with saved checkpoints (state
+    # "crashed"). Drop the state filter and rely on a checkpoint-dir
+    # existence check: if {save_dir}/{project}/{run_id}/checkpoints is
+    # present, we have enough to compute a Lyapunov spectrum from the
+    # best-by-metric checkpoint, regardless of whether the run has
+    # formally finished yet.
     api = _wandb.Api()
-    all_runs = list(api.runs(
+    raw_runs = list(api.runs(
         f"{wandb_entity}/{wandb_project}",
-        filters={"group": group, "state": "finished"},
+        filters={"group": group},
     ))
-    logger.info(f"Computing per-run Lyapunov for {len(all_runs)} finished runs")
+    ckpt_base = Path(save_dir) / wandb_project
+    all_runs = [
+        r for r in raw_runs
+        if (ckpt_base / r.id / "checkpoints").is_dir()
+    ]
+    dropped = len(raw_runs) - len(all_runs)
+    logger.info(
+        f"Computing per-run Lyapunov for {len(all_runs)} runs with checkpoints "
+        f"({dropped} run(s) skipped for missing checkpoint dir) — states: "
+        + ", ".join(sorted({r.state for r in all_runs}))
+    )
 
     # Cache the test trajectories across runs — only the FIRST load_run call
     # actually generates them; subsequent calls pass generate_data=False.
