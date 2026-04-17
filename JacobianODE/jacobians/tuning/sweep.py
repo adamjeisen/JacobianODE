@@ -738,6 +738,30 @@ def select_best_from_sweep(
         use_all_runs=use_all_runs,
     )
 
+    # Defensive filter: drop runs whose checkpoint dir doesn't exist on disk.
+    # This happens when a wandb run ends up state="finished" via the atexit
+    # handler despite crashing before any epoch-end checkpoint was saved
+    # (e.g. preempt within seconds of start). Keeping those in the discovered
+    # set lets ranking pick a dead run and then load_checkpoint() explodes
+    # with FileNotFoundError, killing the whole analytics pipeline.
+    from pathlib import Path as _Path
+    _ckpt_base = _Path(save_dir) / wandb_project
+    kept = [(r, l, t, k) for r, l, t, k in zip(
+        discovered.run_ids, discovered.lambdas,
+        discovered.te_weights, discovered.kd_weights,
+    ) if (_ckpt_base / r / "checkpoints").is_dir()]
+    dropped = [r for r in discovered.run_ids
+               if not (_ckpt_base / r / "checkpoints").is_dir()]
+    if dropped and verbose:
+        print(f"  Dropping {len(dropped)} run(s) with no checkpoint dir: {dropped}")
+    if kept:
+        discovered = DiscoveredSweep(
+            run_ids=[k[0] for k in kept],
+            lambdas=[k[1] for k in kept],
+            te_weights=[k[2] for k in kept],
+            kd_weights=[k[3] for k in kept],
+        )
+
     if not discovered.run_ids:
         group_msg = f" group={wandb_group}" if wandb_group else ""
         raise RuntimeError(
