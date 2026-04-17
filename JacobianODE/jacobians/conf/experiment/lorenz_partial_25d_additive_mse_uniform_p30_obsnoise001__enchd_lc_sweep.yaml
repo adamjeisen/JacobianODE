@@ -1,0 +1,79 @@
+# @package _global_
+#
+# Same base as lorenz_partial_25d_additive_mse_uniform_p30 with obs_noise=0.01.
+# Crosses encoder MLP hidden_dim (per-coupling-layer width) with the standard
+# loop_closure_weight grid to test whether encoder capacity is a bottleneck
+# for the diffeomorphism to the 3-D dyn latent.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Same base as lorenz_partial_25d_additive_mse_uniform_p30 with
+    obs_noise=0.01. Sweeps model.encoder.hidden_dim over
+    {32, 64, 128, 256, 512} × the standard 9-value loop_closure_weight
+    grid (2-D sweep, 45 runs).
+  hypothesis: |
+    The encoder's per-coupling-layer MLP width (default 128) may be
+    capacity-limited in expressing the diffeomorphism between the 25-D
+    delay-embedded obs and the 3-D dyn latent subspace. If so, larger
+    hidden_dim should improve reconstruction, dyn-only cycle
+    consistency, and λ_min accuracy up to some plateau; smaller
+    hidden_dim (32, 64) should underfit and produce looser
+    diffeomorphisms. If capacity is not the bottleneck, results should
+    be flat across hidden_dim.
+  success_criteria:
+    - "Val traj_loss non-increasing from hidden_dim=32 up to some plateau"
+    - "λ_min accuracy (vs empirical ~-13.9) improves monotonically with hidden_dim up to the same plateau"
+    - "Best LC location is roughly stable across hidden_dim (no capacity × LC reversal)"
+
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+  model.encoder.hidden_dim: "32,64,128,256,512"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_N25_D1_NormTrue_T3__JacobianODE"
+wandb_group: "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__enchd_lc_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 25
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 0.1              # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20

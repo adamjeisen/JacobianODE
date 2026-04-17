@@ -1,0 +1,88 @@
+# @package _global_
+#
+# Same base as lorenz_partial_25d_additive_mse_uniform_p30 with obs_noise=0.01
+# and model.use_vae: true. Crosses kl_dyn_weight and the null-coupling toggle
+# (kl_null_weight ∈ {null → coupled to dyn, 0 → disabled}) with the standard
+# loop_closure_weight grid.
+#
+# NOTE: kl_dyn_weight requires use_vae=True to have any effect
+# (see latent_jacobian.py:1279-1282: kl_dyn_loss is forced to 0 when
+# use_vae is False).
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Same base as lorenz_partial_25d_additive_mse_uniform_p30 with
+    obs_noise=0.01 and model.use_vae=true. Sweeps kl_dyn_weight over
+    {1e-4, 1e-3, 1e-2, 1e-1} × kl_null_weight over {null (= coupled to
+    dyn), 0} × the standard 9-value loop_closure_weight grid (3-D
+    sweep, 72 runs).
+  hypothesis: |
+    Open question whether adding VAE-style stochasticity to the dyn
+    latent (regularized by kl_dyn_weight) improves Lyapunov-spectrum
+    estimation — in particular, whether posterior noise on z_dyn acts
+    as a helpful implicit ensemble average that stabilizes stable-
+    direction contraction rate estimates, or instead destabilizes
+    training through interaction with LPL (known LPL × LC sensitivity
+    from prior runs) and loop closure.
+    The null toggle (kl_null=coupled vs 0) separately tests whether
+    pulling z_null toward zero adds signal on top of dyn regularization
+    or is redundant once the dyn posterior is constrained.
+  success_criteria:
+    - "At some kl_dyn setting, λ_min accuracy improves vs the kl_dyn → 0 limit (or equivalently the existing obsnoise001 baseline)"
+    - "Trajectory loss and loop closure don't catastrophically diverge at any kl_dyn × LC cell (beyond the already-known LC=1,10 explosion)"
+    - "Detectable, interpretable difference between kl_null=coupled and kl_null=0 (e.g., in null-space RMS or in λ accuracy)"
+
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+  model.kl_dyn_weight: "1e-4,1e-3,1e-2,1e-1"
+  model.kl_null_weight: "null,0"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_N25_D1_NormTrue_T3__JacobianODE"
+wandb_group: "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__vae_kl_lc_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 25
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3
+  prediction_steps: 30
+  use_vae: true
+  kl_null_weight: 0.0                     # overridden by sweep_grid
+  kl_dyn_weight: 0.0                      # overridden by sweep_grid
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 0.1              # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
