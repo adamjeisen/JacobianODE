@@ -1,0 +1,72 @@
+# @package _global_
+#
+# Single-run companion of lorenz_partial_100d_7lat_additive_mse_p30 at
+# loop_closure_weight=1e-3 and obs_noise=0.01. The corresponding slot
+# (run_idx=4) of the original lc_sweep on ou_bcs_low was
+# failed_exhausted after three preempt-crashed attempts (before the
+# config.update / monitor-double-schedule fixes). Running it alone here
+# fills the missing LC value for the sweep analysis.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Single loop_closure_weight=1e-3 run of
+    lorenz_partial_100d_7lat_additive_mse_p30 with obs_noise=0.01.
+    Fills the run_idx=4 gap in the existing obsnoise001 sweep which
+    was failed_exhausted under the previous monitor/resume bugs.
+  hypothesis: |
+    Should produce results comparable to the neighbouring runs in the
+    original sweep (lc=1e-4 and lc=1e-2). Completes the LC curve.
+  success_criteria:
+    - "Training completes without preempt-cascade"
+    - "Resulting λ₁, λ₂, λ₃ in the same ballpark as neighbouring LC slots"
+
+sweep_grid: {}
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_N100_D1_NormTrue_T7__JacobianODE"
+wandb_group: "lorenz_partial_100d_7lat_additive_mse_p30_obsnoise001_lc1em3"
+
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 100
+      delay_spacing: 1
+
+model:
+  n_target_dims: 7
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 1e-3
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'most_recent'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
