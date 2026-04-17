@@ -483,6 +483,20 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
                 "terminal": False,
             }
 
+    # Prune any state entries whose run_idx was removed from expected.json
+    # (happens when a sweep is trimmed mid-flight — e.g. cancelling a subset
+    # of the grid). Without this, the summary keeps counting ghost runs and
+    # the dashboard disagrees with reality.
+    expected_keys = {str(r["run_idx"]) for r in resolved}
+    stale_keys = [k for k in state["runs"] if k not in expected_keys]
+    for k in stale_keys:
+        state["runs"].pop(k)
+    if stale_keys:
+        logger.info(
+            f"{group}: pruned {len(stale_keys)} stale run_idx entries "
+            f"no longer in expected.json: {stale_keys}"
+        )
+
     try:
         wandb_runs = query_wandb_runs(
             expected["wandb"]["entity"],
