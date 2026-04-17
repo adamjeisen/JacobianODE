@@ -141,6 +141,29 @@ The `latent_criterion` (for latent prediction loss) can use a separate denom
 via `gen_variance_mode=adaptive_latent`, which recomputes `det(Cov(z_dyn))^(1/D)`
 at the start of each epoch from 50 batches.
 
+### One-off diagnostic figures (shareable via web)
+
+The `jacobian-reports` repo is published at `adamjeisen.com/jacobian-reports/`
+(GitHub Pages). To share a one-off diagnostic figure — e.g. for remote viewing
+or to link into a conversation — drop the image into
+`~/Documents/jacobian-analyses/diagnostics/`, commit, and push:
+
+```
+cp figure.png ~/Documents/jacobian-analyses/diagnostics/<name>_<run_id>.png
+cd ~/Documents/jacobian-analyses
+git add diagnostics/<name>_<run_id>.png
+git commit -m "diagnostics: <short description> — run <run_id>"
+git push
+```
+
+The file is then accessible at
+`https://adamjeisen.com/jacobian-reports/diagnostics/<name>_<run_id>.png`.
+
+Pushing: the engaging-controller / jacobian-discuss cron jobs push to this repo
+frequently, so a `git pull --rebase` is usually needed before `git push`. If SSH
+push fails (no agent), use `gh`'s HTTPS credentials:
+`git -c credential.helper='!gh auth git-credential' push https://github.com/adamjeisen/jacobian-reports.git HEAD:main`.
+
 ## Jupyter Notebooks
 
 Never use the default notebook read/edit/grep tools. Never try to read the raw `.ipynb`
