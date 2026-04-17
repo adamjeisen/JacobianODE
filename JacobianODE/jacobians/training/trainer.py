@@ -194,10 +194,18 @@ def train_model(
         except Exception as e:
             logger.warning(f"[resume] Could not persist wandb run id: {e}")
 
-    # Only update the logger config in the main process (rank 0)
+    # Only update the logger config in the main process (rank 0).
+    # allow_val_change=True is required when resuming a wandb run because
+    # config.update() otherwise rejects any diff between the existing config
+    # (from the original start) and the re-serialized config — including
+    # spurious float-precision differences like sigma=13.26897638365872 vs
+    # 13.268976383658721 that arise from OmegaConf re-resolution. Without
+    # this, preempt→requeue crashed the training script on restart and
+    # killed the entire sweep's ability to benefit from REQUEUE.
     if os.getenv("LOCAL_RANK") == "0" or os.getenv("LOCAL_RANK") is None:
         experiment_logger.experiment.config.update(
-            OmegaConf.to_container(cfg, resolve=True)
+            OmegaConf.to_container(cfg, resolve=True),
+            allow_val_change=True,
         )
 
     # Set up callbacks — "best" checkpoints track top-k by metric as before;
