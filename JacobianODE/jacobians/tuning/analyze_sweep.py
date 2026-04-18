@@ -122,20 +122,46 @@ def _discover_swept_paths(configs: list[dict[str, Any]]) -> list[str]:
     return sorted(varying)
 
 
-def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str) -> dict:
+def summarize_sweep_from_wandb(
+    wandb_entity: str,
+    wandb_project: str,
+    group: str,
+    resolved_runs: list | None = None,
+) -> dict:
     """Pull per-run best metrics from wandb and group them by obs_noise_scale.
+
+    When ``resolved_runs`` is supplied (from the sentinel's
+    ``expected.hydra.resolved_runs``), every wandb run in the group is
+    matched to a ``run_idx`` via ``match_run_to_idx`` and the best wandb
+    run per slot is kept in ``per_run``. Wandb runs that don't match any
+    slot are surfaced in ``unmatched_runs`` (never silently dropped), and
+    slots that had ``>1`` matching wandb run are surfaced in
+    ``duplicate_matches`` with the chosen run_id and the other candidate
+    IDs. An ``expected_run_count`` sanity check is also recorded so a
+    deviation from the sentinel's count shows up loudly in the report.
+
+    When ``resolved_runs`` is None, the legacy behavior applies: every
+    wandb run becomes one ``per_run`` row (good for back-compat with
+    notebooks / direct calls).
 
     Returns a dict of:
         {
-            "per_run": [{run_id, lc_weight, obs_noise_scale, best_traj_loss,
-                         best_mase, swept_config: {path: value}, ...}],
+            "per_run": [{run_id, run_idx, lc_weight, obs_noise_scale,
+                         best_traj_loss, best_mase,
+                         swept_config: {path: value}, ...}],
+            "unmatched_runs": [{run_id, ...}, ...],       # new
+            "duplicate_matches": [{run_idx, chosen, others: [...]}],  # new
+            "expected_run_count": int | None,             # new
+            "matched_run_count": int,                     # new
             "best_by_obs_noise_scale": {ons: {...}},
-            "overall_chosen_run": {run_id, ..., swept_config},  # by best_traj_loss
-            "overall_best_mase": {...},                          # legacy, by best_mase
+            "overall_chosen_run": {run_id, ..., swept_config},
+            "overall_best_mase": {...},
             "swept_paths": [path, ...],
         }
     """
     import wandb
+    from .monitor import match_run_to_idx
+
     api = wandb.Api()
     runs = list(api.runs(f"{wandb_entity}/{wandb_project}", filters={"group": group}))
     # Capture every run's config (keyed by run.id) up front so we can discover
@@ -143,7 +169,8 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
     # the per-run `swept_config` column set below.
     configs_by_rid: dict[str, dict[str, Any]] = {r.id: dict(r.config) for r in runs}
     swept_paths = _discover_swept_paths(list(configs_by_rid.values()))
-    per_run: list[dict[str, Any]] = []
+    # Assemble one row per wandb run first, then fold down per run_idx.
+    all_rows: list[dict[str, Any]] = []
     # Columns we want; handle both latent-model and vanilla-model key naming.
     cols = [
         "epoch",
@@ -204,8 +231,14 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
         )
         flat_cfg = _flatten_config(cfg)
         swept_config = {p: flat_cfg.get(p) for p in swept_paths}
-        per_run.append({
+        # Match to a run_idx using the sweep's declared overrides. Only
+        # meaningful when resolved_runs is passed in; None otherwise.
+        run_idx = (
+            match_run_to_idx(cfg, resolved_runs) if resolved_runs else None
+        )
+        all_rows.append({
             "run_id": r.id,
+            "run_idx": run_idx,
             "state": r.state,
             "lc_weight": _to_float_or_none(lc),
             "obs_noise_scale": _to_float_or_none(ons),
@@ -219,6 +252,72 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
             # All swept axes, so the report can show *which* config a row is.
             "swept_config": swept_config,
         })
+
+    # -------------------------------------------------------------
+    # Fold wandb runs down to one entry per run_idx.
+    # Safeguard 1: unmatched wandb runs go to ``unmatched_runs`` —
+    #              never silently dropped.
+    # Safeguard 2: when >1 wandb run matches a slot, log both IDs and
+    #              which was chosen (by best_traj_loss) in
+    #              ``duplicate_matches``.
+    # Safeguard 3: record ``expected_run_count`` and
+    #              ``matched_run_count`` for a loud render-time warning
+    #              when they don't agree.
+    # When resolved_runs is None (legacy callers), skip the fold-down:
+    # per_run stays as "one row per wandb run" for back-compat.
+    # -------------------------------------------------------------
+    unmatched_runs: list[dict[str, Any]] = []
+    duplicate_matches: list[dict[str, Any]] = []
+    expected_count: int | None = (
+        len(resolved_runs) if resolved_runs is not None else None
+    )
+
+    if resolved_runs is None:
+        per_run = all_rows
+    else:
+        by_idx: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in all_rows:
+            if row["run_idx"] is None:
+                unmatched_runs.append(row)
+            else:
+                by_idx[row["run_idx"]].append(row)
+
+        per_run = []
+        for idx, rows in sorted(by_idx.items()):
+            rows_with_tl = [r for r in rows if r["best_traj_loss"] is not None]
+            if not rows_with_tl:
+                # Treat fully-empty slots (e.g. wandb runs that matched but
+                # have no val data) the same way as unmatched — keep them
+                # visible rather than silently dropping.
+                unmatched_runs.extend(rows)
+                continue
+            chosen = min(rows_with_tl, key=lambda r: r["best_traj_loss"])
+            per_run.append(chosen)
+            if len(rows) > 1:
+                others = [r for r in rows if r["run_id"] != chosen["run_id"]]
+                duplicate_matches.append({
+                    "run_idx": idx,
+                    "chosen_run_id": chosen["run_id"],
+                    "other_run_ids": [r["run_id"] for r in others],
+                    "n_candidates": len(rows),
+                })
+                logger.warning(
+                    f"run_idx={idx}: {len(rows)} wandb runs matched "
+                    f"(chose {chosen['run_id']} by best_traj_loss; "
+                    f"dropped {[r['run_id'] for r in others]})"
+                )
+        if unmatched_runs:
+            logger.warning(
+                f"{len(unmatched_runs)} wandb runs did not match any run_idx "
+                f"and are surfaced in metrics_summary.unmatched_runs "
+                f"(IDs: {[r['run_id'] for r in unmatched_runs]})"
+            )
+        if expected_count is not None and len(per_run) != expected_count:
+            logger.warning(
+                f"matched_run_count ({len(per_run)}) != expected_run_count "
+                f"({expected_count}) for group {group}; some slots may be "
+                f"missing or the sweep is still in progress."
+            )
 
     # Group best per obs_noise_scale
     by_ons: dict[Any, list[dict]] = defaultdict(list)
@@ -249,6 +348,10 @@ def summarize_sweep_from_wandb(wandb_entity: str, wandb_project: str, group: str
     )
     return {
         "per_run": per_run,
+        "unmatched_runs": unmatched_runs,
+        "duplicate_matches": duplicate_matches,
+        "expected_run_count": expected_count,
+        "matched_run_count": len(per_run),
         "best_by_obs_noise_scale": best_by_ons,
         "overall_chosen_run": overall_chosen,
         "overall_best_mase": overall_best_mase,
@@ -1025,7 +1128,15 @@ def analyze(
     write_context(sentinel, output_dir)
 
     # Pull per-run metrics straight from wandb (cheap, no model load).
-    metrics_summary = summarize_sweep_from_wandb(wandb_entity, wandb_project, group)
+    # Pass the sentinel's resolved_runs so we can match wandb runs back to
+    # expected run_idx slots and (a) dedupe retries + orphans per slot,
+    # (b) surface anything that fails to match in ``unmatched_runs``.
+    resolved_runs = (
+        sentinel.get("expected_snapshot", {}).get("hydra", {}).get("resolved_runs", [])
+    )
+    metrics_summary = summarize_sweep_from_wandb(
+        wandb_entity, wandb_project, group, resolved_runs=resolved_runs,
+    )
 
     # Evaluate success criteria using the compact metrics summary.
     criteria = (
@@ -1096,7 +1207,10 @@ def analyze(
     metrics_doc = {
         # v2 adds: metrics_summary.swept_paths, metrics_summary.overall_chosen_run,
         # and per_run[*].swept_config (see summarize_sweep_from_wandb).
-        "schema_version": 2,
+        # v3 adds: per_run is now one entry per run_idx (best by best_traj_loss);
+        # metrics_summary.unmatched_runs, duplicate_matches, expected_run_count,
+        # matched_run_count. per_run[*].run_idx.
+        "schema_version": 3,
         "group": group,
         "analyzed_at": iso_now(),
         "metrics_summary": metrics_summary,

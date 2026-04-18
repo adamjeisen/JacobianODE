@@ -158,16 +158,69 @@ def build_results_section(metrics_doc: dict) -> list[str]:
         lines.append("")
         lines.append(f"Swept-axis values at chosen run: {chosen_axis_frag}")
     lines.append("")
-    lines.append(f"**Runs analyzed**: {summary.get('n_runs')}")
+
+    # Sanity / integrity box. Surfaces anything that could quietly corrupt
+    # a conclusion: expected vs matched run counts disagreeing, wandb runs
+    # that didn't match any run_idx, and run_idx slots with >1 wandb run
+    # (i.e. preempt retries / orphan duplicates were folded). If none of
+    # these trip, the box is suppressed entirely so clean sweeps stay
+    # clean-looking. Schema v3+.
+    expected_cnt = summary.get("expected_run_count")
+    matched_cnt = summary.get("matched_run_count")
+    unmatched = summary.get("unmatched_runs") or []
+    dupes = summary.get("duplicate_matches") or []
+    integrity_issues = []
+    if (expected_cnt is not None and matched_cnt is not None
+            and expected_cnt != matched_cnt):
+        integrity_issues.append(
+            f"⚠️ **Matched-run count mismatch**: expected {expected_cnt} "
+            f"run_idx slots per the sentinel, matched {matched_cnt} in wandb. "
+            f"The sweep may still be in progress, or some slots failed "
+            f"without producing wandb evidence."
+        )
+    if unmatched:
+        ids = ", ".join(f"`{r.get('run_id', '—')}`" for r in unmatched)
+        integrity_issues.append(
+            f"⚠️ **{len(unmatched)} wandb run(s) did not match any run_idx** "
+            f"(excluded from the per-run table). These are most likely orphans "
+            f"from preempt-cycle retries or rate-limit re-launches. IDs: {ids}."
+        )
+    if dupes:
+        lines_dup = [
+            f"⚠️ **{len(dupes)} run_idx slot(s) had multiple matching wandb "
+            f"runs** — the best by `best_traj_loss` was kept; the others are "
+            f"listed below for audit:"
+        ]
+        for d in dupes:
+            lines_dup.append(
+                f"  - run_idx=**{d['run_idx']}**: chose "
+                f"`{d['chosen_run_id']}`, dropped "
+                + ", ".join(f"`{rid}`" for rid in d.get("other_run_ids", []))
+            )
+        integrity_issues.append("\n".join(lines_dup))
+    if integrity_issues:
+        lines.append("### Integrity checks")
+        lines.append("")
+        for msg in integrity_issues:
+            lines.append(msg)
+            lines.append("")
+
+    lines.append(f"**Runs analyzed**: {summary.get('n_runs')}"
+                 + (f" (expected {expected_cnt})" if expected_cnt is not None else ""))
     lines.append("")
 
     # Per-run table with dynamic columns for every swept axis. Sorted by
     # traj_loss ascending (best first) so readers can eyeball the ranking.
+    # ``run_idx`` (when present from schema v3) is shown alongside run_id
+    # so the slot-to-run mapping is explicit — aids audit when duplicates
+    # / orphans are listed in the integrity checks block above.
     per_run: list[dict] = summary.get("per_run") or []
+    has_run_idx = any(r.get("run_idx") is not None for r in per_run)
     if per_run:
         lines.append("### Per-run results")
         lines.append("")
-        header_cols = ["run_id"] + [f"`{p}`" for p in swept_paths] + [
+        leading = (["run_idx", "run_id"] if has_run_idx else ["run_id"])
+        header_cols = leading + [f"`{p}`" for p in swept_paths] + [
             "best_traj_loss", "best_MASE", "R²", "LC loss", "epoch",
         ]
         lines.append("| " + " | ".join(header_cols) + " |")
@@ -178,7 +231,10 @@ def build_results_section(metrics_doc: dict) -> list[str]:
         )
         for r in sorted_rows:
             cfg = r.get("swept_config") or {}
-            cells = [f"`{r.get('run_id', '—')}`"]
+            cells: list[str] = []
+            if has_run_idx:
+                cells.append(str(r.get("run_idx") if r.get("run_idx") is not None else "—"))
+            cells.append(f"`{r.get('run_id', '—')}`")
             cells.extend(_fmt_swept_value(cfg.get(p)) for p in swept_paths)
             cells.append(_fmt_float(r.get("best_traj_loss"), 5))
             cells.append(_fmt_float(r.get("best_mase")))
