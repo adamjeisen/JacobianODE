@@ -105,11 +105,35 @@ def _flatten_config(obj: Any, prefix: str = "") -> dict[str, Any]:
 
 def _discover_swept_paths(configs: list[dict[str, Any]]) -> list[str]:
     """Return the sorted list of flattened config paths whose value varies
-    across ``configs`` (more than one distinct stringified value)."""
+    across ``configs`` (more than one distinct stringified value).
+
+    Robustness note: an orphan wandb run whose process died mid-init can
+    log an almost-empty config. Naïvely diffing against that run would
+    mark *every* config path as "varying" (present in the healthy runs,
+    absent in the broken one), producing a per-run table with hundreds of
+    spurious columns. We defend against that by dropping configs whose
+    flattened path count is dramatically below the median (<20%) before
+    doing the diff. The broken run still flows through per-run matching
+    and surfaces as ``unmatched_runs``.
+    """
     if len(configs) < 2:
         return []
     flat = [_flatten_config(c) for c in configs]
-    all_paths = set().union(*flat) if flat else set()
+    # Drop degenerate configs before discovering swept axes.
+    sizes = sorted(len(f) for f in flat)
+    median_size = sizes[len(sizes) // 2]
+    threshold = max(1, int(0.2 * median_size))
+    filtered = [f for f in flat if len(f) >= threshold]
+    if len(filtered) < len(flat):
+        logger.warning(
+            f"_discover_swept_paths: dropped "
+            f"{len(flat) - len(filtered)} degenerate config(s) (size < "
+            f"{threshold}; median {median_size}) before diffing."
+        )
+    flat = filtered
+    if len(flat) < 2:
+        return []
+    all_paths = set().union(*flat)
     varying: list[str] = []
     for p in all_paths:
         if any(p.startswith(pre) for pre in _SWEPT_PATH_EXCLUDES_PREFIX):
