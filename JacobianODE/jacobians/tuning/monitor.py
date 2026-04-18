@@ -114,10 +114,18 @@ def query_wandb_runs(entity: str, project: str, group: str):
 
 
 def query_squeue_states(user: str = "eisenaj") -> dict[str, str]:
-    """Return dict of SLURM job_id -> current state string."""
+    """Return dict of SLURM job_id -> current state string.
+
+    ``-r`` (``--array``) expands compressed array specs into per-task rows.
+    Without it, a pending array like ``12172560_[0-8%9]`` is returned as a
+    single key with brackets, and per-task lookups in ``classify_run_idx``
+    (e.g. ``slurm_states.get('12172560_0')``) all miss — which mis-
+    classifies every run_idx as ``pending`` and (pre-ever_alive guard)
+    stampedes ``resubmit_run`` on every subsequent monitor cycle.
+    """
     try:
         output = subprocess.check_output(
-            ["squeue", "-u", user, "-h", "-o", "%i|%T"], text=True,
+            ["squeue", "-u", user, "-r", "-h", "-o", "%i|%T"], text=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return {}
