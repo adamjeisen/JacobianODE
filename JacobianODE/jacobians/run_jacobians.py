@@ -76,6 +76,21 @@ def _run_training(cfg: DictConfig) -> float:
     log = logging.getLogger("JacobianLogger")
     log.info("Starting JacobianODE training")
 
+    # Done-marker short-circuit (full short-circuit, before data loading).
+    # Mirrors the check in train_model — duplicated here so a relaunch of an
+    # already-finished SLURM array slot exits before paying any data /
+    # checkpoint-loading cost. train_model still has the check too as a
+    # defense-in-depth backstop for callers that bypass run_jacobians.
+    from .training.trainer import _resume_state_dir, read_done_marker, DONE_MARKER_NAME
+    _resume_dir = _resume_state_dir(cfg)
+    _prior_id = read_done_marker(_resume_dir)
+    if _prior_id is not None:
+        log.info(
+            f"[resume] {_resume_dir / DONE_MARKER_NAME} present (prior wandb "
+            f"run id={_prior_id!r}); slot already finished. Exiting."
+        )
+        sys.exit(0)
+
     torch.set_float32_matmul_precision("high")
     num_gpus = torch.cuda.device_count()
 

@@ -76,6 +76,40 @@ def _install_walltime_shutdown_handler() -> None:
         logger.debug(f"Could not install SIGUSR2 handler: {e}")
 
 
+DONE_MARKER_NAME = "done.marker"
+
+
+def read_done_marker(resume_dir: Optional[Path]) -> Optional[str]:
+    """If this slot already finished, return the prior wandb id; else None.
+
+    The marker is written by ``train_model`` on a clean trainer.fit() return.
+    SLURM preserves SLURM_ARRAY_JOB_ID/TASK_ID across requeue, so a re-launch
+    of the same array slot lands in the same ``resume_dir`` and sees the
+    marker. We use it to short-circuit the second attempt instead of
+    starting a fresh wandb run / retraining from scratch.
+    """
+    if resume_dir is None:
+        return None
+    marker = resume_dir / DONE_MARKER_NAME
+    if not marker.is_file():
+        return None
+    try:
+        return marker.read_text().strip() or ""
+    except Exception:
+        return ""
+
+
+def _write_done_marker(resume_dir: Path, wandb_run_id: Optional[str]) -> None:
+    """Atomically write the done marker. Best-effort — never raise."""
+    marker = resume_dir / DONE_MARKER_NAME
+    try:
+        tmp = marker.with_suffix(marker.suffix + ".tmp")
+        tmp.write_text(str(wandb_run_id or ""))
+        os.replace(str(tmp), str(marker))
+    except Exception as e:
+        logger.warning(f"[resume] Could not write done marker {marker}: {e}")
+
+
 def _resume_state_dir(cfg: DictConfig) -> Optional[Path]:
     """Deterministic per-job directory for preempt-safe checkpoints.
 
@@ -149,13 +183,30 @@ def train_model(
     name    = name or cfg.get("run_name", None)
 
     # ----------------------------------------------------------------- #
+    # Done-marker short-circuit
+    # ----------------------------------------------------------------- #
+    # If SLURM relaunches an array slot whose previous attempt already
+    # completed cleanly (e.g. preempt-cycle that fired *after* trainer.fit
+    # returned), we don't want to spin up a fresh wandb run and retrain
+    # from scratch. The done marker is written below on a clean fit return,
+    # and contains the prior wandb_run_id for traceability.
+    resume_dir = _resume_state_dir(cfg)
+    prior_id = read_done_marker(resume_dir)
+    if prior_id is not None:
+        logger.info(
+            f"[resume] {resume_dir / DONE_MARKER_NAME} present (prior wandb "
+            f"run id={prior_id!r}); this array slot already finished. "
+            "Exiting without retraining."
+        )
+        sys.exit(0)
+
+    # ----------------------------------------------------------------- #
     # Preempt-safe resume state
     # ----------------------------------------------------------------- #
     # If we've been requeued by SLURM after a preempt, look for the
     # last.ckpt + wandb_run_id saved by the previous attempt and wire
     # them into trainer.fit / WandbLogger so training continues instead
     # of restarting from epoch 0.
-    resume_dir = _resume_state_dir(cfg)
     ckpt_path_resume: Optional[str] = None
     wandb_resume_id: Optional[str] = None
     if resume_dir is not None:
@@ -353,14 +404,30 @@ def train_model(
     )
 
     # trainer.fit returning normally means training finished (early stop or
-    # max_epochs). A SLURM preempt would have SIGTERM'd us before reaching
-    # here, so it's safe to wipe the resume dir — we're done and don't
-    # want stale last.ckpt files lingering on disk.
+    # max_epochs). Drop the heavy artifacts (last.ckpt, anything > 1 KB)
+    # but leave a tiny ``done.marker`` containing the wandb_run_id behind.
+    # If SLURM later requeues this same array slot — which can happen on
+    # preempt-style partitions like ou_bcs_low even after a clean exit —
+    # the next train_model call sees the marker and exits immediately
+    # instead of redoing all the work and creating a duplicate wandb run.
     if resume_dir is not None and resume_dir.is_dir():
+        finished_run_id: Optional[str] = None
         try:
-            shutil.rmtree(str(resume_dir))
-        except Exception as e:
-            logger.warning(f"[resume] Could not clean up {resume_dir}: {e}")
+            finished_run_id = experiment_logger.experiment.id
+        except Exception:
+            pass
+        # Keep marker (and wandb_run_id.txt for debug), drop everything else.
+        for p in resume_dir.iterdir():
+            if p.name in (DONE_MARKER_NAME, "wandb_run_id.txt"):
+                continue
+            try:
+                if p.is_dir():
+                    shutil.rmtree(str(p))
+                else:
+                    p.unlink()
+            except Exception as e:
+                logger.warning(f"[resume] Could not clean up {p}: {e}")
+        _write_done_marker(resume_dir, finished_run_id)
 
     wandb.finish()
     logger.info(f"Training complete for run: {name}")
