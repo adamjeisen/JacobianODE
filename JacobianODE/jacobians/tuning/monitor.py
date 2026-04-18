@@ -550,6 +550,26 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             else:
                 cls = "failed_retrying"
 
+        # A "pending" slot that was previously dispatched (slurm_arrays[k]
+        # is set) but whose array task is no longer alive, and still has
+        # no wandb evidence, failed *before* wandb.init — e.g. srun step
+        # error, wandb API 429 at startup, OOM before training began.
+        # classify_run_idx can't distinguish this from "truly still queued"
+        # because both look the same from (squeue, wandb). Guard on
+        # monitor_cycle > 1 so a freshly-seeded sweep, whose first squeue
+        # query hasn't happened yet, doesn't misfire.
+        if (
+            cls == "pending"
+            and state["monitor_cycle"] > 1
+            and slurm_arrays.get(k) is not None
+        ):
+            task_id = f"{slurm_arrays[k]}_{k}"
+            if slurm_states.get(task_id) not in ALIVE_SLURM_STATES:
+                cls = (
+                    "failed_exhausted" if entry.get("attempts", 0) >= retry_cap
+                    else "failed_retrying"
+                )
+
         entry["wandb_run_ids"] = wids
         entry["attempts"] = len(wids)
         entry["last_wandb_state"] = last_wb
