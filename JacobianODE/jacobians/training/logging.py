@@ -198,7 +198,30 @@ def _deduplicate_run_name(
     entity: Optional[str],
     log: Optional[logging.Logger],
 ) -> str:
-    """Check for existing runs and add version suffix if needed."""
+    """Check for existing runs and add version suffix if needed.
+
+    Skips the check when running under SLURM (sweep context). The public
+    wandb API call (``api.runs(project_path)``) lists every run in the
+    project and is not cached — when a sweep launches N tasks
+    simultaneously, that's N parallel full-project listings, which reliably
+    trips the ``429 Too Many Requests`` limit on ``api.wandb.ai/graphql``.
+    Observed at the ``wandb_init``-adjacent startup path, where a 429 can
+    cascade into wandb never attaching and the run never appearing (see
+    vae_kl run_idx 22). Wandb already assigns globally unique run IDs, so
+    duplicated *names* are harmless; the dedup is only cosmetic for
+    interactive/notebook users.
+    """
+    if os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_ARRAY_JOB_ID"):
+        msg = (
+            f"[wandb-dedup] skipping name-dedup under SLURM; "
+            f"run names are unique-by-wandb-id, not by display name"
+        )
+        if log is not None:
+            log.info(msg)
+        else:
+            logger.info(msg)
+        return name
+
     api = wandb.Api()
     project_path = f"{entity}/{project}" if entity else project
 
