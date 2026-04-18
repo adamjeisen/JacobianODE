@@ -716,12 +716,15 @@ def _get_squeue_info() -> tuple[dict[str, dict], dict[str, dict]]:
     """
     try:
         out = run(
-            # %200i widens the JOBID column so SLURM doesn't truncate the
-            # array bracket spec — without this, a long pending range like
-            # ``[2-3,9-10,12-22,24,30-39]`` arrives as ``[2-3,9-10,12-22,24,30-``
-            # with no closing ``]``, breaking the count parser downstream.
+            # ``-r`` expands array tasks into one row per task. Without it
+            # SLURM compresses pending tasks into a bracket spec like
+            # ``12125132_[3,5-6,12-13,15,18-24,30-...]`` — and squeue's %i
+            # field truncates that *value* even when the column is widened
+            # (the padding is just visual), so any bracket parsing
+            # downstream sees a chopped string. With ``-r`` every task is
+            # its own row and we just count rows.
             ["squeue", "-u", os.environ.get("USER", "eisenaj"),
-             "-h", "-o", "%200i %j %T"],
+             "-r", "-h", "-o", "%i %j %T"],
             check=False,
         ).stdout
     except FileNotFoundError:
