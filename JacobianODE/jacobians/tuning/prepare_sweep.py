@@ -263,6 +263,20 @@ def build_expected(
 
     launched_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+    # If the caller passed a Hydra launcher partition override in ``raw``
+    # (e.g. ``hydra.launcher.partition=ou_bcs_low``), carry it into
+    # ``slurm.partition`` so monitor-initiated retries go to the same
+    # partition as the original sweep. Without this, retries always land
+    # on the DEFAULT_SLURM partition regardless of where the sweep ran.
+    slurm_config = {
+        "initial_array_job_id": None,
+        **DEFAULT_SLURM,
+    }
+    for ov in raw:
+        if ov.startswith("hydra.launcher.partition="):
+            slurm_config["partition"] = ov.split("=", 1)[1]
+            break
+
     return {
         "schema_version": SCHEMA_VERSION,
         "wandb": wandb_info,
@@ -280,10 +294,7 @@ def build_expected(
             "resolved_runs": resolved,
         },
         "expected_run_count": len(resolved),
-        "slurm": {
-            "initial_array_job_id": None,  # set post-submission if available
-            **DEFAULT_SLURM,
-        },
+        "slurm": slurm_config,
         "retry": DEFAULT_RETRY,
         "experiment_metadata": meta_by_exp,
     }

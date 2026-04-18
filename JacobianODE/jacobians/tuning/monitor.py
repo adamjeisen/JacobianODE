@@ -558,17 +558,28 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             else:
                 cls = "failed_retrying"
 
-        # A "pending" slot that was previously dispatched (slurm_arrays[k]
-        # is set) but whose array task is no longer alive, and still has
-        # no wandb evidence, failed *before* wandb.init — e.g. srun step
-        # error, wandb API 429 at startup, OOM before training began.
-        # classify_run_idx can't distinguish this from "truly still queued"
-        # because both look the same from (squeue, wandb). Guard on
-        # monitor_cycle > 1 so a freshly-seeded sweep, whose first squeue
-        # query hasn't happened yet, doesn't misfire.
+        # Track whether we've *ever* observed this slot's array task alive
+        # in squeue. Guards the "pending → failed_retrying" reclass below:
+        # only slots we watched alive and then go missing (crash, 429,
+        # srun step error, OOM before wandb.init) should be retried. A
+        # slot that's never been seen alive is almost certainly either
+        # (a) still about to be dispatched or (b) the squeue query
+        # returned a transient empty result.
+        array_id = slurm_arrays.get(k)
+        if array_id is not None:
+            task_id = f"{array_id}_{k}"
+            if slurm_states.get(task_id) in ALIVE_SLURM_STATES:
+                entry["ever_alive"] = True
+
+        # A "pending" slot that was previously dispatched, has been seen
+        # alive in at least one prior cycle, and is no longer alive,
+        # without any wandb evidence, failed *before* wandb.init —
+        # e.g. srun step error, wandb API 429 at startup, OOM before
+        # training began. Route it into the retry lifecycle.
         if (
             cls == "pending"
             and state["monitor_cycle"] > 1
+            and entry.get("ever_alive")
             and slurm_arrays.get(k) is not None
         ):
             task_id = f"{slurm_arrays[k]}_{k}"
