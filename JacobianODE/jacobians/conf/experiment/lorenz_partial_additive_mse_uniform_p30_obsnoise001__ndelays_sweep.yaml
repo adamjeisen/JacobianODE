@@ -1,0 +1,82 @@
+# @package _global_
+#
+# p30 sweep over the delay-embedding length (n_delays), with zero
+# loop-closure weight. Goal: find the right embedding depth before
+# sweeping loss-weighting knobs on top. Companion to the obsnoise005
+# variant.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, uniform reconstruction loss,
+    obs_noise=0.01, prediction_steps=30, loop_closure_weight=0.
+    Sweeps delay_embedding_params.n_delays over [5, 10, 15, 20, 25,
+    30, 35, 40, 45, 50]. n_target_dims fixed at 3; encoder.n_input
+    is auto-resolved from n_delays × |observed_indices| at Hydra
+    runtime.
+  hypothesis: |
+    Holding LC=0 pins the reconstruction + forward-rollout objective
+    at its baseline and isolates how much the chart-learning problem
+    (and thus Lyapunov recovery) depends on the delay-embedding
+    length alone. Embedding too short → attractor not unfolded
+    cleanly (Takens dimensionality bound is 2×3+1=7 for generic
+    Lorenz); embedding too long → too much redundant dim structure
+    for the encoder to carve into 3 dyn + (N-3) null.
+    Expect a sweet spot somewhere in the teens-to-twenties on clean
+    data; at obs_noise=0.01 the window is likely not yet pushed
+    toward the long end (contrast with the obsnoise005 variant).
+  success_criteria:
+    - "Clear minimum in best val traj_loss as a function of n_delays (not monotonic)"
+    - "λ_min accuracy non-monotonic in n_delays too, ideally tracking the val loss minimum"
+    - "All runs converge (no training divergence regardless of n_delays)"
+
+sweep_grid:
+  data.train_test_params.delay_embedding_params.n_delays: "5,10,15,20,25,30,35,40,45,50"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDsweep_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_mse_uniform_p30_obsnoise001__ndelays_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 25                        # overridden by sweep_grid
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 0.0              # fixed at 0 for this sweep
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
