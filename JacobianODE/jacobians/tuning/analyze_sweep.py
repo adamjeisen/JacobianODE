@@ -652,58 +652,41 @@ def compute_per_run_lyapunov(
         + ", ".join(sorted({r.state for r in all_runs}))
     )
 
-    # Cache the test trajectories across runs — only the FIRST load_run call
-    # actually generates them; subsequent calls pass generate_data=False.
-    test_trajs_cached = None
+    # Trajectory cache. Each run gets its own delay-embedded trajectory
+    # because n_delays can vary across a sweep (e.g. the ndelays sweeps), so
+    # we can't reuse the first run's shape. The empirical ground-truth
+    # Lyapunov spectrum is n_delays-independent (it's computed from eq.jac
+    # on the raw full-state trajectory) so we cache only that across runs.
     dt_cached = None
     per_run: dict[str, Any] = {}
 
     # Empirical ground-truth Lyapunov spectrum, computed once from eq.jac on
-    # the test trajectories (see run_analytics.py for the canonical path).
+    # the full-state trajectories (see run_analytics.py for the canonical path).
     empirical_mean: np.ndarray | None = None
     empirical_per_traj: np.ndarray | None = None
 
     for i, run in enumerate(all_runs):
         run_id = run.id
         try:
-            if i == 0:
-                # return_full_obs=True so that partial-obs / delay-embedded
-                # runs still have the underlying full state available for
-                # computing the empirical Lyapunov spectrum via eq.jac.
-                loaded = load_run(
-                    f"{wandb_entity}/{wandb_project}",
-                    run_id=run_id,
-                    save_dir=str(save_dir),
-                    generate_data=True,
-                    verbose=False,
-                    return_full_obs=True,
-                )
-            else:
-                loaded = load_run(
-                    f"{wandb_entity}/{wandb_project}",
-                    run_id=run_id,
-                    save_dir=str(save_dir),
-                    generate_data=False,
-                    dt=dt_cached,
-                    verbose=False,
-                )
+            # Always generate_data=True: different runs in the same sweep can
+            # have different n_delays / observed_indices, so the delay-embedded
+            # trajectory shape varies per run. Reusing the first run's data
+            # caused every subsequent run with a different n_delays to crash
+            # with shape-mismatch errors from the encoder.
+            # return_full_obs=True on the FIRST run only — that gives us the
+            # raw full-state trajectory for the empirical Lyapunov spectrum.
+            loaded = load_run(
+                f"{wandb_entity}/{wandb_project}",
+                run_id=run_id,
+                save_dir=str(save_dir),
+                generate_data=True,
+                verbose=False,
+                return_full_obs=(i == 0),
+            )
             run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
             if i == 0:
                 dt_cached = dt
                 if trajs is not None and "test_trajs" in trajs:
-                    # Prefer train_trajs for both the model Jacobians and the
-                    # empirical Jacobians — it's the longest contiguous slice
-                    # available (80% of the timeline vs 5% for test), which
-                    # matters because Lyapunov exponents need many Lyapunov
-                    # times to converge. Using the same train slice for both
-                    # also keeps the comparison apples-to-apples (same time
-                    # range, same trajectories).
-                    if "train_trajs" in trajs:
-                        model_seq = trajs["train_trajs"].sequence
-                    else:
-                        model_seq = trajs["test_trajs"].sequence
-                    test_trajs_cached = model_seq[:n_sample_trajectories].to(device)
-
                     # Compute empirical spectrum ONCE (same data/eq across runs).
                     mu_val = cfg.data.postprocessing.get("mu", 0.0)
                     sigma_val = cfg.data.postprocessing.get("sigma", 1.0)
@@ -733,10 +716,17 @@ def compute_per_run_lyapunov(
             load_checkpoint(run_obj, cfg, lit_model, save_dir=str(save_dir), verbose=False)
             lit_model = lit_model.to(device).eval()
 
-            if test_trajs_cached is None:
-                raise RuntimeError(
-                    "No cached test trajectories — first run must have generate_data=True"
-                )
+            # Per-run model trajectories (delay-embedded with THIS run's
+            # n_delays / observed_indices). Prefer train_trajs for its
+            # longer contiguous slice — Lyapunov needs many Lyapunov times
+            # to converge.
+            if trajs is None or "test_trajs" not in trajs:
+                raise RuntimeError(f"No trajectories returned by load_run for {run_id}")
+            if "train_trajs" in trajs:
+                model_seq = trajs["train_trajs"].sequence
+            else:
+                model_seq = trajs["test_trajs"].sequence
+            test_trajs_this_run = model_seq[:n_sample_trajectories].to(device)
 
             # Compute Jacobians along the test trajectories (chunked). Vanilla
             # JacobianODE (LitMLP) has no encoder — operate directly on the
@@ -745,8 +735,8 @@ def compute_per_run_lyapunov(
             is_vanilla = not hasattr(lit_model, "encode_trajectory")
             lambdas = []
             with torch.no_grad():
-                for start in range(0, test_trajs_cached.shape[0], chunk_size):
-                    chunk = test_trajs_cached[start : start + chunk_size]
+                for start in range(0, test_trajs_this_run.shape[0], chunk_size):
+                    chunk = test_trajs_this_run[start : start + chunk_size]
                     if is_vanilla:
                         jacs = lit_model.compute_jacobians(chunk)  # (B, T, D, D)
                     else:

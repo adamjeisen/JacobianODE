@@ -192,7 +192,15 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
     the training loop (``hydra.*``, ``experiment=...``) are ignored — those
     don't appear in the wandb run config and would cause spurious
     non-matches for every run.
+
+    Single-run sweeps (``sweep_grid: {}``): resolved_runs has exactly one
+    entry with an empty or launcher-only override list. There's nothing
+    to disambiguate, so we return that run_idx unconditionally rather
+    than skipping it as "no matchable overrides".
     """
+    if len(resolved_runs) == 1:
+        return resolved_runs[0]["run_idx"]
+
     def _is_matchable(ov: str) -> bool:
         if "=" not in ov:
             return False
