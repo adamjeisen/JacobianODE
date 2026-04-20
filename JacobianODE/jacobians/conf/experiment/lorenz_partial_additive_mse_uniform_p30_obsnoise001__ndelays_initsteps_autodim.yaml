@@ -1,0 +1,99 @@
+# @package _global_
+#
+# p30 sweep over (n_delays × traj_init_steps), with n_target_dims picked
+# automatically by PCA-variance threshold on the noisy training delay
+# embeddings, and routing-guaranteed encoder initialization (the most
+# recent observation dim deterministically flows into z_dyn at init).
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, uniform reconstruction loss,
+    obs_noise=0.01, prediction_steps=30, loop_closure_weight=0.
+    Sweeps delay_embedding_params.n_delays over
+    [5, 10, 15, ..., 100] (step 5, 20 values)
+    × jacobianODEint_kwargs.traj_init_steps over [15, 30]
+    = 40 runs.
+    n_target_dims is picked at data-load time as the smallest k such
+    that the first k PCs of the noisy training delay embeddings explain
+    ≥ model.n_target_var_threshold of the total variance.
+    final_perm_identity=true on the encoder guarantees that at init
+    z[..., :n_target_dims] == x[..., :n_target_dims] — the first
+    n_target_dims most-recent observations flow into z_dyn without
+    depending on permutation_seed.
+  hypothesis: |
+    At a given obs_noise level, both n_delays and traj_init_steps
+    change how much state information is accumulated before the
+    dynamics model is asked to predict. The PCA-auto dim lets each
+    n_delays pick its own latent dimensionality, so that comparing
+    across n_delays is a fair comparison of "how much useful rank
+    is present" rather than "how well 3 fixed dims capture different
+    embeddings." With routing fixed, no n_delays will fail the
+    decoded[0]-disconnected-from-z_dyn failure mode we saw at seed=42
+    n_delays=30. We expect: (i) at higher traj_init_steps, every
+    n_delays achieves a better val_loss since the encoder has more
+    history to work with; (ii) a soft optimum in n_delays tracking
+    the point where PCA-auto n_target_dims stops growing.
+  success_criteria:
+    - "All 40 runs train without divergence (routing fix holds)"
+    - "PCA-chosen n_target_dims grows with n_delays then saturates"
+    - "Val traj_loss improves with traj_init_steps=30 over traj_init_steps=15 at most n_delays"
+    - "Best val traj_loss per (noise, init) has a non-monotonic optimum in n_delays"
+
+sweep_grid:
+  data.train_test_params.delay_embedding_params.n_delays: "5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100"
+  training.lightning.jacobianODEint_kwargs.traj_init_steps: "15,30"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_mse_uniform_p30_obsnoise001__ndelays_initsteps_autodim"
+
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    # seq_length = traj_init_steps + prediction_steps (lazy-resolved after sweep override)
+    seq_length: "${add:${training.lightning.jacobianODEint_kwargs.traj_init_steps},${model.prediction_steps}}"
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 25                        # overridden by sweep_grid
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3                         # fallback; overridden by PCA-auto at data-load time
+  n_target_var_threshold: 0.99             # PCA-auto: smallest k s.t. cum_var[k-1] ≥ 0.99
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  encoder:
+    final_perm_identity: true              # z[..., :n_target_dims] == most recent obs at init
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 0.0
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+    jacobianODEint_kwargs:
+      traj_init_steps: 15                  # overridden by sweep_grid
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20

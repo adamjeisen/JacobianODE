@@ -13,6 +13,14 @@ from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
+# Simple arithmetic resolver so experiment YAMLs can derive e.g.
+#   seq_length: "${add:${training.lightning.jacobianODEint_kwargs.traj_init_steps},${model.prediction_steps}}"
+# Lazy resolution means values stay correct after Hydra sweep overrides.
+if not OmegaConf.has_resolver("add"):
+    OmegaConf.register_new_resolver(
+        "add", lambda *args: sum(int(a) for a in args)
+    )
+
 
 def load_config(
     config_name: str = "config",

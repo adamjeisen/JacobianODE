@@ -1347,6 +1347,17 @@ class CouplingEncoder(nn.Module):
         (spline only) Number of spline segments.
     tail_bound : float
         (spline only) Linear tails outside ``[-tail_bound, tail_bound]``.
+    final_perm_identity : bool
+        If True, append one final FixedPermutation whose buffer is chosen so
+        that the composition of all permutations is the identity. Combined
+        with ``zero_init=True`` this makes the entire encoder the identity
+        function at initialization, so ``z[..., :n_target_dims] ==
+        x[..., :n_target_dims]`` — the n_target_dims most recent observations
+        land in the dynamic subspace deterministically, independent of the
+        permutation seed. Expressivity is preserved because the inter-layer
+        permutations are still fully random (they drive mixing across coupling
+        layers); the final permutation only relabels output dimensions by a
+        fixed bijection.
     """
 
     def __init__(
@@ -1371,6 +1382,8 @@ class CouplingEncoder(nn.Module):
         # spline-specific
         num_bins: int = 8,
         tail_bound: float = 3.0,
+        # routing at init
+        final_perm_identity: bool = False,
     ) -> None:
         super().__init__()
         self._n_input = n_input
@@ -1447,6 +1460,25 @@ class CouplingEncoder(nn.Module):
 
         self.loft: LOFTLayer | None = LOFTLayer(tau=loft_tau) if use_loft else None
 
+        # Optional final permutation chosen so the whole encoder is the
+        # identity at init (given zero_init couplings): routes input dim k
+        # to output dim k for every k, so z_dyn = z[..., :n_target_dims] =
+        # the n_target_dims most recent observations. Preserves full
+        # expressivity — the inter-layer FixedPermutations are still random
+        # for mixing; this layer only relabels output dims deterministically.
+        self.final_permutation: FixedPermutation | None = None
+        if final_perm_identity:
+            # R = composition of inter-layer random perms (applied in forward order).
+            idx = torch.arange(n_input)
+            for p in self.permutations:
+                idx = idx[p.perm]
+            # final_perm = R^{-1}, so at init the full composition is identity.
+            inv = torch.argsort(idx)
+            fp = FixedPermutation(dim=n_input, seed=0)
+            fp.perm.copy_(inv)
+            fp.perm_inv.copy_(torch.argsort(inv))
+            self.final_permutation = fp
+
     # ----- properties -----
 
     @property
@@ -1474,6 +1506,8 @@ class CouplingEncoder(nn.Module):
                 z, _ = self.actnorms[i](z)
             if i < len(self.permutations):
                 z = self.permutations[i](z)
+        if self.final_permutation is not None:
+            z = self.final_permutation(z)
         if self.loft is not None:
             z = self.loft(z)
         return z
@@ -1492,6 +1526,8 @@ class CouplingEncoder(nn.Module):
         y = z
         if self.loft is not None:
             y = self.loft.inverse(y)
+        if self.final_permutation is not None:
+            y = self.final_permutation.inverse(y)
         for i in reversed(range(len(self.coupling_layers))):
             if i < len(self.permutations):
                 y = self.permutations[i].inverse(y)
@@ -1531,6 +1567,8 @@ class CouplingEncoder(nn.Module):
                 total_log_det = total_log_det + ld
             if i < len(self.permutations):
                 z = self.permutations[i](z)
+        if self.final_permutation is not None:
+            z = self.final_permutation(z)
         if self.loft is not None:
             total_log_det = total_log_det + self.loft.log_det(z)
         return total_log_det

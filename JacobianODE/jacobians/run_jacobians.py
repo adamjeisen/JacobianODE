@@ -171,6 +171,45 @@ def _run_training(cfg: DictConfig) -> float:
     )
 
     # ----------------------------------------
+    # PCA-AUTO n_target_dims
+    # ----------------------------------------
+    # If model.n_target_var_threshold is set, pick n_target_dims as the
+    # smallest k such that the first k PCs of the (noisy) training delay
+    # embeddings capture ≥ threshold of the total variance. Overrides
+    # whatever n_target_dims was set by initialize_config, and cascades to
+    # the MLP input/output_dim which are = k, k^2.
+    _n_target_var_thresh = OmegaConf.select(
+        cfg, "model.n_target_var_threshold", default=None
+    )
+    if _n_target_var_thresh is not None:
+        train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
+        flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
+        flat -= flat.mean(dim=0, keepdim=True)
+        cov = (flat.T @ flat) / (flat.shape[0] - 1)
+        eigvals = torch.linalg.eigvalsh(cov).flip(0).clamp_min(0.0)
+        explained = eigvals / eigvals.sum()
+        cum_var = explained.cumsum(0)
+        n_target = int((cum_var >= _n_target_var_thresh).float().argmax().item()) + 1
+        _cum = [f"{v:.4f}" for v in cum_var[: min(10, len(cum_var))].tolist()]
+        _exp = [f"{v:.4f}" for v in explained[: min(10, len(explained))].tolist()]
+        log.info(
+            f"PCA-auto n_target_dims: threshold={_n_target_var_thresh}, "
+            f"D_embed={flat.shape[-1]}, N_samples={flat.shape[0]}, "
+            f"chose n_target_dims={n_target}"
+        )
+        log.info(f"  explained variance (first 10): {_exp}")
+        log.info(f"  cumulative variance (first 10): {_cum}")
+        cfg.model.n_target_dims = n_target
+        cfg.model.params.input_dim = n_target
+        cfg.model.params.output_dim = n_target ** 2
+        OmegaConf.update(cfg, "model.n_target_dims_pca_auto", n_target, force_add=True)
+        OmegaConf.update(
+            cfg, "model.n_target_dims_pca_cum_var",
+            float(cum_var[n_target - 1].item()),
+            force_add=True,
+        )
+
+    # ----------------------------------------
     # SET UP WANDB
     # ----------------------------------------
     prompt_entity = cfg.wandb_entity is None

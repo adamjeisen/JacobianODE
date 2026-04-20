@@ -33,8 +33,19 @@ encoder:
   permutation_seed: 42
   use_loft: false
   loft_tau: 100.0
+  # When true (combined with zero_init), the entire encoder is the identity
+  # at init, so z_dyn = z[..., :n_target_dims] = the n_target_dims most
+  # recent observations deterministically (independent of permutation_seed).
+  # Inter-layer permutations are still fully random — only a final fixed
+  # permutation is added to cancel their composition. No expressivity cost.
+  final_perm_identity: false
 
 n_target_dims: 7              # drives MLP dims and subspace splitting
+# If set (float in (0, 1]), n_target_dims is auto-picked at data-load time
+# as the smallest k such that the first k PCs of the noisy training
+# delay-embeddings capture ≥ threshold of the total variance. Overrides
+# whatever n_target_dims was configured statically.
+n_target_var_threshold: null
 kl_null_weight: null          # null-space MSE penalty (structural constraint)
 kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
 use_vae: false                # deterministic latent by default; flip on when you need VAE
