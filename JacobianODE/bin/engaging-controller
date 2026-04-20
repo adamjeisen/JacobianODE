@@ -311,6 +311,21 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
         merged_meta.update(expected.get("experiment_metadata") or {})
         if merged_meta:
             merged["experiment_metadata"] = merged_meta
+        # Carry over the latest submission's slurm partition (and any other
+        # slurm fields prepare_sweep derived from overrides) so monitor retries
+        # go to the partition this resubmission actually used, not whatever the
+        # first-ever submission used. Without this, a resubmit with
+        # hydra.launcher.partition=ou_bcs_low on a sweep whose expected.json
+        # already exists will keep firing retries to the old partition.
+        new_slurm = expected.get("slurm") or {}
+        if new_slurm:
+            merged_slurm = dict(merged.get("slurm") or {})
+            merged_slurm.update(new_slurm)
+            # initial_array_job_id is a one-shot that belongs to the first
+            # submission — don't clobber it with the resubmit's placeholder.
+            if merged.get("slurm", {}).get("initial_array_job_id") is not None:
+                merged_slurm["initial_array_job_id"] = merged["slurm"]["initial_array_job_id"]
+            merged["slurm"] = merged_slurm
         # Record the array id of this SUBMISSION so monitor can check the
         # original array task's liveness before triggering a retry (prevents
         # monitor from double-scheduling while SLURM REQUEUE is still
