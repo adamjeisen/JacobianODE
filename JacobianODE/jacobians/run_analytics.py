@@ -730,7 +730,11 @@ def plot_long_trajectory(
     latent_pred: np.ndarray,
     traj_init_steps: int = 15,
 ) -> plt.Figure:
-    """Two-panel plot: obs dim 0 and latent dim 0 over a long free-running run."""
+    """Two-panel plot: obs dim 0 and latent dim 0 over a long free-running run.
+
+    Legacy single-seed plot kept for vanilla (non-latent) models and
+    backward-compat. Latent models use ``plot_seeded_rollouts`` below.
+    """
     fig, axs = plt.subplots(2, 1, figsize=(10, 6))
     T = min(traj_true.shape[0], decoded_pred.shape[0])
     axs[0].plot(traj_true[:T, 0], label="True Observation")
@@ -751,6 +755,64 @@ def plot_long_trajectory(
     axs[1].set_xlabel("Time")
     axs[1].legend(fontsize=9)
 
+    plt.tight_layout()
+    return fig
+
+
+def plot_seeded_rollouts(
+    traj_true: np.ndarray,
+    rollouts: list[dict],
+) -> plt.Figure:
+    """Multi-seed rollout plot for latent models.
+
+    ``rollouts`` is a list of dicts each with keys ``name``, ``init_n``,
+    ``decoded`` (obs dim 0 time series), ``latent_true`` (encoded z_dyn
+    dim 0) and ``latent_pred`` (rolled-out z_dyn dim 0). Each config
+    gets a row with obs (left) and latent (right) panels, annotated
+    with std(post-init) as a quick "collapsed or still moving?" cue.
+    """
+    n = len(rollouts)
+    fig, axs = plt.subplots(n, 2, figsize=(14, 2.8 * n), squeeze=False)
+    for i, r in enumerate(rollouts):
+        init_n = r["init_n"]
+        decoded = r["decoded"]
+        l_true = r["latent_true"]
+        l_pred = r["latent_pred"]
+        post_init = decoded[init_n:]
+        std_post = float(np.std(post_init)) if len(post_init) > 0 else float("nan")
+
+        ax_o = axs[i, 0]
+        T = min(traj_true.shape[0], decoded.shape[0])
+        ax_o.plot(traj_true[:T, 0], label="true obs", lw=0.8, alpha=0.7, color="C0")
+        ax_o.plot(decoded[:T, 0], label="predicted obs", color="C3", lw=1.1)
+        ax_o.axvline(init_n, color="k", ls=":", lw=0.6,
+                     label=f"init ends (t={init_n})")
+        ax_o.set_title(
+            f"{r['name']}: init={init_n}, rollout={T - init_n},  "
+            f"std(post-init)={std_post:.3g}"
+        )
+        ax_o.set_ylabel("Obs dim 0")
+        ax_o.legend(fontsize=8, loc="upper right")
+        ax_o.grid(True, alpha=0.3)
+
+        ax_l = axs[i, 1]
+        T_lat = min(l_true.shape[0], l_pred.shape[0])
+        ax_l.plot(l_true[:T_lat, 0], ls="--", label="encoded z_dyn[0]",
+                  color="C0", alpha=0.7, lw=0.9)
+        ax_l.plot(l_pred[:T_lat, 0], label="rolled z_dyn[0]",
+                  color="C3", lw=1.1)
+        ax_l.axvline(init_n, color="k", ls=":", lw=0.6)
+        ax_l.set_title("Latent dim 0")
+        ax_l.set_ylabel("z_dyn dim 0")
+        ax_l.legend(fontsize=8, loc="upper right")
+        ax_l.grid(True, alpha=0.3)
+    axs[-1, 0].set_xlabel("time step")
+    axs[-1, 1].set_xlabel("time step")
+    fig.suptitle(
+        "Free-running rollouts under three init regimes\n"
+        "(same integration kwargs as training; only traj_init_steps varies)",
+        y=1.00,
+    )
     plt.tight_layout()
     return fig
 
@@ -1807,38 +1869,94 @@ def run_analytics(
                 _emit("prediction_detail_obs", fig_obs)
 
         # ============================================================
-        # 9. Long trajectory
+        # 9. Long trajectory (free-running rollouts at multiple init regimes)
         # ============================================================
         if "long_trajectory" in active_sections:
-            print("Computing long trajectory prediction ...")
+            print("Computing long-trajectory free-running rollouts ...")
             test_trajs_obs_lt = trajs["test_trajs"].sequence
             traj_long = torch.as_tensor(test_trajs_obs_lt[[0]]).float().to(device_obj)
+            T_full = traj_long.shape[1]
 
-            with torch.no_grad():
-                _lt_kw: dict = dict(alpha_teacher_forcing=0.0, obs_noise_scale=0)
-                if is_latent:
-                    _lt_kw.update(return_decoded=True, strided=False)
-                rd_long = lit_model.trajectory_model_step(traj_long, **_lt_kw)
+            if not is_latent:
+                # Vanilla models: no encoder — fall back to the legacy
+                # single-seed plot using trajectory_model_step.
+                with torch.no_grad():
+                    rd_long = lit_model.trajectory_model_step(
+                        traj_long, alpha_teacher_forcing=0.0, obs_noise_scale=0,
+                    )
+                traj_true_lt = traj_long[0].cpu().numpy()
+                decoded_pred_lt = rd_long["outputs"][0].cpu().numpy()
+                fig = plot_long_trajectory(
+                    traj_true_lt, decoded_pred_lt,
+                    traj_long[0].cpu().numpy(),
+                    rd_long["outputs"][0].cpu().numpy(),
+                    traj_init_steps=traj_init_steps,
+                )
+                _emit("long_trajectory", fig)
+            else:
+                # Latent model: roll out three init regimes and show each
+                # in a row.  All three use the training config's
+                # integration kwargs (only traj_init_steps varies).
+                from .jacobianODE import JacobianODEint
+                ikw = dict(cfg.training.lightning.jacobianODEint_kwargs)
 
-                if is_latent:
-                    encoded_lt = lit_model.encode_trajectory(traj_long)
-                    z_pred_full_lt = lit_model._pad_to_full_dim(rd_long["outputs"])
-                    decoded_lt = lit_model.decode_trajectory(z_pred_full_lt)
-                else:
-                    encoded_lt = traj_long
-                    decoded_lt = rd_long["outputs"]
+                # Encode once; each seed slices from the front and pads
+                # the rest with zeros so generate_dynamics rolls forward.
+                with torch.no_grad():
+                    z_full_enc = lit_model.encode_trajectory(traj_long)
+                z_dyn_enc, _ = lit_model._split_latent(z_full_enc)  # (1, T_full, D_dyn)
+                D_dyn = z_dyn_enc.shape[-1]
 
-            traj_true_lt = traj_long[0].cpu().numpy()
-            decoded_pred_lt = decoded_lt[0].cpu().numpy()
-            latent_true_lt = _z_dyn(encoded_lt[0], n_target_dims).cpu().numpy()
-            latent_pred_lt = rd_long["outputs"][0].cpu().numpy()
+                # Three init regimes.
+                # 1) train seeding: the traj_init_steps used during
+                #    training (typically 15 for seq_length=45).
+                # 2) proportional seeding: init = T_full / 3 so the
+                #    init:rollout ratio matches training's 1:2.
+                # 3) triple seeding: 3× training's init, i.e. 45 for the
+                #    standard config — what the current batch+burn-in
+                #    Lyapunov analysis effectively uses.
+                train_init = int(ikw.get("traj_init_steps", 15))
+                seeds = [
+                    ("train seeding",         train_init),
+                    ("proportional seeding (init=T/3)", T_full // 3),
+                    (f"triple seeding (3× train = {3 * train_init})",
+                     3 * train_init),
+                ]
+                # Drop seeds whose init >= T_full; keep order.
+                seeds = [(n, k) for (n, k) in seeds if 0 < k < T_full]
 
-            fig = plot_long_trajectory(
-                traj_true_lt, decoded_pred_lt,
-                latent_true_lt, latent_pred_lt,
-                traj_init_steps=traj_init_steps,
-            )
-            _emit("long_trajectory", fig)
+                jac_ode = JacobianODEint(lit_model.compute_jacobians, dt)
+                rollouts = []
+                for name, init_n in seeds:
+                    roll_n = T_full - init_n
+                    z_init = z_dyn_enc[:, :init_n, :]
+                    z_padded = torch.cat(
+                        [z_init,
+                         torch.zeros(1, roll_n, D_dyn, device=device_obj)],
+                        dim=1,
+                    )
+                    with torch.no_grad():
+                        z_pred = jac_ode.generate_dynamics(
+                            z_padded,
+                            traj_init_steps=init_n,
+                            alpha_teacher_forcing=0.0,
+                            fast_mode=True,
+                            verbose=False,
+                            interp_pts=ikw.get("interp_pts", 4),
+                            inner_N=ikw.get("inner_N", 20),
+                        )  # (1, T_full, D_dyn)
+                        z_full_pred = lit_model._pad_to_full_dim(z_pred)
+                        decoded = lit_model.decode_trajectory(z_full_pred)[0]
+                    rollouts.append(dict(
+                        name=name,
+                        init_n=init_n,
+                        decoded=decoded.cpu().numpy(),
+                        latent_true=_z_dyn(z_full_enc[0], n_target_dims).cpu().numpy(),
+                        latent_pred=z_pred[0].cpu().numpy(),
+                    ))
+
+                fig = plot_seeded_rollouts(traj_long[0].cpu().numpy(), rollouts)
+                _emit("long_trajectory", fig)
 
         # ============================================================
         # 10. Encoder/decoder Jacobians
