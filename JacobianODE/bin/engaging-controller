@@ -299,6 +299,63 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
     if final_expected.is_file():
         old = json.loads(final_expected.read_text())
         old_runs = old.get("hydra", {}).get("resolved_runs", [])
+
+        def _matchable_overrides(run: dict) -> tuple:
+            """The set of (key, value) pairs that disambiguate sweep cells.
+            Hydra-consumed and experiment overrides don't appear in wandb
+            configs, so they don't disambiguate runs from each other."""
+            ovs = []
+            for ov in run.get("overrides", []):
+                if "=" not in ov:
+                    continue
+                k, v = ov.split("=", 1)
+                if k.startswith("hydra.") or k == "experiment":
+                    continue
+                ovs.append((k, v))
+            return tuple(sorted(ovs))
+
+        old_keys = {_matchable_overrides(r) for r in old_runs}
+        new_keys = [_matchable_overrides(r) for r in expected["hydra"]["resolved_runs"]]
+        # If every new resolved_run already has a matching cell in the existing
+        # expected.json, this resubmission is a "redo" of the same sweep grid
+        # (e.g. partition change, code update). REPLACE the bookkeeping rather
+        # than EXTEND — extending only makes sense for adding new sweep axes,
+        # since (a) wandb config-matching cannot disambiguate identical-config
+        # cells and (b) the new SLURM array's task indices are 0..(N-1), so the
+        # alive-task check `{array_id}_{run_idx}` only resolves when run_idx
+        # numbering matches array task numbering 1:1.
+        is_redo = bool(new_keys) and all(k in old_keys for k in new_keys)
+        if is_redo:
+            log(
+                f"[{exp}] REDO {group}: same sweep grid as existing "
+                f"({len(new_keys)} cells). Replacing bookkeeping, not extending."
+            )
+            # Build a fresh expected.json from the new submission, keeping run_idx
+            # numbering 0..(N-1) (matches new array task indices). Carry over
+            # experiment_metadata to preserve any prior validation context.
+            fresh = json.loads(expected_path.read_text())
+            fresh["slurm_arrays"] = {
+                str(r["run_idx"]): array_id
+                for r in fresh["hydra"]["resolved_runs"]
+            }
+            # Preserve original launched_at and the first array job id for
+            # the timeline / sentinel-eligibility checks downstream.
+            fresh.setdefault("first_launched_at", old.get("first_launched_at") or old.get("launched_at"))
+            old_meta = old.get("experiment_metadata") or {}
+            new_meta = fresh.get("experiment_metadata") or {}
+            old_meta.update(new_meta)
+            if old_meta:
+                fresh["experiment_metadata"] = old_meta
+            final_expected.write_text(json.dumps(fresh, indent=2) + "\n")
+            expected_path.unlink(missing_ok=True)
+            expected_run_count = batch_count
+            return {
+                "wandb_group": group,
+                "expected_run_count": expected_run_count,
+                "slurm_array_id": array_id,
+                "slurm_submitted_at": utc_iso(),
+            }
+
         next_idx = max((r["run_idx"] for r in old_runs), default=-1) + 1
         appended = [
             {**r, "run_idx": next_idx + r["run_idx"]}
