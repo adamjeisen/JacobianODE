@@ -1,0 +1,94 @@
+# @package _global_
+#
+# Companion LC sweep at obs_noise=0.05 across the top 3 n_delays from
+# the LC=0 ndelays_initsteps autodim sweep at traj_init_steps=15.
+# Top 3 by best val traj_loss: n_delays in {45, 80, 85}
+# (5.2e-3, 5.8e-3, 5.9e-3; R² 0.985, 0.984, 0.985). The n_delays
+# surface is flatter than at 0.01, so 80/85 are viable contenders
+# even though 45 was nominally best.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, uniform reconstruction loss,
+    obs_noise=0.05, prediction_steps=30, traj_init_steps=15.
+    27-run sweep: 3 n_delays {45, 80, 85} × 9 LC weights
+    {0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1, 10}. n_target_dims
+    picked by PCA-auto (threshold=0.99) per n_delays — with more
+    delays and higher noise, the PCA threshold should select a
+    larger n_target_dims (7 at n_d=45 → 13-14 at n_d=80-85 per the
+    earlier sweep).
+    Goal: same two-stage-stability check as the obsnoise001
+    companion sweep, but at higher noise where the n_delays
+    surface was nearly flat and LC may cleanly break the tie.
+  hypothesis: |
+    Because the LC=0 n_delays surface was flat at obs_noise=0.05
+    (top 3 within ~15% of each other), LC is likely what picks a
+    winner here. LC's role is partially a denoising regularizer, so
+    at higher noise we'd expect the best LC weight to be larger than
+    at obsnoise001. High n_delays + high LC may win if the extra
+    latent-space redundancy gives LC more room to find a clean chart
+    — but it may also hurt if PCA-auto inflates n_target_dims and
+    the dynamics MLP overfits.
+  success_criteria:
+    - "All 27 runs train without divergence"
+    - "Best val traj_loss achieved at LC > 0 with a clear margin over LC=0"
+    - "PCA-auto n_target_dims at each n_delays matches what the earlier LC=0 sweep recorded (sanity: data-driven pick is deterministic)"
+    - "Optimum (n_delays, LC) is interpretable — e.g., low n_delays favours small LC, high n_delays favours larger LC, or a single cell dominates"
+
+sweep_grid:
+  data.train_test_params.delay_embedding_params.n_delays: "45,80,85"
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_mse_uniform_p30_obsnoise005_top3nd_init15_autodim__lc_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 45                      # overridden by sweep_grid
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3                      # fallback; overridden by PCA-auto
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  encoder:
+    final_perm_identity: true
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 0.1            # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+    jacobianODEint_kwargs:
+      traj_init_steps: 15
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
