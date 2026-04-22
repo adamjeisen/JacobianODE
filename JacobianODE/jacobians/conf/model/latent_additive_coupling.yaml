@@ -46,6 +46,15 @@ n_target_dims: 7              # drives MLP dims and subspace splitting
 # delay-embeddings capture ≥ threshold of the total variance. Overrides
 # whatever n_target_dims was configured statically.
 n_target_var_threshold: null
+# When true, the trajectory (rollout) training loss uses
+# reconstruction_mode='most_recent' regardless of the training-level
+# reconstruction_mode (see training.lightning.reconstruction_mode). This
+# matches what validation already hardcodes, so train and val both penalize
+# the same quantity (the live-frame forecast) while reconstruction_mode
+# stays as-configured for the encoder-decoder round-trip loss. Default True
+# (matched); flip to False to reproduce the pre-fix "both use
+# self.reconstruction_mode" behaviour.
+trajectory_loss_most_recent: true
 kl_null_weight: null          # null-space MSE penalty (structural constraint)
 kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
 use_vae: false                # deterministic latent by default; flip on when you need VAE

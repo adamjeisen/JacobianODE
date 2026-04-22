@@ -93,6 +93,15 @@ class LitLatentJacobianODE(LitBase):
         jacobian_noise=None,
         # Reconstruction mode
         reconstruction_mode='uniform',
+        # When True, the trajectory (rollout prediction) loss at TRAINING time
+        # uses reconstruction_mode='most_recent' regardless of the
+        # reconstruction_mode above, which is otherwise only honored for the
+        # encoder-decoder reconstruction loss. This mirrors what validation
+        # already hardcodes: trajectory is always evaluated most-recent-only
+        # because that is the forecastable quantity (and because uniform
+        # averaging dilutes the "genuinely hard" prediction signal by 1/n_delays).
+        # Default True so new sweeps get the matched behaviour without opt-in.
+        trajectory_loss_most_recent=True,
         # Tangent space entropy
         tangent_entropy_weight=0.0,
         tangent_entropy_mode='quadratic',
@@ -200,6 +209,7 @@ class LitLatentJacobianODE(LitBase):
                 f"'most_recent', got '{reconstruction_mode}'"
             )
         self.reconstruction_mode = reconstruction_mode
+        self.trajectory_loss_most_recent = trajectory_loss_most_recent
         if reconstruction_mode == 'harmonic':
             obs_dim = encoder.n_latent
             w_raw = 1.0 / (torch.arange(obs_dim, dtype=torch.float32) + 1.0)
@@ -1431,11 +1441,17 @@ class LitLatentJacobianODE(LitBase):
 
         train_rets = {}
 
-        # Trajectory prediction loss
+        # Trajectory prediction loss. When trajectory_loss_most_recent is True,
+        # override the reconstruction_mode just for this term — matches val's
+        # hardcoded 'most_recent' so train/val diagnose the same quantity, and
+        # avoids the 1/n_delays dilution of genuine forecast error under uniform.
         with self._timed("train/2.trajectory_step"):
             if self.trajectory_training:
+                traj_kwargs = {}
+                if self.trajectory_loss_most_recent:
+                    traj_kwargs['reconstruction_mode'] = 'most_recent'
                 train_rets['trajectory'] = self.trajectory_model_step(
-                    batch, batch_idx, dataloader_idx
+                    batch, batch_idx, dataloader_idx, **traj_kwargs
                 )
 
         # Encode once for loop closure, reconstruction, and regularizers
