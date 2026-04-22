@@ -6,6 +6,11 @@ a trajectory-linearised (LTV) system
     y     = C(t) x
 ZOH-discretised with step ``dt`` so that ``M_k = exp(A_k dt)``.
 
+Set ``discrete=True`` if ``A, B, C`` are already the one-step discrete-time
+matrices (i.e. ``x_{k+1} = A x_k + B u_k``). In that case ``dt`` is ignored,
+``M_k = A_k`` directly (no matrix_exp), ``P_k = A_k^{-1}``, and ``B, C``
+enter unscaled (no sqrt(dt)).
+
 The algorithm is the standard square-root low-rank Lyapunov iteration: each
 step concatenates the propagated square-root factor with the scaled driving
 term, then takes a reduced QR of the transpose. This preserves rank across
@@ -31,6 +36,7 @@ def compute_all_gramians(
     return_sequences: bool = False,
     return_spectrums: bool = True,
     rescale: bool = False,
+    discrete: bool = False,
 ) -> tuple:
     """Compute reachability, controllability, and observability Gramians.
 
@@ -43,7 +49,7 @@ def compute_all_gramians(
     C_mat : torch.Tensor
         Output matrices, shape ``(batch, T, M_out, N)``.
     dt : float
-        Discretisation step.
+        Discretisation step. Ignored when ``discrete=True``.
     return_sequences : bool, default False
         If True, return per-timestep time series (leading dim ``(batch, T, ...)``).
         Otherwise return only the terminal Gramian.
@@ -61,6 +67,11 @@ def compute_all_gramians(
           same shape as before; ``l`` has shape ``(batch,)`` (or
           ``(batch, T)`` when ``return_sequences=True``).
         * ``spec_*`` entries contain **log** eigenvalues of the true Gramian.
+    discrete : bool, default False
+        If True, treat ``A, B, C`` as one-step discrete-time matrices
+        (``x_{k+1} = A x_k + B u_k``). Skips the matrix_exp, uses
+        ``A_k^{-1}`` for the backward pass, and drops the sqrt(dt) factors
+        on ``B, C``. ``dt`` is ignored. Requires ``A_k`` nonsingular.
 
     Returns
     -------
@@ -76,10 +87,16 @@ def compute_all_gramians(
     device, dtype = A.device, A.dtype
 
     # 1. Precompute transitions and scaled I/O matrices
-    M_k = torch.linalg.matrix_exp(A * dt)   # forward state transition
-    P_k = torch.linalg.matrix_exp(-A * dt)  # backward state transition (for W_c)
-    B_tilde = B_mat * math.sqrt(dt)
-    C_tilde = C_mat * math.sqrt(dt)
+    if discrete:
+        M_k = A                              # A is already the one-step map
+        P_k = torch.linalg.inv(A)            # backward = inverse one-step map
+        B_tilde = B_mat                      # no Riemann-weight sqrt(dt)
+        C_tilde = C_mat
+    else:
+        M_k = torch.linalg.matrix_exp(A * dt)   # forward state transition
+        P_k = torch.linalg.matrix_exp(-A * dt)  # backward state transition (for W_c)
+        B_tilde = B_mat * math.sqrt(dt)
+        C_tilde = C_mat * math.sqrt(dt)
 
     # 2. Square-root factors (initialised to zero => W_*(0) = 0)
     S_r = torch.zeros(batch_size, N, N, dtype=dtype, device=device)

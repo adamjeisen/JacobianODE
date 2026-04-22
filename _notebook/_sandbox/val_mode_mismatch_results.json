@@ -1,0 +1,282 @@
+[
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "37nbvfaw",
+    "lc_weight": 10,
+    "state": "finished",
+    "loss_mr": 0.006216008114279248,
+    "loss_unif": 0.0022103627343312837
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "kla2hl9w",
+    "lc_weight": 0.01,
+    "state": "finished",
+    "loss_mr": 0.0010958587045024615,
+    "loss_unif": 0.00033572878601262346
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "vemccm07",
+    "lc_weight": 0.1,
+    "state": "finished",
+    "loss_mr": 0.0028325473103905097,
+    "loss_unif": 0.0009369927538500633
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "brnsc37d",
+    "lc_weight": 0.0001,
+    "state": "finished",
+    "loss_mr": 0.00021645431388606085,
+    "loss_unif": 6.759512825738057e-05
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "z4l1eazh",
+    "lc_weight": 1e-05,
+    "state": "finished",
+    "loss_mr": 0.00012343727166808094,
+    "loss_unif": 4.346847322267422e-05
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "pd8hhmyv",
+    "lc_weight": 0.001,
+    "state": "finished",
+    "loss_mr": 0.00041353173946845345,
+    "loss_unif": 0.00013030274749326054
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "4dzm6954",
+    "lc_weight": 1,
+    "state": "finished",
+    "loss_mr": 0.0042092554867849685,
+    "loss_unif": 0.0013436468580039218
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "btaured2",
+    "lc_weight": 1e-06,
+    "state": "finished",
+    "loss_mr": 0.00015652467118343338,
+    "loss_unif": 6.008084574204986e-05
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30__lc_sweep",
+    "run_id": "7fdqopax",
+    "lc_weight": 0,
+    "state": "finished",
+    "loss_mr": 0.0003526762657202198,
+    "loss_unif": 0.00010648802117430023
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "kux0nmyq",
+    "lc_weight": 0,
+    "state": "finished",
+    "loss_mr": 0.0008387026173295453,
+    "loss_unif": 0.0004235688174958341
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "278k3fs6",
+    "lc_weight": 1e-06,
+    "state": "finished",
+    "loss_mr": 0.0011223613000765909,
+    "loss_unif": 0.0004204320357530378
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "39prin7v",
+    "lc_weight": 1e-05,
+    "state": "finished",
+    "loss_mr": 0.0011032197653548792,
+    "loss_unif": 0.00041637687900220044
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "1aa60yos",
+    "lc_weight": 0.0001,
+    "state": "finished",
+    "loss_mr": 0.0010774791880976409,
+    "loss_unif": 0.0004164583624515217
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "uargsgi2",
+    "lc_weight": 0.001,
+    "state": "finished",
+    "loss_mr": 0.0013134053879184648,
+    "loss_unif": 0.0004974840121576563
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "2oy98bma",
+    "lc_weight": 1,
+    "state": "finished",
+    "loss_mr": 0.003656887580291368,
+    "loss_unif": 0.001459390543459449
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "zswyiot9",
+    "lc_weight": 0.1,
+    "state": "finished",
+    "loss_mr": 0.004195427871309221,
+    "loss_unif": 0.0014473246774286963
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "0urkgv2y",
+    "lc_weight": 0.01,
+    "state": "finished",
+    "loss_mr": 0.002161704054742586,
+    "loss_unif": 0.0006934425982763059
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__lc_sweep",
+    "run_id": "rh70oa5r",
+    "lc_weight": 10,
+    "state": "finished",
+    "loss_mr": 0.0059133198519703,
+    "loss_unif": 0.0026077729708049446
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "y7938e7x",
+    "lc_weight": 0.001,
+    "state": "finished",
+    "loss_mr": 0.008999583893455565,
+    "loss_unif": 0.005294193630106747
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "8jqwi5gc",
+    "lc_weight": 0.1,
+    "state": "finished",
+    "loss_mr": 0.011913634487427771,
+    "loss_unif": 0.006796700181439519
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "bxuw994m",
+    "lc_weight": 0.0001,
+    "state": "finished",
+    "loss_mr": 0.012946323375217617,
+    "loss_unif": 0.0069982283166609704
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "cuscq7w2",
+    "lc_weight": 0,
+    "state": "finished",
+    "loss_mr": 0.012585806602146477,
+    "loss_unif": 0.00703908281866461
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "f91ecsag",
+    "lc_weight": 0.01,
+    "state": "finished",
+    "loss_mr": 0.014596197404898703,
+    "loss_unif": 0.0071877072914503515
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "n5m6h4g9",
+    "lc_weight": 10,
+    "state": "finished",
+    "loss_mr": 0.017306609428487718,
+    "loss_unif": 0.009884201572276652
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "qt8nlbvw",
+    "lc_weight": 1,
+    "state": "finished",
+    "loss_mr": 0.013480574474669993,
+    "loss_unif": 0.0075803123181685805
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "cxkzlvxb",
+    "lc_weight": 1e-05,
+    "state": "finished",
+    "loss_mr": 0.014522162091452628,
+    "loss_unif": 0.008258961897809058
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise005__lc_sweep",
+    "run_id": "dgh2ncgu",
+    "lc_weight": 1e-06,
+    "state": "finished",
+    "loss_mr": 0.017669544671662152,
+    "loss_unif": 0.009439339803066105
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "092g9dhl",
+    "lc_weight": 0,
+    "state": "finished",
+    "loss_mr": 0.0022106489559519105,
+    "loss_unif": 0.0006197591574164107
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "opmdjlmu",
+    "lc_weight": 1e-06,
+    "state": "finished",
+    "loss_mr": 0.0010821223477250896,
+    "loss_unif": 0.00041031292676052544
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "kfn859xs",
+    "lc_weight": 1e-05,
+    "state": "finished",
+    "loss_mr": 0.0017784863302949816,
+    "loss_unif": 0.0005930434817855712
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "4tfmicbv",
+    "lc_weight": 0.0001,
+    "state": "finished",
+    "loss_mr": 0.0017982579265662935,
+    "loss_unif": 0.0005763224689872004
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "vhaz6ufh",
+    "lc_weight": 0.01,
+    "state": "finished",
+    "loss_mr": 0.0035638917397591285,
+    "loss_unif": 0.0010291291764588095
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "g6w8e9tz",
+    "lc_weight": 0.001,
+    "state": "finished",
+    "loss_mr": 0.001813669194234535,
+    "loss_unif": 0.0006328048002615105
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "i22vgice",
+    "lc_weight": 0.1,
+    "state": "finished",
+    "loss_mr": 0.005917390968534164,
+    "loss_unif": 0.0018905484321294352
+  },
+  {
+    "group": "lorenz_partial_25d_additive_mse_uniform_p30_obsnoise001__nolpl_lc_sweep",
+    "run_id": "uue09sft",
+    "lc_weight": 1,
+    "state": "finished",
+    "loss_mr": 0.005221770683419891,
+    "loss_unif": 0.0019718871408258565
+  }
+]

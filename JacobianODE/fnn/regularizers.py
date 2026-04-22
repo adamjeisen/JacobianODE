@@ -337,6 +337,46 @@ class Amplification(nn.Module):
         )
 
 
+def _knn_indices_sq_euclidean_batched(
+    emb: torch.Tensor,
+    k: int,
+    batch_size: int,
+) -> torch.Tensor:
+    """k nearest neighbor indices (rows of ``emb``) without an :math:`N \\times N` distance matrix.
+
+    Uses squared Euclidean distance; ordering matches Euclidean ``cdist`` for neighbor sets
+    (ties may order differently).
+
+    Parameters
+    ----------
+    emb : torch.Tensor
+        ``(n_pts, d)`` embedding vectors.
+    k : int
+        Number of neighbors per row (including the point itself if it is among the smallest).
+    batch_size : int
+        Number of query rows per block. Peak extra memory is ``O(batch_size * n_pts)`` floats.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(n_pts, k)`` ``long`` indices into rows of ``emb``.
+    """
+    n_pts, _d = emb.shape
+    device = emb.device
+    out = torch.empty((n_pts, k), dtype=torch.long, device=device)
+    emb_t = emb.T.contiguous()
+    all_sq = (emb * emb).sum(dim=1)
+    for start in range(0, n_pts, batch_size):
+        end = min(start + batch_size, n_pts)
+        q = emb[start:end]
+        q_sq = (q * q).sum(dim=1, keepdim=True)
+        dist2 = q_sq + all_sq.unsqueeze(0) - 2.0 * torch.mm(q, emb_t)
+        dist2 = torch.clamp(dist2, min=0.0)
+        _, idx = torch.topk(dist2, k, largest=False, dim=1)
+        out[start:end] = idx
+    return out
+
+
 def loss_amplification(
     embedding: torch.Tensor,
     data: torch.Tensor | None = None,
@@ -344,6 +384,7 @@ def loss_amplification(
     max_T: int = 5,
     normalize: bool = False,
     epsilon: float = 1e-8,
+    knn_batch_size: int | None = None,
 ) -> torch.Tensor:
     """Compute noise amplification (sigma) for a time-delay embedding.
 
@@ -368,6 +409,16 @@ def loss_amplification(
         Divide sigma by sum(1 / eps_k).
     epsilon : float
         Small constant to avoid division by zero.
+    knn_batch_size : int, optional
+        Rows per block when finding k-NN in embedding space.  Smaller values use less
+        peak GPU memory (distance blocks are ``(batch, n_pts)`` instead of ``(n_pts, n_pts)``).
+        Default picks a batch size targeting ~128 MiB per block from ``n_pts``.
+
+    Notes
+    -----
+    Pairwise neighbor spread ``eps_k`` uses the identity
+    :math:`\\sum_{i,j}\\|n_i-n_j\\|^2 = 2K\\sum_k\\|n_k\\|^2 - 2\\|\\sum_k n_k\\|^2`
+    to avoid materializing an ``(n_\\text{pts}, K, K, D)`` difference tensor.
 
     Returns
     -------
@@ -393,20 +444,30 @@ def loss_amplification(
         -1, embedding.shape[-1]
     )  # (n_pts, latent_dim)
 
+    n_pts = emb_flat.shape[0]
+    if knn_batch_size is None:
+        # ~128 MiB float32 budget for one (batch, n_pts) distance block
+        _target_block_bytes = 128 * 1024 * 1024
+        knn_batch_size = max(
+            1,
+            min(8192, _target_block_bytes // max(1, n_pts * 4)),
+        )
+
     # k-NN in embedding space (discrete selection, no grad) ─────────────
     with torch.no_grad():
-        dists = torch.cdist(emb_flat, emb_flat)          # (n_pts, n_pts)
-        _, indices = torch.topk(
-            dists, n_neighbors, largest=False,
+        indices = _knn_indices_sq_euclidean_batched(
+            emb_flat, n_neighbors, knn_batch_size,
         )                                                  # (n_pts, K)
 
     # eps_k: mean pairwise squared distance among neighbors ─────────────
     neighbors = emb_flat[indices]                          # (n_pts, K, latent_dim)
-    diff = neighbors.unsqueeze(2) - neighbors.unsqueeze(1) # (n_pts, K, K, latent_dim)
-    sq_pairwise = diff.pow(2).sum(dim=-1)                  # (n_pts, K, K)
     K = n_neighbors
-    # eps_k = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1))   # (n_pts,)
-    eps_k = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1) * emb_flat.shape[-1]) # (n_pts,)
+    # sum_{i,j} ||n_i - n_j||^2 = 2K * sum_k ||n_k||^2 - 2 ||sum_k n_k||^2  (no K×K×D tensor)
+    sum_sq_norms = (neighbors * neighbors).sum(dim=(1, 2))
+    sum_vec = neighbors.sum(dim=1)
+    sq_norm_sum_vec = (sum_vec * sum_vec).sum(dim=-1)
+    pairwise_sq_sum = 2.0 * K * sum_sq_norms - 2.0 * sq_norm_sum_vec
+    eps_k = pairwise_sq_sum / (K * (K - 1) * emb_flat.shape[-1])
 
     # E_k(T): neighbor-variance of data T steps ahead ──────────────────
     E_k_list: list[torch.Tensor] = []

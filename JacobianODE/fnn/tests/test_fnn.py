@@ -8,7 +8,14 @@ import numpy as np
 import pytest
 import torch
 
-from JacobianODE.fnn.regularizers import FNN, DeCov, loss_false, loss_cov
+from JacobianODE.fnn.regularizers import (
+    DeCov,
+    FNN,
+    _knn_indices_sq_euclidean_batched,
+    loss_cov,
+    loss_false,
+    loss_amplification,
+)
 from JacobianODE.fnn.networks import MLPAutoencoder, LSTMAutoencoder
 from JacobianODE.fnn.models import MLPEmbedding, LSTMEmbedding, ETDEmbedding
 from JacobianODE.fnn.utils import hankel_matrix, standardize_ts
@@ -79,6 +86,48 @@ class TestRegularizers:
         x = torch.randn(20, 4)
         loss = reg(x)
         assert torch.isfinite(loss)
+
+    def test_knn_batched_matches_full_cdist(self):
+        """Batched squared-distance k-NN indices match ``cdist`` + ``topk``."""
+        torch.manual_seed(0)
+        emb = torch.randn(80, 5)
+        k = 7
+        batch = 11
+        with torch.no_grad():
+            dists = torch.cdist(emb, emb)
+            _, ref = torch.topk(dists, k, largest=False, dim=1)
+        got = _knn_indices_sq_euclidean_batched(emb, k, batch)
+        torch.testing.assert_close(got, ref)
+
+    def test_loss_amplification_batched_grad(self):
+        """Amplification loss is finite and backprops when k-NN is batched."""
+        T, D = 120, 3
+        max_T = 5
+        z = torch.randn(1, T, D, requires_grad=True)
+        x = torch.randn(1, T, D)
+        loss = loss_amplification(
+            z, x, n_neighbors=5, max_T=max_T, knn_batch_size=16,
+        )
+        assert loss.ndim == 0
+        assert torch.isfinite(loss)
+        loss.backward()
+        assert z.grad is not None
+        assert torch.isfinite(z.grad).all()
+
+    def test_eps_k_pairwise_identity(self):
+        """eps_k uses the 2K||·||^2 - 2||sum||^2 identity (matches explicit K×K diff)."""
+        torch.manual_seed(0)
+        n_pts, K, D = 7, 5, 4
+        neighbors = torch.randn(n_pts, K, D, dtype=torch.double)
+        diff = neighbors.unsqueeze(2) - neighbors.unsqueeze(1)
+        sq_pairwise = diff.pow(2).sum(dim=-1)
+        eps_explicit = sq_pairwise.sum(dim=(1, 2)) / (K * (K - 1) * D)
+        sum_sq_norms = (neighbors * neighbors).sum(dim=(1, 2))
+        sum_vec = neighbors.sum(dim=1)
+        sq_norm_sum_vec = (sum_vec * sum_vec).sum(dim=-1)
+        pairwise_sq_sum = 2.0 * K * sum_sq_norms - 2.0 * sq_norm_sum_vec
+        eps_algebraic = pairwise_sq_sum / (K * (K - 1) * D)
+        torch.testing.assert_close(eps_algebraic, eps_explicit, rtol=1e-12, atol=1e-12)
 
     def test_fnn_loss_gradients(self):
         """FNN loss should produce valid gradients."""
