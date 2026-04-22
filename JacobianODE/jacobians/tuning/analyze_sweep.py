@@ -1088,6 +1088,186 @@ def compute_per_run_lyapunov(
     }
 
 
+def compute_per_run_tangent_spectrum(
+    wandb_entity: str,
+    wandb_project: str,
+    group: str,
+    save_dir: Path,
+    output_dir: Path,
+    *,
+    metrics_summary: dict | None = None,
+    n_sample_trajectories: int = 8,
+    n_pair_samples: int = 512,
+    expected_intrinsic_dim: int = 3,
+) -> dict[str, Any]:
+    """Compute the ranked tangent-direction spectrum for every run in the sweep.
+
+    For each run with a checkpoint: load the model, encode a sample of test
+    trajectories, and call ``lit_model.compute_tangent_spectrum`` to get the
+    ranked per-direction energy of latent tangents (z_{t+1} - z_t) projected
+    onto the encoder Jacobian. Hopefully concentrates on the top
+    ``expected_intrinsic_dim`` components for a system whose underlying
+    attractor is that-dim (e.g. 3 for Lorenz).
+
+    Produces a two-panel figure ``per_run_tangent_spectrum.png``: per-direction
+    energy (log-y) and cumulative fraction (linear-y), one curve per run,
+    with legend labels derived from each run's swept_config when available.
+
+    Returns a dict mapping run_id -> {energy, spectrum, n_pairs, error}.
+    """
+    import torch
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import wandb as _wandb
+
+    from ..checkpoints.loader import load_run, load_checkpoint
+
+    figures_dir = output_dir / "figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    api = _wandb.Api()
+    raw_runs = list(api.runs(
+        f"{wandb_entity}/{wandb_project}",
+        filters={"group": group},
+    ))
+    ckpt_base = Path(save_dir) / wandb_project
+    all_runs = [r for r in raw_runs if (ckpt_base / r.id / "checkpoints").is_dir()]
+    dropped = len(raw_runs) - len(all_runs)
+    logger.info(
+        f"Computing per-run tangent spectrum for {len(all_runs)} runs with checkpoints "
+        f"({dropped} skipped for missing checkpoint dir)"
+    )
+
+    # Map run_id -> swept_config for legend labels (if metrics_summary
+    # was provided). Falls back to run_id alone when unavailable.
+    swept_by_rid: dict[str, dict] = {}
+    if metrics_summary is not None:
+        for entry in metrics_summary.get("per_run", []) or []:
+            rid = entry.get("run_id")
+            sc = entry.get("swept_config") or {}
+            if rid:
+                swept_by_rid[rid] = sc
+
+    per_run: dict[str, Any] = {}
+    for i, run in enumerate(all_runs):
+        run_id = run.id
+        try:
+            loaded = load_run(
+                f"{wandb_entity}/{wandb_project}",
+                run_id=run_id,
+                save_dir=str(save_dir),
+                generate_data=True,
+                verbose=False,
+                return_full_obs=False,
+            )
+            run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
+            if not hasattr(lit_model, "compute_tangent_spectrum"):
+                per_run[run_id] = {"error": "model has no compute_tangent_spectrum"}
+                continue
+
+            load_checkpoint(run_obj, cfg, lit_model, save_dir=str(save_dir), verbose=False)
+            lit_model = lit_model.to(device).eval()
+
+            if trajs is None or "test_trajs" not in trajs:
+                raise RuntimeError(f"No test_trajs from load_run for {run_id}")
+            ts_batch = trajs["test_trajs"].sequence
+            if ts_batch.shape[0] > n_sample_trajectories:
+                ts_batch = ts_batch[:n_sample_trajectories]
+            ts_batch = ts_batch.to(device)
+
+            result = lit_model.compute_tangent_spectrum(ts_batch, n_samples=n_pair_samples)
+            per_run[run_id] = {
+                "energy": result["energy"].cpu().numpy().tolist(),
+                "spectrum": result["spectrum"].cpu().numpy().tolist(),
+                "n_pairs": int(result["n_pairs"]),
+                "n_dyn": int(result["n_dyn"]),
+                "n_obs": int(result["n_obs"]),
+                "error": None,
+            }
+            logger.info(
+                f"  [{i + 1}/{len(all_runs)}] {run_id}: "
+                f"K={result['n_dyn']}, top-3 cum frac="
+                f"{float(np.cumsum(result['spectrum'].cpu().numpy())[2]):.4f}"
+                if result["n_dyn"] >= 3 else
+                f"  [{i + 1}/{len(all_runs)}] {run_id}: K={result['n_dyn']}"
+            )
+        except Exception as e:
+            per_run[run_id] = {"error": f"{type(e).__name__}: {e}"}
+            logger.warning(f"  [{i + 1}/{len(all_runs)}] {run_id}: FAILED — {e}")
+        finally:
+            try:
+                del lit_model
+            except NameError:
+                pass
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # ---- Overlay plot ----
+    success = [(rid, d) for rid, d in per_run.items() if d.get("error") is None]
+    if not success:
+        logger.warning("per_run_tangent_spectrum: no successful runs to plot")
+        return {"per_run": per_run}
+
+    def _short_label(rid: str) -> str:
+        sc = swept_by_rid.get(rid, {})
+        if not sc:
+            return rid
+        bits = []
+        for k, v in sc.items():
+            short = k.rsplit(".", 1)[-1]
+            if isinstance(v, float):
+                bits.append(f"{short}={v:.0e}" if v != 0 else f"{short}=0")
+            else:
+                bits.append(f"{short}={v}")
+        return " ".join(bits)
+
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        n = len(success)
+        cmap = plt.cm.tab20 if n > 10 else plt.cm.tab10
+        for i, (rid, d) in enumerate(success):
+            E = np.asarray(d["energy"])
+            p = np.asarray(d["spectrum"])
+            x = np.arange(1, len(E) + 1)
+            color = cmap(i % cmap.N)
+            label = _short_label(rid)
+            axes[0].plot(x, np.maximum(E, 1e-20), marker="o", ms=3,
+                         lw=1.2, color=color, label=label, alpha=0.85)
+            axes[1].plot(x, np.cumsum(p), marker="o", ms=3,
+                         lw=1.2, color=color, label=label, alpha=0.85)
+
+        axes[0].set_yscale("log")
+        axes[0].set_xlabel("Ranked tangent direction (1-indexed)")
+        axes[0].set_ylabel("Mean squared projection (energy)")
+        axes[0].set_title(f"Per-direction energy ({n} runs)")
+        axes[0].grid(True, which="both", alpha=0.3)
+
+        axes[1].axvline(
+            expected_intrinsic_dim, color="r", ls="--", lw=1,
+            label=f"expected intrinsic dim = {expected_intrinsic_dim}",
+        )
+        axes[1].set_ylim(0, 1.02)
+        axes[1].set_xlabel("Ranked tangent direction (1-indexed)")
+        axes[1].set_ylabel("Cumulative fraction of energy")
+        axes[1].set_title("Cumulative spectrum")
+        axes[1].grid(True, alpha=0.3)
+        axes[1].legend(loc="lower right", fontsize=7, ncol=2 if n > 10 else 1)
+
+        fig.tight_layout()
+        path = figures_dir / "per_run_tangent_spectrum.png"
+        fig.savefig(path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Wrote {path}")
+    except Exception as e:
+        logger.exception(f"per_run_tangent_spectrum overlay plot failed: {e}")
+
+    return {"per_run": per_run}
+
+
 def write_context(sentinel: dict, output_dir: Path) -> None:
     """Write context.json — everything the report writer needs from the sentinel."""
     expected = sentinel.get("expected_snapshot", {})
@@ -1242,6 +1422,29 @@ def analyze(
             per_run_lyap_error = f"{type(e).__name__}: {e}"
             logger.exception("per-run Lyapunov computation raised")
 
+    # Per-run tangent spectrum (across the whole sweep). Cheap relative to
+    # Lyapunov (~1-2 s per run, just one batch through the encoder + per-pair
+    # Jacobian via vmap). Runs for ANY model with an encoder, including
+    # encoder-only sweeps where this is the headline diagnostic.
+    per_run_tangent_spectrum = {}
+    per_run_tangent_error = None
+    try:
+        ts_result = compute_per_run_tangent_spectrum(
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            group=group,
+            save_dir=save_dir,
+            output_dir=output_dir,
+            metrics_summary=metrics_summary,
+        )
+        per_run_tangent_spectrum = ts_result.get("per_run", {})
+        p = output_dir / "figures" / "per_run_tangent_spectrum.png"
+        if p.is_file():
+            figure_map["per_run_tangent_spectrum"] = str(p)
+    except Exception as e:
+        per_run_tangent_error = f"{type(e).__name__}: {e}"
+        logger.exception("per-run tangent spectrum computation raised")
+
     metrics_doc = {
         # v2 adds: metrics_summary.swept_paths, metrics_summary.overall_chosen_run,
         # and per_run[*].swept_config (see summarize_sweep_from_wandb).
@@ -1255,6 +1458,8 @@ def analyze(
         "per_run_lyapunov": per_run_lyapunov,
         "empirical_lyapunov_spectrum": empirical_lyapunov_mean,
         "per_run_lyapunov_error": per_run_lyap_error,
+        "per_run_tangent_spectrum": per_run_tangent_spectrum,
+        "per_run_tangent_spectrum_error": per_run_tangent_error,
         "success_criteria_verdicts": verdicts,
         "figures": figure_map,
         "analytics_error": analytics_error,
