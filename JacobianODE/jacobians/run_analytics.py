@@ -96,6 +96,7 @@ _ALL_SECTIONS = [
     "long_trajectory",
     "encoder_decoder_jacobians",
     "amplification",
+    "tangent_spectrum",
 ]
 
 
@@ -844,6 +845,59 @@ def plot_encoder_decoder_jacobians(
     return fig
 
 
+def plot_tangent_spectrum(
+    energy: np.ndarray,
+    spectrum: np.ndarray,
+    n_pairs: int,
+    n_dyn: int,
+    n_obs: int,
+    expected_intrinsic_dim: int | None = 3,
+) -> plt.Figure:
+    """Two-panel ranked spectrum of latent tangents projected onto encoder Jacobian.
+
+    Left:  raw per-direction energy (log-y).
+    Right: cumulative fraction of energy (linear-y), with the
+           ``expected_intrinsic_dim`` reference line. For Lorenz this is 3.
+    Both panels x = ranked tangent direction (1-indexed for readability).
+    """
+    K = len(energy)
+    x = np.arange(1, K + 1)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+
+    # Panel 1: per-direction energy, log-y.
+    axes[0].plot(x, energy, marker="o", lw=1.4, color="C0")
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("Ranked tangent direction (1-indexed)")
+    axes[0].set_ylabel("Mean squared projection (energy)")
+    axes[0].set_title(f"Per-direction energy (K={K} = min(n_dyn={n_dyn}, n_obs={n_obs}))")
+    axes[0].grid(True, which="both", alpha=0.3)
+
+    # Panel 2: cumulative fraction of energy.
+    cum = np.cumsum(spectrum)
+    axes[1].plot(x, cum, marker="o", lw=1.4, color="C0",
+                 label="cumulative fraction")
+    if expected_intrinsic_dim is not None and expected_intrinsic_dim <= K:
+        axes[1].axvline(
+            expected_intrinsic_dim, color="r", ls="--", lw=1,
+            label=f"expected intrinsic dim = {expected_intrinsic_dim}",
+        )
+        cum_at_expected = float(cum[expected_intrinsic_dim - 1])
+        axes[1].axhline(
+            cum_at_expected, color="r", ls=":", lw=0.8, alpha=0.6,
+            label=f"cum @ dim {expected_intrinsic_dim} = {cum_at_expected:.4f}",
+        )
+    axes[1].set_ylim(0, 1.02)
+    axes[1].set_xlabel("Ranked tangent direction (1-indexed)")
+    axes[1].set_ylabel("Cumulative fraction of energy")
+    axes[1].set_title(f"Cumulative spectrum (n_pairs = {n_pairs})")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="lower right", fontsize=8)
+
+    fig.tight_layout()
+    return fig
+
+
 def plot_amplification(
     amp_loss_true: float,
     amp_loss_latent: float,
@@ -1109,6 +1163,30 @@ def run_analytics(
     lit_model.eval()
 
     is_latent = isinstance(lit_model, LitLatentJacobianODE)
+
+    # Encoder-only runs have no trained dynamics, so dynamics-only analytics
+    # sections (Lyapunov, Kaplan-Yorke, MASE, prediction windows, long
+    # trajectory rollouts) are meaningless. Strip them from the active set
+    # before the orchestration loop. Tangent-spectrum, reconstruction,
+    # latent_utilization, and encoder/decoder Jacobian sections still apply.
+    encoder_only_mode = bool(getattr(lit_model, "encoder_only_mode", False))
+    if encoder_only_mode:
+        _dropped = {
+            "sweep_overview",  # uses C1/C2/C3 selection criteria → all dynamics
+            "mase",            # one-step teacher-forced trajectory prediction
+            "lyapunov",        # dynamics-MLP Jacobians
+            "kaplan_yorke",    # derived from Lyapunov spectrum
+            "prediction_windows",
+            "prediction_detail",
+            "long_trajectory",
+        }
+        _skipped = active_sections & _dropped
+        if _skipped:
+            print(
+                f"encoder_only_mode=True → skipping dynamics-only sections: "
+                f"{sorted(_skipped)}"
+            )
+        active_sections = active_sections - _dropped
 
     # -------------------------------------------------------- config extraction
     mu = float(cfg.data.postprocessing.mu) if np.isscalar(cfg.data.postprocessing.mu) else np.array(cfg.data.postprocessing.mu)
@@ -2107,6 +2185,51 @@ def run_analytics(
                         _html_section("Amplification Loss", _amp_lines)
                         _emit("amplification", fig)
                         _summary_lines += ["", "=== Amplification Loss ==="] + _amp_lines
+
+        # ============================================================
+        # 12. Tangent-space spectrum (encoder Jacobian × latent velocity)
+        # ============================================================
+        if "tangent_spectrum" in active_sections and is_latent and hasattr(
+            lit_model, "compute_tangent_spectrum"
+        ):
+            print("Computing tangent space spectrum ...")
+            ts_batch = trajs["test_trajs"].sequence
+            # Cap input to 16 trajectories so the per-pair Jacobian computation
+            # (vmap'd jacrev/jacfwd over up to ~3000 points) stays bounded.
+            if ts_batch.shape[0] > 16:
+                ts_batch = ts_batch[:16]
+            ts_batch = ts_batch.to(device_obj)
+            try:
+                ts_result = lit_model.compute_tangent_spectrum(
+                    ts_batch, n_samples=512,
+                )
+                E_np = ts_result["energy"].cpu().numpy()
+                p_np = ts_result["spectrum"].cpu().numpy()
+                K = len(E_np)
+                cum = np.cumsum(p_np)
+                # For partial-obs Lorenz the underlying attractor is 3-D; for
+                # other systems the user can still read the curve and judge
+                # where energy plateaus. Pass 3 as a default reference line.
+                fig = plot_tangent_spectrum(
+                    E_np, p_np, ts_result["n_pairs"],
+                    n_dyn=ts_result["n_dyn"], n_obs=ts_result["n_obs"],
+                    expected_intrinsic_dim=3,
+                )
+                _emit("tangent_spectrum", fig)
+                _ts_lines = [
+                    f"K (= min(n_dyn, n_obs)): {K}",
+                    f"n_pairs: {ts_result['n_pairs']}",
+                    "Top-5 spectrum: " + ", ".join(
+                        f"{v:.4f}" for v in p_np[:min(5, K)]
+                    ),
+                    f"Cumulative @ dim 3: {float(cum[2]):.4f}" if K >= 3 else "",
+                    f"Cumulative @ dim 5: {float(cum[4]):.4f}" if K >= 5 else "",
+                ]
+                _ts_lines = [ln for ln in _ts_lines if ln]
+                _html_section("Tangent Space Spectrum", _ts_lines)
+                _summary_lines += ["", "=== Tangent Space Spectrum ==="] + _ts_lines
+            except Exception as exc:
+                print(f"  tangent_spectrum failed: {exc}")
 
         # ============================================================
         # Final: consolidated summary section (HTML only — always last)

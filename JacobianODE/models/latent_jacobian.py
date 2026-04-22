@@ -102,6 +102,14 @@ class LitLatentJacobianODE(LitBase):
         # averaging dilutes the "genuinely hard" prediction signal by 1/n_delays).
         # Default True so new sweeps get the matched behaviour without opt-in.
         trajectory_loss_most_recent=True,
+        # When True, training and validation skip ALL dynamics-related work
+        # (trajectory rollout, loop closure, latent prediction, Jacobian /
+        # eigenvalue diagnostics) and use only reconstruction + KL losses.
+        # Training routes every epoch through ``_warmup_step``; validation
+        # takes a fast-path that mirrors the warmup loss computation. The
+        # encoder/decoder is trained as a standalone autoencoder. Default
+        # False — does not affect existing experiment configs.
+        encoder_only_mode=False,
         # Tangent space entropy
         tangent_entropy_weight=0.0,
         tangent_entropy_mode='quadratic',
@@ -210,6 +218,7 @@ class LitLatentJacobianODE(LitBase):
             )
         self.reconstruction_mode = reconstruction_mode
         self.trajectory_loss_most_recent = trajectory_loss_most_recent
+        self.encoder_only_mode = encoder_only_mode
         if reconstruction_mode == 'harmonic':
             obs_dim = encoder.n_latent
             w_raw = 1.0 / (torch.arange(obs_dim, dtype=torch.float32) + 1.0)
@@ -575,6 +584,88 @@ class LitLatentJacobianODE(LitBase):
 
         return A
 
+    def _build_tangent_pairs(self, batch, z_full, n_samples=None):
+        """Build (z_dyn-tangent, observation) pairs for tangent diagnostics.
+
+        Returns flat ``(M, n_dyn)`` tangent vectors ``dz = z_{t+1} - z_t``
+        and the corresponding ``(M, n_obs)`` observations ``x_t`` for
+        encoder-Jacobian computation. Optionally subsamples to ``n_samples``
+        pairs (random permutation, no replacement). Used by both the
+        tangent-entropy training loss and the post-training tangent-spectrum
+        diagnostic.
+
+        Returns ``(dz_sample, x_sample, n_dyn, n_obs)`` or ``(None, None,
+        n_dyn, n_obs)`` if no pairs exist (T' < 2).
+        """
+        z_dyn, _ = self._split_latent(z_full)
+        n_dyn = z_dyn.shape[-1]
+        B, T, _ = z_dyn.shape
+        if T < 2:
+            return None, None, n_dyn, batch.shape[-1]
+
+        dz = z_dyn[:, 1:, :] - z_dyn[:, :-1, :]  # (B, T-1, n_dyn)
+
+        # Build the observation tensor that aligns with each dz timestep.
+        if hasattr(self.encoder, 'time_window'):
+            w = self.encoder.time_window
+            n_obs = w * batch.shape[-1]
+            windows = batch.unfold(1, w, 1).permute(0, 1, 3, 2)  # (B, T', w, D)
+            x_for_jac = windows[:, :-1].reshape(B, T - 1, -1)    # (B, T-1, w*D)
+        else:
+            margin = getattr(self.encoder, 'context_margin', 0)
+            n_obs = batch.shape[-1]
+            x_for_jac = batch[:, margin:margin + T - 1, :]       # (B, T-1, D_obs)
+
+        dz_flat = dz.reshape(-1, n_dyn)
+        x_flat = x_for_jac.reshape(-1, n_obs)
+        N = dz_flat.shape[0]
+        if N == 0:
+            return None, None, n_dyn, n_obs
+
+        if n_samples is not None and N > n_samples:
+            idx = torch.randperm(N, device=z_dyn.device)[:n_samples]
+            return dz_flat[idx], x_flat[idx], n_dyn, n_obs
+        return dz_flat, x_flat, n_dyn, n_obs
+
+    def _encoder_jacobian_at(self, x_flat, n_dyn, n_obs):
+        """Compute the encoder Jacobian dz_dyn/dx at a flat batch of obs.
+
+        Returns ``(M, n_dyn, n_obs)`` Jacobian matrices via ``torch.func``,
+        chosen between ``jacrev``/``jacfwd`` based on shape. For coupling
+        encoders (``n_target_dims is not None``), only the dynamic subspace
+        rows are computed.
+        """
+        n_target = self.n_target_dims  # None for non-coupling
+        if hasattr(self.encoder, 'time_window'):
+            w = self.encoder.time_window
+            D = x_flat.shape[-1] // w
+
+            def _encode_point(x_flat_pt):
+                z = self.encoder.encode(x_flat_pt.reshape(1, w, D)).squeeze(0)
+                return z[:n_target] if n_target is not None else z
+        else:
+            def _encode_point(x_pt):
+                z = self.encoder.encode(
+                    x_pt.unsqueeze(0).unsqueeze(0)
+                ).squeeze(0).squeeze(0)
+                return z[:n_target] if n_target is not None else z
+
+        # Pick jacrev vs jacfwd based on output vs input dimension.
+        if n_dyn <= n_obs:
+            jac_fn = torch.func.jacrev(_encode_point)
+        else:
+            jac_fn = torch.func.jacfwd(_encode_point)
+
+        was_training = self.encoder.training
+        self.encoder.eval()
+        try:
+            with torch.no_grad():
+                J_all = torch.func.vmap(jac_fn)(x_flat)  # (M, n_dyn, n_obs)
+        finally:
+            if was_training:
+                self.encoder.train()
+        return J_all
+
     def _tangent_space_entropy_loss(self, batch, z_full):
         """Tangent space entropy using **encoder** Jacobians (dz/dx).
 
@@ -598,74 +689,84 @@ class LitLatentJacobianODE(LitBase):
         torch.Tensor
             Scalar loss (zero if T' < 2).
         """
-        z_dyn, _ = self._split_latent(z_full)
-        n_dyn = z_dyn.shape[-1]
-        B, T, _ = z_dyn.shape
-        if T < 2:
+        dz_sample, x_sample, n_dyn, n_obs = self._build_tangent_pairs(
+            batch, z_full, n_samples=self.tangent_entropy_n_samples,
+        )
+        if dz_sample is None:
+            z_dyn, _ = self._split_latent(z_full)
             return z_dyn.new_zeros(1).squeeze()
-
-        dz = z_dyn[:, 1:, :] - z_dyn[:, :-1, :]  # (B, T-1, n_dyn)
-
-        # Build the observation tensor that aligns with each dz timestep.
-        if hasattr(self.encoder, 'time_window'):
-            w = self.encoder.time_window
-            n_obs = w * batch.shape[-1]
-            windows = batch.unfold(1, w, 1).permute(0, 1, 3, 2)  # (B, T', w, D)
-            x_for_jac = windows[:, :-1].reshape(B, T - 1, -1)    # (B, T-1, w*D)
-        else:
-            margin = getattr(self.encoder, 'context_margin', 0)
-            n_obs = batch.shape[-1]
-            x_for_jac = batch[:, margin:margin + T - 1, :]       # (B, T-1, D_obs)
-
-        dz_flat = dz.reshape(-1, n_dyn)
-        x_flat = x_for_jac.reshape(-1, n_obs)
-        N = dz_flat.shape[0]
-        if N == 0:
-            return z_dyn.new_zeros(1).squeeze()
-
-        # Subsample
-        if self.tangent_entropy_n_samples is not None and N > self.tangent_entropy_n_samples:
-            idx = torch.randperm(N, device=z_dyn.device)[:self.tangent_entropy_n_samples]
-            x_sample = x_flat[idx]
-            dz_sample = dz_flat[idx]
-        else:
-            x_sample = x_flat
-            dz_sample = dz_flat
-
-        # Single-point encoder function for autograd Jacobian computation.
-        # For coupling encoders, return only z_dyn dims so the Jacobian is
-        # (n_dyn, n_obs) rather than (n_latent, n_obs).
-        n_target = self.n_target_dims  # None for non-coupling
-        if hasattr(self.encoder, 'time_window'):
-            w = self.encoder.time_window
-            D = batch.shape[-1]
-
-            def _encode_point(x_flat_pt):
-                z = self.encoder.encode(x_flat_pt.reshape(1, w, D)).squeeze(0)
-                return z[:n_target] if n_target is not None else z
-        else:
-            def _encode_point(x_pt):
-                z = self.encoder.encode(
-                    x_pt.unsqueeze(0).unsqueeze(0)
-                ).squeeze(0).squeeze(0)
-                return z[:n_target] if n_target is not None else z
-
-        # Pick jacrev vs jacfwd based on output vs input dimension.
-        if n_dyn <= n_obs:
-            jac_fn = torch.func.jacrev(_encode_point)
-        else:
-            jac_fn = torch.func.jacfwd(_encode_point)
-
-        was_training = self.encoder.training
-        self.encoder.eval()
-        try:
-            with torch.no_grad():
-                J_all = torch.func.vmap(jac_fn)(x_sample)  # (M, n_dyn, n_obs)
-        finally:
-            if was_training:
-                self.encoder.train()
-
+        J_all = self._encoder_jacobian_at(x_sample, n_dyn, n_obs)
         return tangent_space_entropy(dz_sample, J_all, mode=self.tangent_entropy_mode)
+
+    def compute_tangent_spectrum(
+        self,
+        batch: torch.Tensor,
+        n_samples: int | None = 256,
+    ) -> dict[str, torch.Tensor]:
+        """Diagnostic: ranked spectrum of latent tangents projected onto encoder Jacobian.
+
+        For each consecutive pair of observations ``(x_t, x_{t+1})`` in the
+        batch, encodes both, computes the latent tangent ``dz = z_{t+1} - z_t``,
+        projects ``dz`` onto the columns of ``U`` from the SVD of the encoder
+        Jacobian at ``x_t``, and reports the ranked per-direction energy
+        averaged across the batch. For Lorenz, the spectrum should
+        concentrate on the top ~3 components (the true intrinsic dim of the
+        attractor's tangent bundle).
+
+        Same math as :meth:`_tangent_space_entropy_loss` up to the SVD +
+        projection step; this method skips the entropy reduction and returns
+        the raw ranked spectrum so it can be plotted / averaged across runs.
+
+        Parameters
+        ----------
+        batch : Tensor (B, T, D_obs)
+            Raw observations.
+        n_samples : int or None
+            Subsample size for Jacobian computation. None = use all pairs.
+
+        Returns
+        -------
+        dict
+            ``{
+                'energy': Tensor (K,),    # mean squared projection per direction
+                'spectrum': Tensor (K,),  # energy normalized to sum to 1
+                'n_pairs': int,           # number of consecutive pairs used
+                'n_dyn': int,             # rows of the encoder Jacobian
+                'n_obs': int,             # cols of the encoder Jacobian
+            }``
+            where ``K = min(n_dyn, n_obs)``. Sorted descending by SVD.
+        """
+        with torch.no_grad():
+            z_full = self.encode_trajectory(batch)
+        dz_sample, x_sample, n_dyn, n_obs = self._build_tangent_pairs(
+            batch, z_full, n_samples=n_samples,
+        )
+        if dz_sample is None:
+            K = min(n_dyn, n_obs)
+            zeros = torch.zeros(K, device=batch.device)
+            return {'energy': zeros, 'spectrum': zeros, 'n_pairs': 0,
+                    'n_dyn': n_dyn, 'n_obs': n_obs}
+        J_all = self._encoder_jacobian_at(x_sample, n_dyn, n_obs)
+        with torch.no_grad():
+            U, _, _ = torch.linalg.svd(J_all, full_matrices=False)  # (M, n_dyn, K)
+            projections = torch.bmm(
+                U.transpose(-2, -1), dz_sample.unsqueeze(-1)
+            ).squeeze(-1)                                            # (M, K)
+            E_unsorted = (projections ** 2).mean(dim=0)              # (K,)
+            # Sort descending by mean energy. Singular-value ordering is
+            # only meaningful when sv's are well-separated; for degenerate
+            # sv's (e.g. orthonormal-row J) U columns are arbitrary, so
+            # sorting by projected energy is what makes the spectrum a
+            # well-defined ranked diagnostic.
+            E, _ = torch.sort(E_unsorted, descending=True)
+            p = E / (E.sum() + 1e-10)
+        return {
+            'energy': E,
+            'spectrum': p,
+            'n_pairs': int(dz_sample.shape[0]),
+            'n_dyn': n_dyn,
+            'n_obs': n_obs,
+        }
 
     def _weighted_obs_loss(self, targets, predictions, mode=None):
         """Observation-space loss with ``reconstruction_mode`` weighting.
@@ -1414,6 +1515,12 @@ class LitLatentJacobianODE(LitBase):
         batch : torch.Tensor
             Raw observations of shape ``(B, T, D_obs)``.
         """
+        # Encoder-only mode: skip all dynamics work for every epoch.
+        # _warmup_step already implements exactly the right loss
+        # (reconstruction + KL + optional tangent entropy / diffeo).
+        if self.encoder_only_mode:
+            return self._warmup_step(batch)
+
         # Encoder warmup phase: reconstruction only
         if self.current_epoch < self.encoder_warmup_epochs:
             return self._warmup_step(batch)
@@ -1674,6 +1781,67 @@ class LitLatentJacobianODE(LitBase):
             Raw observations of shape ``(B, T, D_obs)``.
         """
         batch = batch.type(self.dtype)
+
+        # Encoder-only fast path: no dynamics, no trajectory rollout, no
+        # eigenvalue diagnostics. Mirrors _warmup_step but under no_grad,
+        # and logs the same canonical metric names that EarlyStopping /
+        # ModelCheckpoint monitor (mean val loss, trajectory val_loss,
+        # val/recon_loss, val/kl_*_loss). With encoder_only_mode=True
+        # there is no trajectory loss to monitor, so trajectory val_loss
+        # is set equal to the recon+KL composite — that's what gets used
+        # for "best by val recon" checkpoint selection.
+        if self.encoder_only_mode:
+            with torch.no_grad():
+                z_full = self.encode_trajectory(batch)
+                mu_dyn, z_null = self._split_latent(z_full)
+                z_dyn_sampled, log_var, kl_mu = self._vae_reparameterize(mu_dyn)
+
+                if self.use_vae and z_null is not None:
+                    z_full_for_recon = torch.cat([z_dyn_sampled, z_null], dim=-1)
+                else:
+                    z_full_for_recon = z_full
+
+                val_recon_loss = None
+                if self.reconstruction_loss_weight > 0:
+                    val_recon_loss = self._reconstruction_loss(batch, z_full=z_full_for_recon)
+
+                val_kl_null_loss = None
+                val_kl_dyn_loss = None
+                eff_null_w, eff_dyn_w = self._effective_kl_weights()
+                if self.n_target_dims is not None:
+                    if z_null is not None and z_null.numel() > 0:
+                        val_kl_null_loss = F.mse_loss(z_null, torch.zeros_like(z_null))
+                    else:
+                        val_kl_null_loss = torch.tensor(0.0, device=batch.device)
+                    if self.use_vae and log_var is not None:
+                        val_kl_dyn_loss = self._kl_divergence(kl_mu, log_var)
+                    else:
+                        val_kl_dyn_loss = torch.tensor(0.0, device=batch.device)
+
+                total_loss = torch.zeros(1, device=batch.device, dtype=batch.dtype).squeeze()
+                if val_recon_loss is not None:
+                    total_loss = total_loss + self.reconstruction_loss_weight * val_recon_loss
+                if val_kl_null_loss is not None and eff_null_w > 0:
+                    total_loss = total_loss + eff_null_w * val_kl_null_loss
+                if val_kl_dyn_loss is not None and eff_dyn_w > 0:
+                    total_loss = total_loss + eff_dyn_w * val_kl_dyn_loss
+
+            if log_metrics:
+                log_kwargs = dict(sync_dist=True, add_dataloader_idx=False)
+                self.log("mean val loss", total_loss, sync_dist=True)
+                self.log("trajectory val_loss", total_loss, sync_dist=True)
+                if val_recon_loss is not None:
+                    self.log("val/recon_loss", val_recon_loss, **log_kwargs)
+                if val_kl_null_loss is not None:
+                    self.log("val/kl_null_loss", val_kl_null_loss, **log_kwargs)
+                if val_kl_dyn_loss is not None:
+                    self.log("val/kl_dyn_loss", val_kl_dyn_loss, **log_kwargs)
+
+            if not hasattr(self, 'current_epoch_val_losses'):
+                self.current_epoch_val_losses = []
+            self.current_epoch_val_losses.append(total_loss.item())
+            self._maybe_emit_profile("val")
+            return total_loss
 
         # Validation always monitors the 'most_recent' (live-frame) variant
         # of the trajectory loss — this is the quantity that actually

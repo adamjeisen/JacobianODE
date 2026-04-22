@@ -1,0 +1,89 @@
+# @package _global_
+#
+# Companion encoder-only KL sweep at obs_noise=0.05. Same knobs as the
+# obsnoise001 variant — just different noise level and wandb_group.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, obs_noise=0.05, n_delays=75.
+    encoder_only_mode=true, init_pca_basis=true, use_vae=true.
+    12-run sweep: 6 kl_dyn_weight × 2 kl_null_weight. Best by
+    val/recon_loss. Tangent-spectrum diagnostic post-training.
+  hypothesis: |
+    At obs_noise=0.05 the encoder has to learn to denoise as well as
+    reconstruct. KL shaping may matter more here than at noise=0.01:
+    a mild kl_dyn should smooth the latent while kl_null suppresses the
+    noise-dominated off-manifold variance. Expect best val/recon_loss at
+    kl_dyn slightly higher than the obsnoise001 companion. Tangent spectrum
+    should still concentrate on top 3 components — Lorenz intrinsic dim
+    doesn't depend on noise level, only on the attractor.
+  success_criteria:
+    - "All 12 runs train without divergence"
+    - "Best val/recon_loss at some kl_dyn > 0 with clear margin over kl_dyn=0"
+    - "Top 3 components of tangent spectrum at best run carry >= 90% of energy"
+    - "Best kl_dyn at noise=0.05 is >= best kl_dyn at noise=0.01 (more regularization helps at higher noise)"
+
+sweep_grid:
+  model.kl_dyn_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
+  model.kl_null_weight: "null,0"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_encoderonly_nd75_init15_pcainit_autodim__kl_sweep_obsnoise005"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 75
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  use_vae: true
+  vae_sample_all_losses: false
+  kl_warmup_epochs: 0
+  trajectory_loss_most_recent: false
+  encoder_only_mode: true
+  encoder:
+    final_perm_identity: false
+    init_pca_basis: true
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 0.0
+    loop_closure_training: false
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 0.0
+    trajectory_training: false
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0
+    n_eigval_jacobians: 8
+    jacobianODEint_kwargs:
+      traj_init_steps: 15
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20

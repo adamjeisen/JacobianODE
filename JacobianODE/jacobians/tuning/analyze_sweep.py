@@ -61,6 +61,7 @@ ANALYTICS_SECTIONS = [
     "long_trajectory",
     "encoder_decoder_jacobians",
     "amplification",
+    "tangent_spectrum",
 ]
 
 
@@ -1189,34 +1190,57 @@ def analyze(
     # Per-run Lyapunov spectra (across the whole sweep). Expensive (~10-20s per
     # run) but valuable — gives both the spectrum overlay and λ_max vs val_loss
     # scatter for identifying runs with unphysical dynamics.
+    # Skip for encoder-only runs: no trained dynamics MLP, nothing to
+    # compute eigenvalues of. Detect via any run's wandb config.
     per_run_lyapunov = {}
     empirical_lyapunov_mean = None
     per_run_lyap_error = None
+    _skip_per_run_lyap = False
     try:
-        result = compute_per_run_lyapunov(
-            wandb_entity=wandb_entity,
-            wandb_project=wandb_project,
-            group=group,
-            save_dir=save_dir,
-            output_dir=output_dir,
-            true_lyapunov=true_lyapunov,
-            expected_snapshot=sentinel.get("expected_snapshot", {}),
-        )
-        per_run_lyapunov = result.get("per_run", {})
-        empirical_lyapunov_mean = result.get("empirical_mean")
-        # Register any produced per-run plots
-        for name in (
-            "per_run_lyapunov",
-            "per_run_lyapunov_vs_true",
-            "per_run_lyapunov_relerr",
-            "lyapunov_spectrum_mse_vs_val_loss",
-        ):
-            p = output_dir / "figures" / f"{name}.png"
-            if p.is_file():
-                figure_map[name] = str(p)
-    except Exception as e:
-        per_run_lyap_error = f"{type(e).__name__}: {e}"
-        logger.exception("per-run Lyapunov computation raised")
+        import wandb as _wandb
+        _api = _wandb.Api()
+        _probe = list(_api.runs(
+            f"{wandb_entity}/{wandb_project}",
+            filters={"group": group}, per_page=1,
+        ))
+        if _probe:
+            _cfg0 = dict(_probe[0].config)
+            if bool(_cfg0.get("model", {}).get("encoder_only_mode", False)):
+                _skip_per_run_lyap = True
+                logger.info(
+                    "encoder_only_mode=True on this sweep — skipping per-run Lyapunov"
+                )
+    except Exception as _e:
+        logger.debug(f"encoder_only_mode probe failed (proceeding): {_e}")
+
+    if _skip_per_run_lyap:
+        per_run_lyap_error = "skipped: encoder_only_mode"
+    else:
+        try:
+            result = compute_per_run_lyapunov(
+                wandb_entity=wandb_entity,
+                wandb_project=wandb_project,
+                group=group,
+                save_dir=save_dir,
+                output_dir=output_dir,
+                true_lyapunov=true_lyapunov,
+                expected_snapshot=sentinel.get("expected_snapshot", {}),
+            )
+            per_run_lyapunov = result.get("per_run", {})
+            empirical_lyapunov_mean = result.get("empirical_mean")
+            # Register any produced per-run plots
+            for name in (
+                "per_run_lyapunov",
+                "per_run_lyapunov_vs_true",
+                "per_run_lyapunov_relerr",
+                "lyapunov_spectrum_mse_vs_val_loss",
+            ):
+                p = output_dir / "figures" / f"{name}.png"
+                if p.is_file():
+                    figure_map[name] = str(p)
+        except Exception as e:
+            per_run_lyap_error = f"{type(e).__name__}: {e}"
+            logger.exception("per-run Lyapunov computation raised")
 
     metrics_doc = {
         # v2 adds: metrics_summary.swept_paths, metrics_summary.overall_chosen_run,

@@ -63,6 +63,13 @@ n_target_var_threshold: null
 # (matched); flip to False to reproduce the pre-fix "both use
 # self.reconstruction_mode" behaviour.
 trajectory_loss_most_recent: true
+# When true, training and validation skip ALL dynamics-related work
+# (trajectory rollout, loop closure, latent prediction, Jacobian /
+# eigenvalue diagnostics) and use only reconstruction + KL losses. Training
+# routes every epoch through _warmup_step; validation takes a fast-path
+# that mirrors the same loss. Use for encoder-only sweeps where the goal
+# is just to learn the latent representation. Default false.
+encoder_only_mode: false
 kl_null_weight: null          # null-space MSE penalty (structural constraint)
 kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
 use_vae: false                # deterministic latent by default; flip on when you need VAE

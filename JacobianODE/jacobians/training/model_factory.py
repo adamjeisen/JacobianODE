@@ -93,6 +93,8 @@ def make_model(
             extra_kwargs["use_vae"] = cfg.model.use_vae
         if "trajectory_loss_most_recent" in cfg.model:
             extra_kwargs["trajectory_loss_most_recent"] = cfg.model.trajectory_loss_most_recent
+        if "encoder_only_mode" in cfg.model:
+            extra_kwargs["encoder_only_mode"] = cfg.model.encoder_only_mode
         if "vae_sample_all_losses" in cfg.model:
             extra_kwargs["vae_sample_all_losses"] = cfg.model.vae_sample_all_losses
         if "kl_warmup_epochs" in cfg.model:
