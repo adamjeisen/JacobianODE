@@ -29,8 +29,9 @@ metadata:
     - "Best kl_dyn at noise=0.05 is >= best kl_dyn at noise=0.01 (more regularization helps at higher noise)"
 
 sweep_grid:
-  model.kl_dyn_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
-  model.kl_null_weight: "null,0"
+  # See obsnoise001 companion for why these live under training.lightning.
+  training.lightning.kl_dyn_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
+  training.lightning.kl_null_weight: "null,0"
 
 wandb_entity: JacobianODE
 wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
@@ -79,6 +80,8 @@ training:
     reconstruction_loss_weight: 1.0
     latent_prediction_loss_weight: 0.0
     trajectory_training: false
+    kl_null_weight: null                 # overridden by sweep_grid
+    kl_dyn_weight: 0.0                   # overridden by sweep_grid
     reconstruction_mode: 'uniform'
     obs_noise_scale: 0.0
     n_eigval_jacobians: 8

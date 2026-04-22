@@ -40,8 +40,11 @@ metadata:
     - "Cumulative tangent energy at dim 3 is higher than at the worst run"
 
 sweep_grid:
-  model.kl_dyn_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
-  model.kl_null_weight: "null,0"
+  # NB: kl_*_weight live in cfg.training.lightning (single source of truth);
+  # cfg.model.kl_*_weight entries are docs only and do NOT feed the model.
+  # See model_factory.py:126-129.
+  training.lightning.kl_dyn_weight: "0,1e-4,1e-3,1e-2,1e-1,1"
+  training.lightning.kl_null_weight: "null,0"
 
 wandb_entity: JacobianODE
 wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
@@ -62,8 +65,10 @@ model:
   n_target_dims: 3                       # fallback; overridden by PCA-auto
   n_target_var_threshold: 0.99           # PCA-auto picks k as first k s.t. cum_var >= 0.99
   prediction_steps: 30                   # unused (no dynamics) but kept for config compatibility
-  kl_null_weight: 0.0                    # overridden by sweep_grid
-  kl_dyn_weight: 0.0                     # overridden by sweep_grid
+  # These two fields under model.* are docs-only; the source of truth lives
+  # in training.lightning below (per model_factory.py:126-129).
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
   use_vae: true                          # required for kl_dyn_weight > 0 to take effect
   vae_sample_all_losses: false
   kl_warmup_epochs: 0
@@ -90,6 +95,8 @@ training:
     reconstruction_loss_weight: 1.0
     latent_prediction_loss_weight: 0.0    # no dynamics → no latent pred
     trajectory_training: false            # explicit; encoder_only_mode already suppresses it
+    kl_null_weight: null                  # overridden by sweep_grid
+    kl_dyn_weight: 0.0                    # overridden by sweep_grid
     reconstruction_mode: 'uniform'
     obs_noise_scale: 0.0
     n_eigval_jacobians: 8                 # unused (no dynamics Jacobians)
