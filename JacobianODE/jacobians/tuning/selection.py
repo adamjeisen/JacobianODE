@@ -139,6 +139,15 @@ def select_best_model(
     if len(passes_c3_and_c1) == 0:
         apply_c1 = False
 
+    # If literally every candidate fails C3 — drop C3 only, rather than
+    # the prior behaviour where post-survivor fallback dropped EVERY
+    # filter (so a too-strict C3 also nullified C1 + C2). Per-criterion
+    # relaxation lets C2 keep doing its job. Common at high n_target_dims
+    # where many off-manifold contracting modes register as "fast" and
+    # the flat 0.001 threshold becomes nonsensical.
+    if apply_c3 and all(fails_c3):
+        apply_c3 = False
+
     # Step 3: compute survivors
     survivors = []
     for i in range(n):

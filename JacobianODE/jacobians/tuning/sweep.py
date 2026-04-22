@@ -74,6 +74,7 @@ def run_sweep(
     sigma: float = 1.0,
     verbose: bool = False,
     n_latent: Optional[int] = None,
+    n_dyn: Optional[int] = None,
     ranking_method: RankingMethod = "pareto_knee",
 ) -> SweepResult:
     """Run a full hyperparameter sweep over lambda_loop values (notebook mode).
@@ -157,7 +158,11 @@ def run_sweep(
         n_dims,
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
-        loop_closure_n_dims=n_latent,
+        # C2 (loop closure) is computed in the dynamic subspace (z_dyn),
+        # not the full latent. So the natural-scale threshold sqrt(D)
+        # uses n_dyn, not n_latent. For latent models without subspace
+        # split, n_dyn==n_latent and the two are equivalent.
+        loop_closure_n_dims=(n_dyn if n_dyn is not None else n_latent),
         ranking_method=ranking_method,
     )
 
@@ -192,6 +197,7 @@ def select_from_wandb_runs(
     save_dir: Optional[str] = None,
     verbose: bool = False,
     n_latent: Optional[int] = None,
+    n_dyn: Optional[int] = None,
     ranking_method: RankingMethod = "pareto_knee",
 ) -> SweepResult:
     """Select the best model from already-trained W&B runs (post-hoc mode).
@@ -352,7 +358,11 @@ def select_from_wandb_runs(
         n_dims,
         eigenvalue_threshold=eigenvalue_threshold,
         use_loop_closure=use_loop_closure,
-        loop_closure_n_dims=n_latent,
+        # C2 (loop closure) is computed in the dynamic subspace (z_dyn),
+        # not the full latent. So the natural-scale threshold sqrt(D)
+        # uses n_dyn, not n_latent. For latent models without subspace
+        # split, n_dyn==n_latent and the two are equivalent.
+        loop_closure_n_dims=(n_dyn if n_dyn is not None else n_latent),
         ranking_method=ranking_method,
     )
 
@@ -791,9 +801,11 @@ def select_best_from_sweep(
         n_latent = n_dims
     dt = _dt0
 
+    # n_dyn is the subspace where loop closure is computed (= n_target_dims
+    # for latent models with subspace split, otherwise == n_latent).
+    n_target_dims = OmegaConf.select(_cfg0, "model.n_target_dims", default=None)
+    n_dyn = n_target_dims if n_target_dims is not None else n_latent
     if verbose:
-        n_target_dims = OmegaConf.select(_cfg0, "model.n_target_dims", default=None)
-        n_dyn = n_target_dims if n_target_dims is not None else n_latent
         print(f"n_dims={n_dims}, n_latent={n_latent}, n_dyn={n_dyn}, dt={dt:.4f}")
 
     sweep_result = select_from_wandb_runs(
@@ -807,6 +819,7 @@ def select_best_from_sweep(
         lambda_values=discovered.lambdas,
         save_dir=save_dir,
         verbose=verbose,
+        n_dyn=n_dyn,
         n_latent=n_latent,
         ranking_method=ranking_method,
     )
