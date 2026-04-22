@@ -1828,8 +1828,18 @@ class LitLatentJacobianODE(LitBase):
 
             if log_metrics:
                 log_kwargs = dict(sync_dist=True, add_dataloader_idx=False)
-                self.log("mean val loss", total_loss, sync_dist=True)
-                self.log("trajectory val_loss", total_loss, sync_dist=True)
+                # For encoder-only mode, the checkpoint monitor and the
+                # sweep selector both track "trajectory val_loss". Log the
+                # PURE RECONSTRUCTION loss as that metric (not the KL-
+                # inflated composite) so ModelCheckpoint saves the
+                # recon-best checkpoint and best_traj_loss ranking picks
+                # the recon-best run. The composite is still what's
+                # optimised in training — we just rank on recon.
+                monitor_loss = val_recon_loss if val_recon_loss is not None else total_loss
+                self.log("mean val loss", monitor_loss, sync_dist=True)
+                self.log("trajectory val_loss", monitor_loss, sync_dist=True)
+                self.log("val/trajectory_loss", monitor_loss, **log_kwargs)
+                self.log("val/total_loss", total_loss, **log_kwargs)
                 if val_recon_loss is not None:
                     self.log("val/recon_loss", val_recon_loss, **log_kwargs)
                 if val_kl_null_loss is not None:

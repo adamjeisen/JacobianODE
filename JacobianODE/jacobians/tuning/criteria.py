@@ -78,6 +78,33 @@ def compute_all_diagnostics(
         pin_memory=val_dataloader.pin_memory,
     )
 
+    # Encoder-only runs have no trained dynamics MLP, so trajectory rollout
+    # and loop closure return meaningless values. Replace the dynamics-based
+    # metrics with reconstruction-based ones so selection ranks correctly.
+    if getattr(lit_model, "encoder_only_mode", False):
+        recon_losses = []
+        with torch.no_grad():
+            iterator = tqdm(total=n_batches, disable=not verbose)
+            for i, batch in enumerate(rand_dl):
+                if i >= n_batches:
+                    break
+                batch = batch.to(device)
+                # Same path training + val use: encode, _reconstruction_loss
+                # handles the split + zero-pad + decode internally.
+                z_full = lit_model.encode_trajectory(batch)
+                recon_losses.append(
+                    float(lit_model._reconstruction_loss(batch, z_full=z_full).item())
+                )
+                iterator.update(1)
+            iterator.close()
+        n = len(recon_losses)
+        return DiagnosticMetrics(
+            one_step_mase=0.0,              # not applicable; keeps C1 filter happy
+            loop_closure_loss=None,         # not applicable
+            fast_eigenvalue_fraction=0.0,   # not applicable
+            trajectory_val_loss=(sum(recon_losses) / n) if n > 0 else float("inf"),
+        )
+
     total_model_mae = 0.0
     total_persistence_mae = 0.0
     loop_closure_losses = []
@@ -249,6 +276,28 @@ def diagnostics_from_wandb(
 
     if hist is None or hist.empty or monitor not in hist.columns:
         return None
+
+    # Encoder-only runs don't log val/one_step_mase etc. (no dynamics to
+    # teacher-force) AND their "trajectory val_loss" was the recon+KL
+    # composite prior to the fix, which misleads best_traj_loss selection.
+    # Detect and route to recon-based ranking directly from wandb history.
+    is_encoder_only = bool(
+        (run.config.get("model") or {}).get("encoder_only_mode", False)
+    )
+    if is_encoder_only:
+        if "val/recon_loss" not in hist.columns:
+            return None
+        m_recon = pd.to_numeric(hist["val/recon_loss"], errors="coerce")
+        valid_r = m_recon.notna()
+        if not valid_r.any():
+            return None
+        best_idx = m_recon.loc[valid_r].idxmin()
+        return DiagnosticMetrics(
+            one_step_mase=0.0,
+            loop_closure_loss=None,
+            fast_eigenvalue_fraction=0.0,
+            trajectory_val_loss=float(m_recon.loc[best_idx]),
+        )
 
     m = pd.to_numeric(hist[monitor], errors="coerce")
     valid = m.notna()
