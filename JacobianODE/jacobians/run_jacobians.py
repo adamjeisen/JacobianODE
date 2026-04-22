@@ -171,43 +171,68 @@ def _run_training(cfg: DictConfig) -> float:
     )
 
     # ----------------------------------------
-    # PCA-AUTO n_target_dims
+    # PCA on noisy training delay embeddings
     # ----------------------------------------
-    # If model.n_target_var_threshold is set, pick n_target_dims as the
-    # smallest k such that the first k PCs of the (noisy) training delay
-    # embeddings capture ≥ threshold of the total variance. Overrides
-    # whatever n_target_dims was set by initialize_config, and cascades to
-    # the MLP input/output_dim which are = k, k^2.
+    # Two opt-in features share the same PCA decomposition:
+    #   (1) model.n_target_var_threshold → auto-pick n_target_dims as the
+    #       smallest k such that cum_var[k-1] >= threshold.
+    #   (2) model.encoder.init_pca_basis → initialize the encoder's final
+    #       layer so that, at init, z = V @ x where V is the full PCA basis
+    #       (top-k PCs become z_dyn; lower PCs become z_null).
+    # If either is set, run the eigh once and use the results for both.
     _n_target_var_thresh = OmegaConf.select(
         cfg, "model.n_target_var_threshold", default=None
     )
-    if _n_target_var_thresh is not None:
+    _init_pca_basis = OmegaConf.select(
+        cfg, "model.encoder.init_pca_basis", default=False
+    )
+    pca_basis_tensor = None
+    if _n_target_var_thresh is not None or _init_pca_basis:
         train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
         flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
         flat -= flat.mean(dim=0, keepdim=True)
         cov = (flat.T @ flat) / (flat.shape[0] - 1)
-        eigvals = torch.linalg.eigvalsh(cov).flip(0).clamp_min(0.0)
+        # eigh returns ascending eigvals + matching eigvecs as columns.
+        eigvals_asc, eigvecs_asc = torch.linalg.eigh(cov)
+        eigvals = eigvals_asc.flip(0).clamp_min(0.0)
+        # PCA basis V: rows = PCs in variance-descending order.
+        # eigvecs_asc[:, i] is the i-th eigvec; transpose puts PCs as rows,
+        # then flip so descending.
+        V = eigvecs_asc.T.flip(0).contiguous()  # (D, D)
         explained = eigvals / eigvals.sum()
         cum_var = explained.cumsum(0)
-        n_target = int((cum_var >= _n_target_var_thresh).float().argmax().item()) + 1
         _cum = [f"{v:.4f}" for v in cum_var[: min(10, len(cum_var))].tolist()]
         _exp = [f"{v:.4f}" for v in explained[: min(10, len(explained))].tolist()]
         log.info(
-            f"PCA-auto n_target_dims: threshold={_n_target_var_thresh}, "
-            f"D_embed={flat.shape[-1]}, N_samples={flat.shape[0]}, "
-            f"chose n_target_dims={n_target}"
+            f"PCA on training delay embeddings: D_embed={flat.shape[-1]}, "
+            f"N_samples={flat.shape[0]}"
         )
         log.info(f"  explained variance (first 10): {_exp}")
         log.info(f"  cumulative variance (first 10): {_cum}")
-        cfg.model.n_target_dims = n_target
-        cfg.model.params.input_dim = n_target
-        cfg.model.params.output_dim = n_target ** 2
-        OmegaConf.update(cfg, "model.n_target_dims_pca_auto", n_target, force_add=True)
-        OmegaConf.update(
-            cfg, "model.n_target_dims_pca_cum_var",
-            float(cum_var[n_target - 1].item()),
-            force_add=True,
-        )
+
+        if _n_target_var_thresh is not None:
+            n_target = int((cum_var >= _n_target_var_thresh).float().argmax().item()) + 1
+            log.info(
+                f"PCA-auto n_target_dims: threshold={_n_target_var_thresh}, "
+                f"chose n_target_dims={n_target}"
+            )
+            cfg.model.n_target_dims = n_target
+            cfg.model.params.input_dim = n_target
+            cfg.model.params.output_dim = n_target ** 2
+            OmegaConf.update(cfg, "model.n_target_dims_pca_auto", n_target, force_add=True)
+            OmegaConf.update(
+                cfg, "model.n_target_dims_pca_cum_var",
+                float(cum_var[n_target - 1].item()),
+                force_add=True,
+            )
+
+        if _init_pca_basis:
+            pca_basis_tensor = V.float()
+            log.info(
+                f"PCA-basis encoder init enabled: V shape={tuple(pca_basis_tensor.shape)}, "
+                f"orthogonality residual ||V V^T - I||_F = "
+                f"{torch.linalg.norm(V @ V.T - torch.eye(V.shape[0], dtype=torch.float64)).item():.3g}"
+            )
 
     # ----------------------------------------
     # SET UP WANDB
@@ -235,9 +260,9 @@ def _run_training(cfg: DictConfig) -> float:
         x0 = None
 
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
-        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True)
+        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True, pca_basis=pca_basis_tensor)
     else:
-        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True)
+        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True, pca_basis=pca_basis_tensor)
 
     # Store SLURM timeout in the app config so it gets logged to W&B.
     # This allows downstream tools (run_analytics, discover_sweep_runs) to

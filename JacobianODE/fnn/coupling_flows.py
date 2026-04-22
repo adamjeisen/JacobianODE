@@ -1077,6 +1077,58 @@ class FixedPermutation(nn.Module):
         return y[..., self.perm_inv]
 
 
+class FixedOrthogonal(nn.Module):
+    """Deterministic orthogonal linear transform on the feature dim.
+
+    Stores a fixed orthogonal matrix ``Q`` of shape ``(D, D)`` in a buffer.
+    Forward applies ``Q`` along the last dim of the input; inverse uses
+    ``Q^T``. Volume-preserving (``|det Q| = 1``), so composes cleanly with
+    additive coupling layers.
+
+    The matrix is *re-orthogonalised* once at construction via QR (with
+    sign-corrected diagonal) so that ``Q Q^T = I`` to float-precision
+    regardless of small numerical drift in the input.
+
+    Parameters
+    ----------
+    matrix : torch.Tensor
+        Square matrix of shape ``(D, D)``. Must be approximately orthogonal
+        (``||M M^T - I||_F < 1e-2``); reorthogonalised internally.
+    """
+
+    def __init__(self, matrix: torch.Tensor) -> None:
+        super().__init__()
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError(
+                f"FixedOrthogonal expects a square matrix, got shape {tuple(matrix.shape)}"
+            )
+        D = matrix.shape[0]
+        m64 = matrix.detach().double()
+        err = torch.linalg.norm(m64 @ m64.T - torch.eye(D, dtype=torch.float64)).item()
+        if err > 1e-2:
+            raise ValueError(
+                f"FixedOrthogonal input matrix not orthogonal: ||M M^T - I||_F = {err:.3g}"
+            )
+        # Re-orthogonalise via QR to remove numerical drift; preserve
+        # column-sign convention so det(Q) is determined by the input,
+        # not by QR's arbitrary sign choice.
+        Q, R = torch.linalg.qr(m64)
+        sign = torch.diag(R).sign()
+        sign[sign == 0] = 1.0
+        Q = Q * sign[None, :]
+        Q = Q.float()
+        self.register_buffer("matrix", Q)
+        self.register_buffer("matrix_T", Q.T.contiguous())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply Q along last dim: (Q @ x_last) for each row in leading dims.
+        # Equivalent to x @ Q^T.
+        return x @ self.matrix_T
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        return y @ self.matrix
+
+
 # ---------------------------------------------------------------------------
 # LOFT — Log Soft Extension  (Andrade 2024, Eq. 10, arXiv:2402.16408)
 # ---------------------------------------------------------------------------
@@ -1384,6 +1436,8 @@ class CouplingEncoder(nn.Module):
         tail_bound: float = 3.0,
         # routing at init
         final_perm_identity: bool = False,
+        init_pca_basis: bool = False,
+        pca_basis: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         self._n_input = n_input
@@ -1466,7 +1520,16 @@ class CouplingEncoder(nn.Module):
         # the n_target_dims most recent observations. Preserves full
         # expressivity — the inter-layer FixedPermutations are still random
         # for mixing; this layer only relabels output dims deterministically.
+        if final_perm_identity and init_pca_basis:
+            raise ValueError(
+                "final_perm_identity and init_pca_basis are mutually exclusive — "
+                "they configure two different choices for the encoder's final layer "
+                "(identity init vs PCA-basis init). Pick one."
+            )
+
         self.final_permutation: FixedPermutation | None = None
+        self.final_orthogonal: FixedOrthogonal | None = None
+
         if final_perm_identity:
             # R = composition of inter-layer random perms (applied in forward order).
             idx = torch.arange(n_input)
@@ -1478,6 +1541,40 @@ class CouplingEncoder(nn.Module):
             fp.perm.copy_(inv)
             fp.perm_inv.copy_(torch.argsort(inv))
             self.final_permutation = fp
+        elif init_pca_basis:
+            # Append a fixed orthogonal Q chosen so that, at init (couplings
+            # are identity), the whole encoder applies V to the input — i.e.
+            # z = V @ x where V = pca_basis is the PCA rotation computed
+            # offline from training data. With z_dyn = z[..., :n_target_dims]
+            # this means z_dyn at init is the top-n_target PCs of the input.
+            #
+            # Derivation: at init the coupling stack is identity, so
+            #   forward(x) = Q @ P(x), where P(x)[i] = x[P_indices[i]]
+            #              = (Q @ P_mat) @ x  with P_mat[i,j] = 1 iff j == P_indices[i].
+            # We want this = V @ x, hence Q = V @ P_mat.T (since P_mat is
+            # orthogonal). P_mat.T is itself a permutation by P_inv_indices.
+            if pca_basis is None:
+                raise ValueError(
+                    "init_pca_basis=True requires the pca_basis kwarg "
+                    "(D x D orthogonal matrix). None was passed."
+                )
+            if not isinstance(pca_basis, torch.Tensor):
+                pca_basis = torch.as_tensor(pca_basis)
+            if pca_basis.shape != (n_input, n_input):
+                raise ValueError(
+                    f"pca_basis must have shape ({n_input}, {n_input}), "
+                    f"got {tuple(pca_basis.shape)}"
+                )
+            # Composed inter-layer permutation as index array.
+            P_indices = torch.arange(n_input)
+            for p in self.permutations:
+                P_indices = P_indices[p.perm]
+            # P_mat[i, j] = 1 iff j == P_indices[i].
+            P_mat = torch.zeros(n_input, n_input, dtype=torch.float64)
+            P_mat[torch.arange(n_input), P_indices] = 1.0
+            V = pca_basis.detach().double()
+            Q = V @ P_mat.T  # so that Q @ P_mat = V → forward at init is V @ x.
+            self.final_orthogonal = FixedOrthogonal(Q)
 
     # ----- properties -----
 
@@ -1508,6 +1605,8 @@ class CouplingEncoder(nn.Module):
                 z = self.permutations[i](z)
         if self.final_permutation is not None:
             z = self.final_permutation(z)
+        if self.final_orthogonal is not None:
+            z = self.final_orthogonal(z)
         if self.loft is not None:
             z = self.loft(z)
         return z
@@ -1526,6 +1625,8 @@ class CouplingEncoder(nn.Module):
         y = z
         if self.loft is not None:
             y = self.loft.inverse(y)
+        if self.final_orthogonal is not None:
+            y = self.final_orthogonal.inverse(y)
         if self.final_permutation is not None:
             y = self.final_permutation.inverse(y)
         for i in reversed(range(len(self.coupling_layers))):
@@ -1569,6 +1670,8 @@ class CouplingEncoder(nn.Module):
                 z = self.permutations[i](z)
         if self.final_permutation is not None:
             z = self.final_permutation(z)
+        if self.final_orthogonal is not None:
+            z = self.final_orthogonal(z)
         if self.loft is not None:
             total_log_det = total_log_det + self.loft.log_det(z)
         return total_log_det

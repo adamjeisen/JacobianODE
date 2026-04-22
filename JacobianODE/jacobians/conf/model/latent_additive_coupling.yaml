@@ -39,6 +39,14 @@ encoder:
   # Inter-layer permutations are still fully random — only a final fixed
   # permutation is added to cancel their composition. No expressivity cost.
   final_perm_identity: false
+  # When true, append a fixed orthogonal Q at the end such that, at init,
+  # the encoder maps x -> V @ x where V is the PCA basis of the noisy
+  # training delay embeddings (computed by run_jacobians and injected at
+  # construction). z_dyn = z[..., :n_target_dims] is then the top
+  # n_target_dims PCs of the input. Mutually exclusive with
+  # final_perm_identity. Same expressivity as either alternative — only
+  # the starting point of training differs.
+  init_pca_basis: false
 
 n_target_dims: 7              # drives MLP dims and subspace splitting
 # If set (float in (0, 1]), n_target_dims is auto-picked at data-load time

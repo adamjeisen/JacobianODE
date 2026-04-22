@@ -25,6 +25,7 @@ def make_model(
     noise_scale_factor: float = 1.0,
     generalized_variance: Optional[float] = None,
     verbose: bool = False,
+    pca_basis: Optional[torch.Tensor] = None,
 ) -> Any:
     """Create and initialize the model for training.
 
@@ -57,9 +58,19 @@ def make_model(
     # Build extra kwargs for the Lightning model
     extra_kwargs = {}
 
-    # If the config has an encoder section, instantiate it
+    # If the config has an encoder section, instantiate it.
+    # When init_pca_basis is enabled, inject the precomputed basis as an
+    # extra kwarg (it can't live in the YAML since it's a runtime tensor).
     if "encoder" in cfg.model:
-        encoder = instantiate(cfg.model.encoder)
+        encoder_extra_kwargs = {}
+        if OmegaConf.select(cfg, "model.encoder.init_pca_basis", default=False):
+            if pca_basis is None:
+                raise ValueError(
+                    "model.encoder.init_pca_basis=True but no pca_basis tensor was "
+                    "passed to make_model. Compute it in run_jacobians and forward it."
+                )
+            encoder_extra_kwargs["pca_basis"] = pca_basis
+        encoder = instantiate(cfg.model.encoder, **encoder_extra_kwargs)
         extra_kwargs["encoder"] = encoder
         if "prediction_steps" in cfg.model:
             extra_kwargs["prediction_steps"] = cfg.model.prediction_steps
