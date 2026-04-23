@@ -1,0 +1,89 @@
+# @package _global_
+#
+# Overnight 27-run validation sweep around the obsnoise005 winner of the
+# uniform LC sweep (ad08hyqh: n_delays=45, LC=1e-4, splitmode in effect,
+# final_perm_identity=true, init_pca_basis=false, LPL=1, recon_w=1,
+# best_traj=5.50e-3, passes C1+C2+C3). Same 3-axis grid as the obsnoise001
+# companion, just at the higher noise level.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, obs_noise=0.05, n_delays=45,
+    prediction_steps=30, traj_init_steps=15, splitmode (most_recent traj
+    + uniform recon), final_perm_identity=true, init_pca_basis=false,
+    fixed LC=1e-4 (winner from prior LC sweep). 27-run validation grid:
+    3 obs_noise_scale × 3 recon_w × 3 lpl_w.
+  hypothesis: |
+    Same hypotheses as obsnoise001 companion, at higher data noise. At
+    noise=0.05 the data noise budget is already large, so:
+      - obs_noise_scale's relative magnitudes are smaller (0.03 ≈ 0.6×
+        data noise here vs 3× at noise=0.01)
+      - recon scale mismatch may be smaller too (uniform recon includes
+        noisier early steps that look more like the most_recent traj)
+      - lpl might matter more because the latent has more noise to suppress
+  success_criteria:
+    - "All 27 runs train without divergence"
+    - "Best val traj_loss is at most 2x worse than the winner's 5.50e-3"
+    - "Best cell has selection_LC <= sqrt(n_target_dims) (passes C2)"
+    - "Best cell's optimal recon_w / lpl_w consistent with obsnoise001 companion (or interpretable difference)"
+
+sweep_grid:
+  training.lightning.obs_noise_scale: "0,3e-3,3e-2"
+  training.lightning.reconstruction_loss_weight: "0.3,1,3"
+  training.lightning.latent_prediction_loss_weight: "0,0.1,1"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_uniformLC_p30_obsnoise005_nd45_init15_autodim_lc1em4__validation_3x3x3_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 45
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3                      # fallback; PCA-auto picked 7 for the winner
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true     # explicit (matches winner)
+  encoder:
+    final_perm_identity: true
+    init_pca_basis: false
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 1e-4             # winner's value, fixed
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0       # overridden by sweep_grid
+    latent_prediction_loss_weight: 1.0    # overridden by sweep_grid
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0                  # overridden by sweep_grid
+    n_eigval_jacobians: 8
+    jacobianODEint_kwargs:
+      traj_init_steps: 15
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
