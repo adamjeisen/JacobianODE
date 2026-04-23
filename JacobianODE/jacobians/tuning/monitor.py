@@ -200,6 +200,21 @@ def _values_match(wanted, actual) -> bool:
     return wanted == actual
 
 
+def _is_matchable_override(ov: str) -> bool:
+    """An override is matchable against a wandb run's config if it targets
+    a training-visible key. Hydra consumes ``hydra.*`` and ``experiment=...``
+    before the config reaches the training loop, so those keys aren't
+    present in the wandb config and would cause spurious non-matches."""
+    if "=" not in ov:
+        return False
+    key = ov.split("=", 1)[0]
+    if key.startswith("hydra."):
+        return False
+    if key == "experiment":
+        return False
+    return True
+
+
 def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
     """Return the run_idx whose overrides match this run's config, or None.
 
@@ -211,23 +226,22 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
     don't appear in the wandb run config and would cause spurious
     non-matches for every run.
 
-    Single-run sweeps (``sweep_grid: {}``): resolved_runs has exactly one
-    entry with an empty or launcher-only override list. There's nothing
-    to disambiguate, so we return that run_idx unconditionally rather
-    than skipping it as "no matchable overrides".
-    """
-    if len(resolved_runs) == 1:
-        return resolved_runs[0]["run_idx"]
+    Trivial-sweep shortcut: if a single resolved_run has NO matchable
+    overrides (e.g. ``sweep_grid: {}`` with launcher-only overrides),
+    there's nothing to disambiguate — return its run_idx unconditionally.
 
-    def _is_matchable(ov: str) -> bool:
-        if "=" not in ov:
-            return False
-        key = ov.split("=", 1)[0]
-        if key.startswith("hydra."):
-            return False
-        if key == "experiment":
-            return False
-        return True
+    But when called with a one-element ``resolved_runs`` list that DOES
+    contain matchable overrides (as ``classify_run_idx`` does, once per
+    run_idx), we MUST fall through to the real override-based match.
+    Returning the run_idx unconditionally in that case causes every wandb
+    run to falsely match every run_idx — this was a latent bug that made
+    every non-alive-SLURM run_idx classify as ``done_finished`` whenever
+    any wandb run in the group had state=finished.
+    """
+    if len(resolved_runs) == 1 and not any(
+        _is_matchable_override(ov) for ov in resolved_runs[0].get("overrides", [])
+    ):
+        return resolved_runs[0]["run_idx"]
 
     # (run_idx, specificity) for each matching resolved_run; specificity is
     # the number of matchable overrides the resolved_run constrains. When
@@ -236,7 +250,7 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
     # tiebreak a new wandb run would match both and be dropped as ambiguous.
     matches: list[tuple[int, int]] = []
     for r in resolved_runs:
-        filtered_overrides = [ov for ov in r["overrides"] if _is_matchable(ov)]
+        filtered_overrides = [ov for ov in r["overrides"] if _is_matchable_override(ov)]
         if not filtered_overrides:
             # All overrides were launcher/experiment — can't disambiguate.
             continue
