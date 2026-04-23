@@ -87,6 +87,19 @@ def make_model(
                 pca_basis = torch.eye(int(_n_input))
             encoder_extra_kwargs["pca_basis"] = pca_basis
         encoder = instantiate(cfg.model.encoder, **encoder_extra_kwargs)
+        # DirectSumCouplingEncoder exposes n_target_dims (sum of per-area k's).
+        # Downstream _split_latent slices z[..., :cfg.model.n_target_dims], so
+        # the encoder's total dyn-dim must match the model-level setting —
+        # otherwise the dynamic subspace and the slicer silently disagree.
+        _enc_k = getattr(encoder, "n_target_dims", None)
+        if _enc_k is not None and "n_target_dims" in cfg.model \
+                and cfg.model.n_target_dims is not None \
+                and int(cfg.model.n_target_dims) != int(_enc_k):
+            raise ValueError(
+                f"model.n_target_dims ({cfg.model.n_target_dims}) must equal "
+                f"the encoder's n_target_dims ({_enc_k}, = sum of "
+                f"n_target_dims_per_block). Fix one of them in the YAML."
+            )
         extra_kwargs["encoder"] = encoder
         if "prediction_steps" in cfg.model:
             extra_kwargs["prediction_steps"] = cfg.model.prediction_steps

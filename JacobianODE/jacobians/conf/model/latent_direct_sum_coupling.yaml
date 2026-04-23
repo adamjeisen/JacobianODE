@@ -1,0 +1,85 @@
+# Latent JacobianODE with a DIRECT-SUM coupling encoder.
+#
+# Unlike latent_additive_coupling.yaml which uses a monolithic CouplingEncoder
+# over the full input, this model encodes N subsystems INDEPENDENTLY — one
+# CouplingEncoder per area, with the per-area latents reordered so the
+# combined dynamic subspace (z_dyn = z[..., :sum(n_target_dims_per_block)])
+# sits at the front of z. The encoder Jacobian is block-diagonal across
+# areas by construction, so any cross-area information flow we observe in
+# the latent dynamics must come from the dynamics MLP, not from encoder
+# mixing. This is the structural setup for block-structured controllability
+# analyses in the latent space.
+#
+# All sub-encoders share the same conditioner MLP hyperparameters
+# (hidden_dim, n_hidden_layers, n_coupling_layers, coupling_type, etc.).
+# They differ only in n_input (= len(area_indices[i])) and permutation seed
+# (permutation_seed_base + i).
+
+params:
+  _target_: JacobianODE.models.mlp.MLP
+  input_dim: null    # = n_target_dims (total across areas), set at runtime
+  hidden_dim: [256, 1024, 2048, 2048]
+  num_layers: 4
+  output_dim: null   # = n_target_dims², set at runtime
+  residuals: False
+  dropout: 0.0
+  activation: 'silu'
+
+encoder:
+  _target_: JacobianODE.fnn.coupling_flows.DirectSumCouplingEncoder
+  # REQUIRED — partition of the input axis into subsystems. Every index in
+  # [0, n_input) must appear in exactly one sublist. Sublists need not be
+  # contiguous. For WMTask with N1=N2=64 (and n_delays=1):
+  #   area_indices:
+  #     - [0, 1, ..., 63]      # visual
+  #     - [64, 65, ..., 127]   # cognitive
+  area_indices: ???
+  # REQUIRED — per-area dynamic-subspace size. sum(n_target_dims_per_block)
+  # MUST equal the top-level n_target_dims below (enforced in model_factory).
+  n_target_dims_per_block: ???
+  # Shared MLP / coupling settings (identical across sub-encoders).
+  n_coupling_layers: 8
+  coupling_type: additive       # NICE-style; volume-preserving
+  use_actnorm: false
+  hidden_dim: 128
+  n_hidden_layers: 2
+  zero_init: true               # identity-per-layer at init
+  permutation_seed_base: 42     # sub-encoder i uses permutation_seed_base + i
+  use_loft: false
+  loft_tau: 100.0
+  # When true (combined with zero_init), each sub-encoder is the identity at
+  # init, so z at init is x-gathered-into-the-dyn-first layout. Sensible
+  # starting point; independent of permutation seeds. No expressivity cost.
+  final_perm_identity: true
+  # PCA-basis init is NOT supported for DirectSumCouplingEncoder (requires
+  # per-area PCA bases threaded through the data pipeline — deferred).
+
+# Total dynamic-subspace dim (must equal sum(n_target_dims_per_block)).
+n_target_dims: ???
+# PCA-auto selection is not supported for direct-sum encoders in V1 — the
+# per-area split is user-specified via n_target_dims_per_block.
+n_target_var_threshold: null
+trajectory_loss_most_recent: true
+encoder_only_mode: false
+kl_null_weight: null
+kl_dyn_weight: 0.0
+use_vae: false
+vae_sample_all_losses: false
+kl_warmup_epochs: 0
+prediction_steps: 30
+encoder_warmup_epochs: 0
+dynamics_warmup_epochs: 0
+jac_window_stride: null
+decode_only_recent: false
+
+geometric_noise:
+  enabled: false
+  n_coupling_layers: 6
+  hidden_dim: 128
+  n_hidden_layers: 2
+  permutation_seed: 0
+
+jacobian_noise:
+  enabled: false
+  lookahead_steps: null
+  orthogonalize: true

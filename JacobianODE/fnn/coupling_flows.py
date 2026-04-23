@@ -1677,6 +1677,247 @@ class CouplingEncoder(nn.Module):
         return total_log_det
 
 
+class DirectSumCouplingEncoder(nn.Module):
+    """Direct-sum composition of :class:`CouplingEncoder`s — one per subsystem.
+
+    Partitions the input axis into N subsystems via ``area_indices`` (a list
+    of index lists, one per subsystem). Each subsystem is encoded by its
+    own :class:`CouplingEncoder` independently; the per-area latent outputs
+    are then reordered into a dyn-first-then-null layout so the combined
+    dynamic subspace is contiguous at positions ``[0, sum(n_target_dims_per_block))``.
+
+    The encoder Jacobian ``dz_area_i/dx_area_j`` is zero for ``i != j`` by
+    construction — the only cross-area information flow possible downstream
+    must come from the dynamics MLP, not from encoder mixing. This is the
+    structural property that enables clean controllability analyses in the
+    latent space.
+
+    Forward path::
+
+        x (..., n_input)
+          → gather per-area via area_indices → (x_0, x_1, ..., x_{N-1})
+          → each x_i through its CouplingEncoder → (z_0_block, ..., z_{N-1}_block)
+          → each z_i_block split into [dyn_i (size k_i) ‖ null_i (size n_i - k_i)]
+          → concatenate [dyn_0, ..., dyn_{N-1}, null_0, ..., null_{N-1}]
+          → z (..., n_input)  with z[..., :sum(k_i)] = all dyn parts.
+
+    Inverse (decode) path reverses this exactly: un-group z back to per-area
+    ``[dyn_i ‖ null_i]`` layout, apply each sub-encoder's inverse, and
+    scatter each area's output back to its original input indices. The
+    decoder sees the *same units* the sub-encoder produced at forward time
+    (same unit ordering), and the reconstructed x lands at the same input
+    positions it came from.
+
+    Parameters
+    ----------
+    area_indices : list[list[int]]
+        Partition of the input axis into subsystems. Each sublist is the
+        set of input indices for one area. Every index in
+        ``[0, sum(len(a) for a in area_indices))`` must appear exactly once;
+        indices within a sublist need not be contiguous. Example for the
+        WMTask 128-D biological RNN (N1=N2=64): ``[[0..63], [64..127]]``.
+    n_target_dims_per_block : list[int]
+        Per-area size of the dynamic subspace. ``sum(n_target_dims_per_block)``
+        is the total dynamic-subspace dim that downstream code (e.g.
+        ``LitLatentJacobianODE._split_latent``) will slice.
+    n_coupling_layers, coupling_type, hidden_dim, n_hidden_layers, zero_init,
+    use_actnorm, use_loft, loft_tau, scale_activation, scale_clamp,
+    clamp_type, alpha_pos, alpha_neg, num_bins, tail_bound, final_perm_identity
+        Shared across all sub-encoders — see :class:`CouplingEncoder` for
+        semantics. The "same MLP" invariant (every sub-encoder uses identical
+        conditioner MLP hyperparameters) is enforced by passing the same
+        kwargs to each sub-encoder.
+    permutation_seed_base : int
+        Base seed; sub-encoder *i* uses ``permutation_seed_base + i`` so each
+        area gets an independent, deterministic random inter-layer
+        permutation sequence.
+
+    Notes
+    -----
+    PCA-basis init (``init_pca_basis`` in :class:`CouplingEncoder`) is not
+    exposed here — it would require threading per-area PCA bases through
+    the data pipeline. ``final_perm_identity=True`` + ``zero_init=True``
+    already gives identity-at-init per area, which is the sensible default
+    for the first iteration.
+    """
+
+    def __init__(
+        self,
+        area_indices: list[list[int]],
+        n_target_dims_per_block: list[int],
+        # Shared MLP / coupling settings — mirror CouplingEncoder
+        n_coupling_layers: int = 8,
+        coupling_type: str = "additive",
+        hidden_dim: int = 128,
+        n_hidden_layers: int = 2,
+        zero_init: bool = True,
+        use_actnorm: bool = False,
+        permutation_seed_base: int = 0,
+        use_loft: bool = False,
+        loft_tau: float = 100.0,
+        # affine-specific
+        scale_activation: str = "tanh",
+        scale_clamp: float = 3.0,
+        clamp_type: str = "symmetric",
+        alpha_pos: float = 0.1,
+        alpha_neg: float = 2.0,
+        # spline-specific
+        num_bins: int = 8,
+        tail_bound: float = 3.0,
+        # routing at init
+        final_perm_identity: bool = False,
+    ) -> None:
+        super().__init__()
+        if len(area_indices) == 0:
+            raise ValueError("area_indices must contain at least one area.")
+        if len(area_indices) != len(n_target_dims_per_block):
+            raise ValueError(
+                f"area_indices has {len(area_indices)} areas but "
+                f"n_target_dims_per_block has {len(n_target_dims_per_block)}."
+            )
+        block_sizes = [len(a) for a in area_indices]
+        for i, (k, n) in enumerate(zip(n_target_dims_per_block, block_sizes)):
+            if not (0 <= k <= n):
+                raise ValueError(
+                    f"n_target_dims_per_block[{i}]={k} must be in [0, {n}] "
+                    f"(area size)."
+                )
+        # Partition invariant: every input index appears exactly once.
+        flat = [int(i) for a in area_indices for i in a]
+        if sorted(flat) != list(range(len(flat))):
+            raise ValueError(
+                "area_indices must partition [0, n_input): every index in "
+                "[0, sum(block_sizes)) must appear exactly once across the "
+                "sublists (no gaps, no duplicates)."
+            )
+
+        self._n_input = len(flat)
+        self._k_per_block = tuple(int(k) for k in n_target_dims_per_block)
+        self._block_sizes = tuple(block_sizes)
+        self._n_areas = len(area_indices)
+
+        # Store per-area index lists as LongTensor buffers so gather/scatter
+        # runs on the model's device and survives state_dict save/load.
+        for i, a in enumerate(area_indices):
+            self.register_buffer(
+                f"_area_idx_{i}", torch.as_tensor(a, dtype=torch.long)
+            )
+
+        # Shared hyperparameters — identical across sub-encoders except for
+        # (n_input, permutation_seed). The "same MLP" invariant lives here.
+        shared = dict(
+            n_coupling_layers=n_coupling_layers,
+            coupling_type=coupling_type,
+            hidden_dim=hidden_dim,
+            n_hidden_layers=n_hidden_layers,
+            zero_init=zero_init,
+            use_actnorm=use_actnorm,
+            use_loft=use_loft,
+            loft_tau=loft_tau,
+            scale_activation=scale_activation,
+            scale_clamp=scale_clamp,
+            clamp_type=clamp_type,
+            alpha_pos=alpha_pos,
+            alpha_neg=alpha_neg,
+            num_bins=num_bins,
+            tail_bound=tail_bound,
+            final_perm_identity=final_perm_identity,
+        )
+        self.blocks = nn.ModuleList([
+            CouplingEncoder(
+                n_input=n, permutation_seed=permutation_seed_base + i, **shared
+            )
+            for i, n in enumerate(block_sizes)
+        ])
+
+    # ----- helpers -----
+
+    def _area_idx(self, i: int) -> torch.Tensor:
+        return getattr(self, f"_area_idx_{i}")
+
+    # ----- properties -----
+
+    @property
+    def n_latent(self) -> int:
+        """Total latent dim — equals total input dim (each sub-encoder is D_i → D_i)."""
+        return self._n_input
+
+    @property
+    def n_target_dims(self) -> int:
+        """Total dynamic-subspace dim across all areas."""
+        return sum(self._k_per_block)
+
+    # ----- forward / inverse -----
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode: gather per-area → per-area encode → reorder dyn-first.
+
+        Parameters
+        ----------
+        x : Tensor (..., n_input)
+
+        Returns
+        -------
+        z : Tensor, same shape as x, with layout
+            ``[dyn_0, dyn_1, ..., dyn_{N-1}, null_0, null_1, ..., null_{N-1}]``.
+        """
+        # Per-area gather along last dim.
+        xs = [x.index_select(-1, self._area_idx(i)) for i in range(self._n_areas)]
+        # Per-area encode.
+        zs = [blk(xi) for blk, xi in zip(self.blocks, xs)]
+        # Group dyn parts, then null parts.
+        dyn_parts = [z[..., :k] for z, k in zip(zs, self._k_per_block)]
+        null_parts = [z[..., k:] for z, k in zip(zs, self._k_per_block)]
+        return torch.cat(dyn_parts + null_parts, dim=-1)
+
+    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode: un-group z → per-area decode → scatter to original indices.
+
+        Parameters
+        ----------
+        z : Tensor (..., n_input) in the dyn-first layout produced by :meth:`forward`.
+
+        Returns
+        -------
+        x : Tensor, same shape as z, with each area's reconstructed values
+            placed at the input indices they came from.
+        """
+        # 1) Un-group back to per-area [dyn || null] layout (exactly what each
+        #    sub-encoder produced at forward time — the decoder must see the
+        #    same unit ordering).
+        offset = 0
+        dyn_parts = []
+        for k in self._k_per_block:
+            dyn_parts.append(z[..., offset:offset + k])
+            offset += k
+        null_parts = []
+        for i, k in enumerate(self._k_per_block):
+            n_null = int(self._area_idx(i).numel()) - k
+            null_parts.append(z[..., offset:offset + n_null])
+            offset += n_null
+        blocks_z = [
+            torch.cat([dp, np_], dim=-1) for dp, np_ in zip(dyn_parts, null_parts)
+        ]
+        # 2) Per-area inverse.
+        xs = [blk.inverse(bz) for blk, bz in zip(self.blocks, blocks_z)]
+        # 3) Scatter back to the original input layout — each area's reconstructed
+        #    values land at exactly the indices they were gathered from.
+        shape = list(z.shape)
+        shape[-1] = self._n_input
+        x_out = z.new_zeros(shape)
+        for i, xi in enumerate(xs):
+            x_out.index_copy_(-1, self._area_idx(i), xi)
+        return x_out
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Alias for :meth:`forward`."""
+        return self.forward(x)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Alias for :meth:`inverse`."""
+        return self.inverse(z)
+
+
 # ---------------------------------------------------------------------------
 # Masked Linear Layer  (for MADE)
 # ---------------------------------------------------------------------------
