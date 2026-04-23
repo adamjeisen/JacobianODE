@@ -285,7 +285,22 @@ def initialize_config(
     # Set model dimensions
     if "encoder" in cfg.model:
         # Encoder sees delay-embedded observations (dim = n_delays * len(observed_indices))
-        cfg.model.encoder.n_input = dim
+        # For standard CouplingEncoder (and similar), write dim into n_input.
+        # For DirectSumCouplingEncoder, the partition is user-specified via
+        # area_indices — we just validate it covers `dim` distinct input indices.
+        if "n_input" in cfg.model.encoder:
+            cfg.model.encoder.n_input = dim
+        elif "area_indices" in cfg.model.encoder:
+            area_indices = OmegaConf.to_container(
+                cfg.model.encoder.area_indices, resolve=True
+            )
+            total = sum(len(a) for a in area_indices)
+            if total != dim:
+                raise ValueError(
+                    f"DirectSumCouplingEncoder area_indices cover {total} "
+                    f"input indices, but data dim is {dim}. The partition "
+                    f"must match data dimensionality exactly."
+                )
         OmegaConf.update(cfg, "model.n_recent_dims", n_recent_dims, force_add=True)
         # n_latent: explicit in config for standard encoders, equals n_input
         # for dimension-preserving encoders (e.g. AffineCouplingEncoder).
