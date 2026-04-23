@@ -262,37 +262,48 @@ def _stats(x):
 
 colors = {"vis→cog": "C0", "cog→vis": "C3"}
 
-fig, axes = plt.subplots(2, 3, figsize=(15.5, 8), sharex=True)
+fig, axes = plt.subplots(2, 3, figsize=(16, 8), sharex=True)
 t_axis = np.arange(T_total) * dt
 for col, gk in enumerate(["reach", "ctrl", "obs"]):
     for row, stat in enumerate(["trace", "min"]):
-        ax = axes[row][col]
+        ax_gt = axes[row][col]           # left axis: ground truth
+        ax_lrn = ax_gt.twinx()           # right axis: learned/predicted
 
+        handles_for_legend = []
+        labels_for_legend = []
         for dir_label, lrn, gt in [
             ("vis→cog", vc_lrn, vc_gt),
             ("cog→vis", cv_lrn, cv_gt),
         ]:
             c = colors[dir_label]
-            # Learned (solid)
-            m, s = _stats(lrn[gk][stat])
-            ax.plot(t_axis, m, c + "-", lw=2,
-                    label=f"{dir_label} (learned)")
-            ax.fill_between(t_axis, m - s, m + s, color=c, alpha=0.15)
-            # GT (dashed)
+            # Ground truth (solid) on the LEFT axis
             m_gt, s_gt = _stats(gt[gk][stat])
-            ax.plot(t_axis, m_gt, c + "--", lw=1.5,
-                    label=f"{dir_label} (ground truth)")
+            (h_gt,) = ax_gt.plot(t_axis, m_gt, c + "-", lw=2,
+                                 label=f"{dir_label} (ground truth)")
+            ax_gt.fill_between(t_axis, m_gt - s_gt, m_gt + s_gt,
+                               color=c, alpha=0.15)
+            # Learned (dotted) on the RIGHT axis
+            m, s = _stats(lrn[gk][stat])
+            (h_lrn,) = ax_lrn.plot(t_axis, m, c + ":", lw=2,
+                                   label=f"{dir_label} (learned)")
+            ax_lrn.fill_between(t_axis, m - s, m + s, color=c, alpha=0.10)
+            handles_for_legend.extend([h_gt, h_lrn])
+            labels_for_legend.extend([f"{dir_label} (GT, solid)",
+                                      f"{dir_label} (learned, dotted)"])
 
         stat_label = "log trace" if stat == "trace" else "log min eigenvalue"
-        ax.set_title(f"{gk}  |  {stat_label}")
-        ax.set_xlabel("window time (s)")
-        ax.set_ylabel("log λ")
-        ax.grid(True, alpha=0.3)
+        ax_gt.set_title(f"{gk}  |  {stat_label}")
+        ax_gt.set_xlabel("window time (s)")
+        ax_gt.set_ylabel("GT  log λ")
+        ax_lrn.set_ylabel("learned  log λ")
+        ax_gt.grid(True, alpha=0.3)
         if col == 0 and row == 0:
-            ax.legend(loc="best", fontsize=8)
+            ax_gt.legend(handles_for_legend, labels_for_legend,
+                         loc="best", fontsize=7)
 
 fig.suptitle(
-    f"Cross-area Gramians — DirectSum learned (solid) vs ground-truth RNN (dashed)\n"
+    f"Cross-area Gramians — ground truth (solid, left axis) vs DirectSum learned "
+    f"(dotted, right axis)\n"
     f"Run {RUN_ID} · obs_noise_scale={OBS_NOISE_SCALE_USED} · "
     f"latent-space Jacobians, block partition at idx 64",
     y=1.01,
