@@ -63,6 +63,24 @@ ALIVE_SLURM_STATES = (
 )
 
 
+def _slurm_task_id(slurm_arrays: dict, k: str) -> str | None:
+    """Return the SLURM task_id for a run_idx, or None if not recorded.
+
+    Two stored formats are supported (the new format was introduced to fix
+    the EXTEND-path misalignment, where run_idx was offset from the new
+    array's task indices):
+      * legacy: slurm_arrays[k] = "<array_id>"           → task_id = "<array_id>_<k>"
+      * new:    slurm_arrays[k] = "<array_id>_<task_idx>" (already a task_id) → use as-is
+
+    SLURM array_ids from sbatch are pure numeric, so the presence of "_"
+    unambiguously identifies the new format.
+    """
+    val = slurm_arrays.get(k)
+    if val is None:
+        return None
+    return val if "_" in val else f"{val}_{k}"
+
+
 # ---------------------------------------------------------------------------
 # Atomic JSON IO
 # ---------------------------------------------------------------------------
@@ -332,9 +350,8 @@ def classify_run_idx(
             matched.append(r)
 
     # (1) Alive SLURM array task — wins over any wandb state.
-    array_id = slurm_arrays.get(k)
-    if array_id is not None:
-        task_id = f"{array_id}_{k}"
+    task_id = _slurm_task_id(slurm_arrays, k)
+    if task_id is not None:
         if slurm_states.get(task_id) in ALIVE_SLURM_STATES:
             last = (matched[-1].state if matched else None)
             return ("running", [r.id for r in matched], last)
@@ -573,9 +590,8 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
         # slot that's never been seen alive is almost certainly either
         # (a) still about to be dispatched or (b) the squeue query
         # returned a transient empty result.
-        array_id = slurm_arrays.get(k)
-        if array_id is not None:
-            task_id = f"{array_id}_{k}"
+        task_id = _slurm_task_id(slurm_arrays, k)
+        if task_id is not None:
             if slurm_states.get(task_id) in ALIVE_SLURM_STATES:
                 entry["ever_alive"] = True
 
@@ -588,9 +604,8 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             cls == "pending"
             and state["monitor_cycle"] > 1
             and entry.get("ever_alive")
-            and slurm_arrays.get(k) is not None
+            and task_id is not None
         ):
-            task_id = f"{slurm_arrays[k]}_{k}"
             if slurm_states.get(task_id) not in ALIVE_SLURM_STATES:
                 cls = (
                     "failed_exhausted" if entry.get("attempts", 0) >= retry_cap
@@ -621,9 +636,8 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
         if any(slurm_states.get(jid) in ALIVE_SLURM_STATES
                for jid in entry["slurm_job_ids"]):
             continue
-        array_id = slurm_arrays.get(k)
-        if array_id:
-            orig_task = f"{array_id}_{k}"
+        orig_task = _slurm_task_id(slurm_arrays, k)
+        if orig_task is not None:
             if slurm_states.get(orig_task) in ALIVE_SLURM_STATES:
                 logger.info(
                     f"{expected['wandb']['group']}/run_idx={k}: original SLURM "
@@ -677,9 +691,9 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
     # writing done.json so the orphan doesn't keep flipping wandb state and
     # confusing downstream analysis.
     orphan_ids = []
-    for k, arr_id in slurm_arrays.items():
-        task = f"{arr_id}_{k}"
-        if slurm_states.get(task) in ALIVE_SLURM_STATES:
+    for k in slurm_arrays:
+        task = _slurm_task_id(slurm_arrays, k)
+        if task is not None and slurm_states.get(task) in ALIVE_SLURM_STATES:
             orphan_ids.append(task)
     # Also pick up any monitor-retry jobs still queued/running.
     for entry in runs.values():

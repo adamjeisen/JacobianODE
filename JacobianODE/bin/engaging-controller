@@ -383,13 +383,18 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
             if merged.get("slurm", {}).get("initial_array_job_id") is not None:
                 merged_slurm["initial_array_job_id"] = merged["slurm"]["initial_array_job_id"]
             merged["slurm"] = merged_slurm
-        # Record the array id of this SUBMISSION so monitor can check the
-        # original array task's liveness before triggering a retry (prevents
-        # monitor from double-scheduling while SLURM REQUEUE is still
-        # in-flight). Per-run offset: next_idx .. len-1 belong to this submit.
+        # Record the SLURM task_id for this SUBMISSION so monitor can check
+        # the original array task's liveness before triggering a retry
+        # (prevents monitor from double-scheduling while SLURM REQUEUE is
+        # still in-flight). On EXTEND, run_idx is offset by next_idx from
+        # the new array's task indices (which always start at 0), so we
+        # must store the full task_id `array_id_<task_idx>` — storing only
+        # array_id and reconstructing as `array_id_<run_idx>` (the legacy
+        # behavior) would point at a non-existent task.
         slurm_arrays = dict(old.get("slurm_arrays") or {})
         for r in appended:
-            slurm_arrays[str(r["run_idx"])] = array_id
+            new_task_idx = r["run_idx"] - next_idx
+            slurm_arrays[str(r["run_idx"])] = f"{array_id}_{new_task_idx}"
         merged["slurm_arrays"] = slurm_arrays
         final_expected.write_text(json.dumps(merged, indent=2) + "\n")
         expected_path.unlink(missing_ok=True)

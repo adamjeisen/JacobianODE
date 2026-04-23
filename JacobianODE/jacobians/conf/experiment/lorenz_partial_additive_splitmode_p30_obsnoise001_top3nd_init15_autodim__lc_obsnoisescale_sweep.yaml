@@ -1,0 +1,97 @@
+# @package _global_
+#
+# Split-mode LC × obs_noise_scale sweep at obs_noise=0.01, across the
+# top-3 n_delays from the LC=0 ndelays_initsteps autodim sweep
+# (n_delays in {55, 60, 70}). Adds training-time observation noise as
+# augmentation on top of the data noise.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, obs_noise=0.01, prediction_steps=30,
+    traj_init_steps=15. Split-mode loss (reconstruction_mode='uniform' for
+    encoder-decoder round-trip; trajectory rollout uses 'most_recent' at
+    train and val via trajectory_loss_most_recent=true). 108-run sweep:
+    3 n_delays {55, 60, 70} × 9 LC weights × 4 obs_noise_scale values.
+    n_target_dims picked by PCA-auto (threshold=0.99) per n_delays.
+  hypothesis: |
+    Trained models on this benchmark systematically undershoot the
+    contracting Lyapunov exponent λ₃ ≈ -14 to ~ -5..-7. Adding training-
+    time observation noise (obs_noise_scale > 0) injects perturbations
+    that are routed through the encoder Jacobian into the latent space
+    *anisotropically*, biasing the dynamics MLP toward learning the
+    correct contracting directions. Unlike kl_dyn_weight (isotropic
+    latent noise), obs_noise_scale matches the geometry of how real
+    sensor noise enters the system. Expect:
+      - At small obs_noise_scale (~ data noise / 10 to data noise), some
+        runs achieve better λ₃ accuracy than the obs_noise_scale=0 baseline.
+      - Trade-off with val/trajectory_loss: too much noise hurts
+        reconstruction; sweet spot is in the bottom of the log range.
+      - Effect should be visible across multiple n_delays, not a one-cell
+        artifact.
+  success_criteria:
+    - "All 108 runs train without divergence"
+    - "obs_noise_scale=0 baseline cells reproduce the prior LC sweep's val/trajectory_loss within noise"
+    - "Best per-cell λ₃ accuracy (vs empirical Lorenz) at some obs_noise_scale > 0 with margin over the obs_noise_scale=0 baseline at the same (n_delays, LC) cell"
+    - "λ₁ remains positive and within ~30% of empirical at the cell with best λ₃"
+    - "Spectrum-L2 error to empirical Lorenz at the best obs_noise_scale > 0 cell strictly improves over the best obs_noise_scale=0 cell"
+
+sweep_grid:
+  data.train_test_params.delay_embedding_params.n_delays: "55,60,70"
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+  training.lightning.obs_noise_scale: "0,3e-3,1e-2,3e-2"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDInitSweep_autodim_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_splitmode_p30_obsnoise001_top3nd_init15_autodim__lc_obsnoisescale_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.01
+    normalize: true
+  train_test_params:
+    seq_length: 45                      # = traj_init_steps (15) + prediction_steps (30)
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 60                      # overridden by sweep_grid
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3                      # fallback; overridden by PCA-auto
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true     # split-mode: rollout uses most_recent (matches val)
+  encoder:
+    final_perm_identity: true
+    init_pca_basis: false
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 1e-4           # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'      # encoder-decoder recon stays uniform
+    obs_noise_scale: 0.0                # overridden by sweep_grid
+    n_eigval_jacobians: 8
+    jacobianODEint_kwargs:
+      traj_init_steps: 15
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 20
