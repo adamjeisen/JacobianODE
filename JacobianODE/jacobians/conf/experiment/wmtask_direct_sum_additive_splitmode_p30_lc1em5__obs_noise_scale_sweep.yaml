@@ -8,8 +8,9 @@
 #   - 3-point obs_noise_scale sweep {0, 0.01, 0.05}
 #   - identity initialization (final_perm_identity=true + zero_init=true)
 #
-# LC weight = 10 (the value that gave the lowest val/loop_closure_loss in
-# the reference LC sweep — vy4hsmqr: lc_loss=1.1e-5 at best-traj epoch).
+# LC weight = 1e-5 (the value that gave the BEST trajectory val loss in
+# the reference LC sweep — i73jwojr: best_traj=0.0105, lc_loss=3.83 at
+# best-traj epoch, passes C2 since sqrt(128)≈11.3).
 
 defaults:
   - override /data: wmtask
@@ -24,21 +25,21 @@ metadata:
     subspace is contiguous at positions [0, 128) so downstream z_dyn
     slicing unchanged. Split-mode MSE (uniform recon + most_recent traj).
     obs_noise=0.05, prediction_steps=30, seq_length=45. LC weight fixed
-    at 10 (winner of the reference LC sweep by lowest val loop-closure
-    loss). 3-run sweep over obs_noise_scale {0, 0.01, 0.05}.
+    at 1e-5 (winner of the reference LC sweep by best trajectory loss).
+    3-run sweep over obs_noise_scale {0, 0.01, 0.05}.
   hypothesis: |
     With a block-structured (area-diagonal) encoder Jacobian by
     construction, any cross-area signal in the latent dynamics is
     attributable to the dynamics MLP, not encoder mixing. The baseline
     check is whether the Lyapunov spectrum reproduces the reference
-    random-init 128->128 network — if the direct-sum encoder converges
-    to a comparable spectrum, the block constraint didn't break
-    anything. obs_noise_scale sweep quantifies how much training noise
-    biases the Lyapunov spectrum toward better-resolved contracting
-    directions (as it did for partial-obs Lorenz).
+    random-init 128->128 network at LC=1e-5 — if the direct-sum encoder
+    converges to a comparable spectrum, the block constraint didn't
+    break anything. obs_noise_scale sweep quantifies how much training
+    noise biases the Lyapunov spectrum toward better-resolved
+    contracting directions (as it did for partial-obs Lorenz).
   success_criteria:
     - "All 3 runs train without divergence"
-    - "Best val traj_loss within 2x of the reference LC=10 run's 0.088"
+    - "Best val traj_loss within 2x of the reference LC=1e-5 run's 0.0105"
     - "Lyapunov λ_max is finite positive at obs_noise_scale=0 (consistent with reference)"
     - "Loop closure loss at selection epoch < sqrt(n_target_dims) = sqrt(128) ≈ 11.3 (C2 pass)"
 
@@ -47,7 +48,7 @@ sweep_grid:
 
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "wmtask_direct_sum_additive_splitmode_p30_lc10__obs_noise_scale_sweep"
+wandb_group: "wmtask_direct_sum_additive_splitmode_p30_lc1em5__obs_noise_scale_sweep"
 
 data:
   postprocessing:
@@ -89,7 +90,7 @@ training:
     accumulate_grad_batches: 4
   lightning:
     loss_func: mse
-    loop_closure_weight: 10.0                 # fixed at reference-sweep winner by LC loss
+    loop_closure_weight: 1e-5                 # reference-sweep winner by best trajectory loss
     loop_closure_training: true
     reconstruction_loss_weight: 1.0
     latent_prediction_loss_weight: 1.0
