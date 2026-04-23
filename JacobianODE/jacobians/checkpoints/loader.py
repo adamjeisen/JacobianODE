@@ -432,6 +432,23 @@ def _load_recent_run(
                 generalized_variance=generalized_variance,
                 verbose=verbose,
             )
+        # Load trained weights. Without this, lit_model stays at its fresh-init
+        # state and downstream analyses silently operate on an untrained model.
+        # (The is_encoder_only branch does this explicitly; the latent branches
+        # were missing the call.)
+        load_checkpoint(
+            run, cfg, lit_model, save_dir=save_dir,
+            loss_key="trajectory val_loss", verbose=verbose,
+        )
+
+    # Also load trained weights for the eigentime-delay and pretrained-jac
+    # branches — both of those paths only instantiate the model above and
+    # would otherwise return a fresh-init model.
+    if is_eigentime_delay or is_pretrained_jac_run:
+        load_checkpoint(
+            run, cfg, lit_model, save_dir=save_dir,
+            loss_key="trajectory val_loss", verbose=verbose,
+        )
 
     return (
         run,
