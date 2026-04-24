@@ -247,9 +247,15 @@ def plot_sweep_overview(
     all_diagnostics: list,
     result,
     sweep_lambdas: list[float],
-    n_latent: int,
+    n_dyn: int,
 ) -> plt.Figure:
-    """4-panel bar chart of sweep selection criteria."""
+    """4-panel bar chart of sweep selection criteria.
+
+    ``n_dyn`` is the dimensionality of the loop-closure space (the
+    dynamic subspace, ``n_target_dims``, for latent models with a
+    subspace split; equal to ``n_latent`` otherwise). The C2 threshold
+    drawn on panel (0, 1) is ``sqrt(n_dyn)``.
+    """
     one_step_mases = [m.one_step_mase for m in all_diagnostics]
     loop_closure_losses = [m.loop_closure_loss for m in all_diagnostics]
     eig_fracs = [m.fast_eigenvalue_fraction for m in all_diagnostics]
@@ -282,8 +288,8 @@ def plot_sweep_overview(
     if result.best_index is not None:
         axes[0, 1].bar(result.best_index, loop_closure_losses[result.best_index],
                        color="gold", edgecolor="black", linewidth=2, label="Selected")
-    axes[0, 1].axhline(y=np.sqrt(n_latent), color="k", linestyle="--", lw=1,
-                       label=f"sqrt(n_latent)={np.sqrt(n_latent):.2f}")
+    axes[0, 1].axhline(y=np.sqrt(n_dyn), color="k", linestyle="--", lw=1,
+                       label=f"sqrt(n_dyn)={np.sqrt(n_dyn):.2f}")
     axes[0, 1].set_xticks(x_pos)
     axes[0, 1].set_xticklabels(x_labels, rotation=45, ha="right")
     axes[0, 1].set_ylabel("Loop closure loss")
@@ -1337,7 +1343,7 @@ def run_analytics(
         # ============================================================
         if "sweep_overview" in active_sections:
             if sweep_diagnostics is not None and sweep_result is not None and sweep_lambdas is not None:
-                fig = plot_sweep_overview(sweep_diagnostics, sweep_result, sweep_lambdas, n_latent)
+                fig = plot_sweep_overview(sweep_diagnostics, sweep_result, sweep_lambdas, n_dyn)
                 _emit("sweep_overview", fig)
 
                 # Pareto front plot (log-log lc_loss vs traj_loss)
