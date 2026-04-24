@@ -19,7 +19,13 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from ..core.types import in_ipython
-from ..lightning_base import OptunaPruneCallback, OptunaProgressCallback, OptunaConstrainedProgressCallback, PercentEarlyStopping
+from ..lightning_base import (
+    OptunaPruneCallback,
+    OptunaProgressCallback,
+    OptunaConstrainedProgressCallback,
+    PercentEarlyStopping,
+    ShadowPercentEarlyStoppingCheckpoint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +315,25 @@ def train_model(
         )
 
     callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback()]
+
+    # Optional: shadow checkpoint that freezes at a simulated smaller-
+    # patience ES-trigger. Primary ES still controls when training stops;
+    # this callback writes a parallel best-so-far checkpoint frozen at the
+    # point a hypothetical shadow-patience ES would have triggered. Useful
+    # for comparing models trained with different ES patience settings
+    # without running separate sweeps.
+    shadow_patience = cfg.training.early_stopping.get("shadow_patience", None)
+    if shadow_patience is not None:
+        callbacks.append(
+            ShadowPercentEarlyStoppingCheckpoint(
+                monitor=cfg.training.early_stopping.monitor,
+                shadow_patience=int(shadow_patience),
+                percent_thresh=cfg.training.early_stopping.get("percent_thresh", 0.01),
+                min_epochs=cfg.training.early_stopping.get("min_epochs", 0),
+                filename=f"es{int(shadow_patience)}-best",
+            )
+        )
+
     callbacks.extend(resume_cbs)
     if extra_callbacks:
         callbacks.extend(extra_callbacks)

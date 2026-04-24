@@ -193,6 +193,13 @@ early_stopping:
   percent_thresh: 0.01
   monitor: 'mean val loss'
   mode: 'min'
+  # Optional shadow checkpoint. When set (int), a parallel checkpoint is
+  # saved frozen at the point a hypothetical PercentEarlyStopping with this
+  # patience would have triggered. Primary ES still uses
+  # `early_stopping_patience`; training continues for as long as the real ES
+  # allows. File name: `es{shadow_patience}-best.ckpt` in the main ckpt dir.
+  # null = disabled (default).
+  shadow_patience: null
 
 model_checkpoint:
   save_top_k: 1

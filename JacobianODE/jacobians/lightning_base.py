@@ -2,8 +2,10 @@ import gc
 import math
 import numpy as np
 import lightning as L
+from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.core.optimizer import LightningOptimizer
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from pathlib import Path
 import time
 import torch
 from torch import nn
@@ -1161,6 +1163,158 @@ class PercentEarlyStopping(EarlyStopping):
             return True, None
 
         return False, None
+
+
+class ShadowPercentEarlyStoppingCheckpoint(L.Callback):
+    """Shadow checkpoint that freezes at the state a *hypothetical*
+    earlier-triggering :class:`PercentEarlyStopping` would have stopped on.
+
+    Runs in parallel with the real early-stopping + checkpointing. Does NOT
+    stop training itself — the real ES/patience config still controls when
+    training ends. This callback simply tracks a second, parallel
+    PercentEarlyStopping counter (with a typically smaller ``shadow_patience``)
+    and writes a checkpoint whenever the monitored metric hits a new best,
+    freezing the file once the shadow counter trips.
+
+    At the end of training you have two checkpoints per run: the "real" one
+    saved by the trainer's ModelCheckpoint, and the "shadow" one saved here
+    — exactly the state the run would have been in if it had early-stopped
+    under the shadow patience.
+
+    Semantics mirror :class:`PercentEarlyStopping` exactly (wait_count
+    compares each epoch's val to the *previous* epoch's val, not best-so-far).
+    Independently, a running ``best_loss`` is tracked so the saved checkpoint
+    is always the best observed val-loss up to (and including) the trigger
+    epoch — not just the last-improving-delta epoch.
+
+    Parameters
+    ----------
+    monitor : str
+        Metric to track (same as ES monitor).
+    shadow_patience : int
+        How many consecutive sub-threshold updates to tolerate before freezing.
+    percent_thresh : float
+        Same semantics as :class:`PercentEarlyStopping.percent_thresh`.
+    min_epochs : int
+        Don't trigger before this many epochs.
+    filename : str
+        Base filename (no extension) for the frozen checkpoint.
+    """
+
+    def __init__(
+        self,
+        monitor: str = "trajectory val_loss",
+        shadow_patience: int = 2,
+        percent_thresh: float = 0.01,
+        min_epochs: int = 0,
+        filename: str = "es_shadow-best",
+    ):
+        super().__init__()
+        self._monitor = monitor
+        self._shadow_patience = int(shadow_patience)
+        self._percent_thresh = float(percent_thresh)
+        self._min_epochs = int(min_epochs)
+        self._filename = filename if filename.endswith(".ckpt") else filename + ".ckpt"
+
+        # PercentEarlyStopping-equivalent state
+        self._prev_loss: float | None = None
+        self._wait_count = 0
+        # Running best + triggered flag
+        self._best_loss: float | None = None
+        self._best_epoch: int | None = None
+        self._triggered = False
+        self._dirpath: Path | None = None
+
+    # ---- Lightning lifecycle hooks ---------------------------------------
+
+    def _resolve_dirpath(self, trainer) -> Path | None:
+        """Inherit the dirpath from the trainer's primary ModelCheckpoint so
+        shadow checkpoints land in the same per-run checkpoint directory."""
+        if self._dirpath is not None:
+            return self._dirpath
+        for cb in trainer.callbacks:
+            if isinstance(cb, ModelCheckpoint) and getattr(cb, "dirpath", None):
+                self._dirpath = Path(cb.dirpath)
+                return self._dirpath
+        return None
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self._triggered:
+            return
+        dirpath = self._resolve_dirpath(trainer)
+        if dirpath is None:
+            return
+
+        val = trainer.callback_metrics.get(self._monitor)
+        if val is None:
+            return
+        try:
+            current = float(val.item() if hasattr(val, "item") else val)
+        except (TypeError, ValueError):
+            return
+
+        # NaN/Inf: treat as no improvement (parallels PercentEarlyStopping).
+        if not math.isfinite(current):
+            self._wait_count += 1
+            self._maybe_trigger(trainer.current_epoch)
+            return
+
+        # Running-best tracking: always save on strict improvement, so the
+        # shadow file is the best val-loss checkpoint up to the current epoch.
+        is_new_best = self._best_loss is None or current < self._best_loss
+        if is_new_best:
+            self._best_loss = current
+            self._best_epoch = trainer.current_epoch
+            filepath = dirpath / self._filename
+            dirpath.mkdir(parents=True, exist_ok=True)
+            trainer.save_checkpoint(str(filepath))
+
+        # PercentEarlyStopping-equivalent wait_count update.
+        if self._prev_loss is None:
+            self._prev_loss = current
+        else:
+            prev = self._prev_loss
+            if not math.isfinite(prev):
+                self._prev_loss = current
+                self._wait_count = 0
+            elif prev > current:
+                pct = (prev - current) / prev
+                if pct < self._percent_thresh:
+                    self._wait_count += 1
+                else:
+                    self._wait_count = 0
+            else:
+                self._wait_count += 1
+            self._prev_loss = current
+
+        self._maybe_trigger(trainer.current_epoch)
+
+    def _maybe_trigger(self, epoch: int):
+        if epoch < self._min_epochs:
+            return
+        if self._wait_count >= self._shadow_patience and not self._triggered:
+            self._triggered = True
+
+    # ---- State dict for resume safety (preempt-safe recovery) ------------
+
+    def state_dict(self):
+        return {
+            "prev_loss": self._prev_loss,
+            "wait_count": self._wait_count,
+            "best_loss": self._best_loss,
+            "best_epoch": self._best_epoch,
+            "triggered": self._triggered,
+            "dirpath": str(self._dirpath) if self._dirpath is not None else None,
+        }
+
+    def load_state_dict(self, state_dict):
+        self._prev_loss = state_dict.get("prev_loss")
+        self._wait_count = int(state_dict.get("wait_count", 0))
+        self._best_loss = state_dict.get("best_loss")
+        self._best_epoch = state_dict.get("best_epoch")
+        self._triggered = bool(state_dict.get("triggered", False))
+        dp = state_dict.get("dirpath")
+        self._dirpath = Path(dp) if dp else None
 
 
 class _OptunaTrialMixin:
