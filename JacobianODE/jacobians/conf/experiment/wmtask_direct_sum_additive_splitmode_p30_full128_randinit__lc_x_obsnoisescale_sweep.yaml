@@ -1,0 +1,100 @@
+# @package _global_
+#
+# Random-init companion to wmtask_direct_sum_additive_splitmode_p30_full128__lc_x_obsnoisescale_sweep.
+# Same grid, same everything — except final_perm_identity=false. The DirectSum
+# encoder is still block-diagonal (area-separating) by construction, but each
+# sub-encoder starts at a random final permutation instead of the identity.
+# That matches the init-geometry of the reference monolithic sweep
+# (wmtask_latent_additive_mse_p30__lc_sweep), isolating the DirectSum
+# structural constraint from the identity-init effect.
+
+defaults:
+  - override /data: wmtask
+  - override /model: latent_direct_sum_coupling
+  - _self_
+
+metadata:
+  description: |
+    WMTask fully-observed (N1=N2=64), latent JacobianODE with DirectSum
+    coupling encoder, 128->128 (no null subspace). 21-run sweep over
+    7 LC × 3 obs_noise_scale. RANDOM init per area (final_perm_identity=false),
+    additive coupling. Split-mode loss (moot for fully-observed n_delays=1,
+    set explicitly). Companion to the identity-init full128 sweep.
+  hypothesis: |
+    The reference monolithic 128->128 sweep (wmtask_latent_additive_mse_p30__lc_sweep)
+    had final_perm_identity=false (default), so the encoder started with
+    random dimension-mixing at init. Our identity-init DirectSum sweep got
+    good trajectory loss but weaker Jacobian structure (under-asymmetric
+    cross-area Gramians, weaker Lyapunov spectrum fit). This sweep removes
+    the identity-init difference — both reference and this sweep now start
+    with random orthogonal-permutation outputs — while retaining the
+    DirectSum area-separating structural constraint. If this sweep's
+    Lyapunov structure matches the reference, the issue was identity-init
+    geometry, not the DirectSum constraint. If it still doesn't match,
+    the block-diagonal encoder constraint is genuinely limiting.
+  success_criteria:
+    - "All 21 runs train without divergence"
+    - "Best val traj_loss within 2x of the reference LC sweep's best (0.0105)"
+    - "At best cell, Lyapunov λ_max finite positive and consistent with reference"
+    - "Cross-area Gramian asymmetry (vis->cog > cog->vis) preserved"
+
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1"
+  training.lightning.obs_noise_scale: "0,0.01,0.05"
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "wmtask_direct_sum_additive_splitmode_p30_full128_randinit__lc_x_obsnoisescale_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: false
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 1
+      delay_spacing: 1
+
+model:
+  n_target_dims: 128
+  prediction_steps: 30
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    area_indices:
+      - [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]   # visual N1
+      - [64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127]   # cognitive N2
+    n_target_dims_per_block: [64, 64]
+    final_perm_identity: false             # ← random final perm per area (changed from identity-init companion)
+    zero_init: true                        # coupling last-layers still zero_init — encoder is still identity-at-init-up-to-final-perm
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 16
+  trainer_params:
+    max_epochs: 1000
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 1e-5              # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.05                  # overridden by sweep_grid
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01
