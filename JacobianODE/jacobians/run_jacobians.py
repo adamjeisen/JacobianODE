@@ -186,8 +186,62 @@ def _run_training(cfg: DictConfig) -> float:
     _init_pca_basis = OmegaConf.select(
         cfg, "model.encoder.init_pca_basis", default=False
     )
+    # DirectSumCouplingEncoder partitions the input axis into N subsystems via
+    # area_indices. With n_target_var_threshold set, we do PCA *per area* (each
+    # area's input data is decomposed independently) and pick n_target_dims for
+    # each area as the smallest k that captures the threshold of that area's
+    # variance. The total n_target_dims is the sum across areas.
+    _is_direct_sum = (
+        str(OmegaConf.select(cfg, "model.encoder._target_", default=""))
+        .endswith("DirectSumCouplingEncoder")
+    )
     pca_basis_tensor = None
-    if _n_target_var_thresh is not None or _init_pca_basis:
+    if _is_direct_sum and _n_target_var_thresh is not None:
+        if _init_pca_basis:
+            raise ValueError(
+                "init_pca_basis is not supported for DirectSumCouplingEncoder "
+                "(would need per-area PCA bases threaded through model_factory). "
+                "Set encoder.init_pca_basis=false."
+            )
+        train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
+        flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
+        area_indices = OmegaConf.to_container(
+            cfg.model.encoder.area_indices, resolve=True
+        )
+        n_target_per_block = []
+        cum_at_pick = []
+        for i, idxs in enumerate(area_indices):
+            x_area = flat[:, idxs]
+            x_area = x_area - x_area.mean(dim=0, keepdim=True)
+            cov_a = (x_area.T @ x_area) / (x_area.shape[0] - 1)
+            eigvals_a = torch.linalg.eigvalsh(cov_a).flip(0).clamp_min(0.0)
+            explained_a = eigvals_a / eigvals_a.sum()
+            cum_var_a = explained_a.cumsum(0)
+            n_k = int((cum_var_a >= _n_target_var_thresh).float().argmax().item()) + 1
+            n_target_per_block.append(n_k)
+            cum_at_pick.append(float(cum_var_a[n_k - 1].item()))
+            log.info(
+                f"  area {i}: input_dims={len(idxs)}, n_target_dims={n_k}, "
+                f"cum_var_at_pick={cum_at_pick[-1]:.4f}"
+            )
+        total = int(sum(n_target_per_block))
+        log.info(
+            f"DirectSum PCA-auto: n_target_dims_per_block={n_target_per_block} "
+            f"(total={total}, threshold={_n_target_var_thresh})"
+        )
+        cfg.model.encoder.n_target_dims_per_block = list(n_target_per_block)
+        cfg.model.n_target_dims = total
+        cfg.model.params.input_dim = total
+        cfg.model.params.output_dim = total ** 2
+        OmegaConf.update(
+            cfg, "model.n_target_dims_per_block_pca_auto",
+            list(n_target_per_block), force_add=True,
+        )
+        OmegaConf.update(
+            cfg, "model.n_target_dims_per_block_pca_cum_var",
+            list(cum_at_pick), force_add=True,
+        )
+    elif _n_target_var_thresh is not None or _init_pca_basis:
         train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
         flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
         flat -= flat.mean(dim=0, keepdim=True)

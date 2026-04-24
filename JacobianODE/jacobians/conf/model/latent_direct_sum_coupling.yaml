@@ -54,10 +54,17 @@ encoder:
   # PCA-basis init is NOT supported for DirectSumCouplingEncoder (requires
   # per-area PCA bases threaded through the data pipeline — deferred).
 
-# Total dynamic-subspace dim (must equal sum(n_target_dims_per_block)).
+# Total dynamic-subspace dim (must equal sum(n_target_dims_per_block) when
+# specified directly; auto-overridden at runtime when n_target_var_threshold
+# is set — see below).
 n_target_dims: ???
-# PCA-auto selection is not supported for direct-sum encoders in V1 — the
-# per-area split is user-specified via n_target_dims_per_block.
+# PCA-auto per-area: when set (e.g. 0.99), at data-load time
+# JacobianODE.jacobians.run_jacobians does PCA on each area's training data
+# independently and picks n_target_dims_per_block[i] as the smallest k such
+# that area i's first k PCs capture >= threshold of its variance. The
+# encoder.n_target_dims_per_block and the top-level n_target_dims are then
+# overwritten to reflect the per-area picks (and their sum). Set to null to
+# use whatever n_target_dims_per_block is in the YAML directly.
 n_target_var_threshold: null
 trajectory_loss_most_recent: true
 encoder_only_mode: false
