@@ -1,0 +1,55 @@
+// Claude Code sandbox — kernel-isolated environment for unattended work on endeavour.
+//
+// Prereqs (see .devcontainer/README.md):
+//   - Docker + nvidia-container-toolkit on the host (Arch: pacman -S docker nvidia-container-toolkit)
+//   - `devcontainer` CLI (`npm i -g @devcontainers/cli`)
+//   - GitHub fine-grained PAT at ~/.config/claude-sandbox/gh-pat (Contents:write on JacobianODE + jacobian-reports only)
+//   - Wandb API key at ~/.config/claude-sandbox/wandb-api-key (service-account preferred)
+//   - sshfs mount of an engaging path at ~/mnt/engaging-weights (read-only)
+//   - ENGAGING_MOUNT_PATH env var set to that engaging path. Must be at or above
+//     the absolute path engaging records in wandb's save_dir, so checkpoint
+//     paths from wandb config resolve at the same path inside the container.
+//     Currently: /orcd/data/ekmiller/001/eisenaj/JacobianODE
+{
+  "name": "JacobianODE claude sandbox",
+  "build": { "dockerfile": "Dockerfile" },
+
+  "runArgs": [
+    "--gpus", "all",
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW",
+    "--hostname", "claude-sandbox"
+  ],
+
+  "mounts": [
+    // Workspace folder (JacobianODE) is bind-mounted automatically by devcontainer CLI
+    // via --workspace-folder + workspaceFolder, so don't list it again here — Docker
+    // rejects duplicate mount targets.
+    "source=${localEnv:HOME}/Documents/jacobian-analyses,target=/workspaces/jacobian-analyses,type=bind",
+    "source=${localEnv:HOME}/.config/claude-sandbox/gh-pat,target=/run/secrets/gh-pat,type=bind,readonly",
+    "source=${localEnv:HOME}/.config/claude-sandbox/wandb-api-key,target=/run/secrets/wandb-api-key,type=bind,readonly",
+    "source=${localEnv:HOME}/mnt/engaging-weights,target=${localEnv:ENGAGING_MOUNT_PATH},type=bind,readonly",
+    "source=claude-sandbox-uv-cache,target=/home/claude/.cache/uv,type=volume",
+    "source=claude-sandbox-claude,target=/home/claude/.claude,type=volume"
+  ],
+
+  "containerEnv": {
+    "UV_LINK_MODE": "copy",
+    // Put the project venv under the persistent uv-cache volume rather than in
+    // the bind-mounted workspace. Otherwise host and container compete for the
+    // same .venv (different Python/torch builds), and a host-side `uv sync`
+    // breaks the container or vice versa.
+    "UV_PROJECT_ENVIRONMENT": "/home/claude/.cache/uv/venvs/jacobianode",
+    "GIT_AUTHOR_NAME": "Adam Eisen (sandbox)",
+    "GIT_AUTHOR_EMAIL": "adamjeisen@gmail.com",
+    "GIT_COMMITTER_NAME": "Adam Eisen (sandbox)",
+    "GIT_COMMITTER_EMAIL": "adamjeisen@gmail.com",
+    "ENGAGING_MOUNT_PATH": "${localEnv:ENGAGING_MOUNT_PATH}"
+  },
+
+  "remoteUser": "claude",
+  "workspaceFolder": "/workspaces/JacobianODE",
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "sudo /usr/local/bin/init-firewall.sh"
+}
