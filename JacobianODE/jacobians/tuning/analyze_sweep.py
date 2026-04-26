@@ -1501,26 +1501,12 @@ def backfill(
         s for s in ANALYTICS_SECTIONS
         if s not in existing_figures
     ]
-
-    # Per-run sections live outside ANALYTICS_SECTIONS. Re-run them when their
-    # figure is missing (parallel to the global-section rule above) — this
-    # picks up sweeps where per-run failed (e.g. due to a since-fixed loader
-    # bug) and left no per-run figures behind.
-    skip_per_run_lyap = (metrics_doc.get("per_run_lyapunov_error") or "").startswith(
-        "skipped:"
-    )
-    needs_per_run_lyap = (
-        not skip_per_run_lyap and "per_run_lyapunov" not in existing_figures
-    )
-    needs_per_run_tangent = "per_run_tangent_spectrum" not in existing_figures
-
-    if not (missing_sections or needs_per_run_lyap or needs_per_run_tangent):
+    if not missing_sections:
         logger.info(f"[backfill {group}] all sections present, nothing to do")
         return output_dir
 
     logger.info(
         f"[backfill {group}] missing sections: {missing_sections}  "
-        f"per_run_lyap={needs_per_run_lyap}  per_run_tangent={needs_per_run_tangent}  "
         f"(existing: {sorted(existing_figures)})"
     )
 
@@ -1544,79 +1530,32 @@ def backfill(
     if not (wandb_entity and wandb_project):
         raise ValueError(f"Cannot determine wandb entity/project for backfill of {group}")
 
-    # Run only the missing global sections via run_analytics.
-    new_figures: dict = {}
-    analytics_log = ""
-    if missing_sections:
-        try:
-            new_figures, analytics_log = run_full_analytics(
-                wandb_entity=wandb_entity,
-                wandb_project=wandb_project,
-                group=group,
-                save_dir=save_dir,
-                output_dir=output_dir,
-                true_lyapunov=true_lyapunov,
-                lyapunov_burn_in_steps=lyapunov_burn_in_steps,
-                lyapunov_burn_in_drop=lyapunov_burn_in_drop,
-                sections_override=missing_sections,
-            )
-        except Exception as e:
-            logger.exception(f"[backfill {group}] run_analytics raised: {e}")
+    # Run only the missing sections via run_analytics. Per-run sections
+    # (Lyapunov, tangent-spectrum) are intentionally NOT re-run here — they
+    # loop over every run in the sweep, are too heavy for the controller's
+    # login-node inline backfill, and belong in the full sbatch path. To
+    # rebuild per-run figures, move the sentinel from processed/ → done/ so
+    # the controller dispatches a fresh analysis sbatch to ou_bcs_high.
+    try:
+        new_figures, analytics_log = run_full_analytics(
+            wandb_entity=wandb_entity,
+            wandb_project=wandb_project,
+            group=group,
+            save_dir=save_dir,
+            output_dir=output_dir,
+            true_lyapunov=true_lyapunov,
+            lyapunov_burn_in_steps=lyapunov_burn_in_steps,
+            lyapunov_burn_in_drop=lyapunov_burn_in_drop,
+            sections_override=missing_sections,
+        )
+    except Exception as e:
+        logger.exception(f"[backfill {group}] run_analytics raised: {e}")
+        new_figures = {}
+        analytics_log = ""
 
-    # Re-run per-run sections that previously failed (figure missing).
+    # Merge new figures into existing metrics_doc
     figure_map = metrics_doc.get("figures", {})
     figure_map.update(new_figures)
-    expected_snapshot = (
-        sentinel.get("expected_snapshot", {}) if done_path is not None else {}
-    )
-    metrics_summary = metrics_doc.get("metrics_summary", {})
-
-    if needs_per_run_lyap:
-        try:
-            result = compute_per_run_lyapunov(
-                wandb_entity=wandb_entity,
-                wandb_project=wandb_project,
-                group=group,
-                save_dir=save_dir,
-                output_dir=output_dir,
-                true_lyapunov=true_lyapunov,
-                expected_snapshot=expected_snapshot,
-            )
-            metrics_doc["per_run_lyapunov"] = result.get("per_run", {})
-            metrics_doc["empirical_lyapunov_spectrum"] = result.get("empirical_mean")
-            metrics_doc["per_run_lyapunov_error"] = None
-            for name in (
-                "per_run_lyapunov",
-                "per_run_lyapunov_vs_true",
-                "per_run_lyapunov_relerr",
-                "lyapunov_spectrum_mse_vs_val_loss",
-            ):
-                p = output_dir / "figures" / f"{name}.png"
-                if p.is_file():
-                    figure_map[name] = str(p)
-        except Exception as e:
-            metrics_doc["per_run_lyapunov_error"] = f"{type(e).__name__}: {e}"
-            logger.exception(f"[backfill {group}] per-run Lyapunov raised: {e}")
-
-    if needs_per_run_tangent:
-        try:
-            ts_result = compute_per_run_tangent_spectrum(
-                wandb_entity=wandb_entity,
-                wandb_project=wandb_project,
-                group=group,
-                save_dir=save_dir,
-                output_dir=output_dir,
-                metrics_summary=metrics_summary,
-            )
-            metrics_doc["per_run_tangent_spectrum"] = ts_result.get("per_run", {})
-            metrics_doc["per_run_tangent_spectrum_error"] = None
-            p = output_dir / "figures" / "per_run_tangent_spectrum.png"
-            if p.is_file():
-                figure_map["per_run_tangent_spectrum"] = str(p)
-        except Exception as e:
-            metrics_doc["per_run_tangent_spectrum_error"] = f"{type(e).__name__}: {e}"
-            logger.exception(f"[backfill {group}] per-run tangent spectrum raised: {e}")
-
     metrics_doc["figures"] = figure_map
     metrics_doc["analyzed_at"] = iso_now()
     metrics_path.write_text(json.dumps(metrics_doc, indent=2) + "\n")
@@ -1624,17 +1563,12 @@ def backfill(
     # Append analytics log
     log_path = output_dir / "run_analytics.log"
     with log_path.open("a") as f:
-        f.write(
-            f"\n\n--- backfill {iso_now()} sections={missing_sections} "
-            f"per_run_lyap={needs_per_run_lyap} "
-            f"per_run_tangent={needs_per_run_tangent} ---\n"
-        )
+        f.write(f"\n\n--- backfill {iso_now()} sections={missing_sections} ---\n")
         f.write(analytics_log)
 
     logger.info(
-        f"[backfill {group}] added {len(new_figures)} global figure(s)"
-        + (", per_run_lyap re-ran" if needs_per_run_lyap else "")
-        + (", per_run_tangent re-ran" if needs_per_run_tangent else "")
+        f"[backfill {group}] added {len(new_figures)} figure(s): "
+        f"{sorted(new_figures.keys())}"
     )
     return output_dir
 
