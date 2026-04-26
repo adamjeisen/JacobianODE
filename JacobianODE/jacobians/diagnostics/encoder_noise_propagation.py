@@ -62,16 +62,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comma-separated wandb group names")
     parser.add_argument("--save-dir", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--reports-dir", required=True,
+                        help="Path to the jacobian-reports repo root (used to "
+                             "look up <project>/<group>/metrics.json for the "
+                             "chosen-best run id; fallback if --run-ids omitted)")
+    parser.add_argument("--run-ids", default=None,
+                        help="Comma-separated explicit run ids to use, one per "
+                             "group (overrides metrics.json lookup)")
     parser.add_argument("--n-trajectories", type=int, default=16,
                         help="Test trajectories used for both diagnostics")
     parser.add_argument("--n-jac-samples", type=int, default=512,
                         help="Random sample of (B*T) points for the SVD pass")
     parser.add_argument("--noise-multiplier", type=float, default=1.0,
                         help="Scale the training obs_noise by this (default 1x)")
-    parser.add_argument("--loss-key", default="best_traj_loss")
-    parser.add_argument("--rank", default="min",
-                        choices=("min", "max"),
-                        help="Pick best run by min (default) or max loss-key")
     parser.add_argument("--tag", default=None,
                         help="Optional output filename suffix")
     args = parser.parse_args(argv)
@@ -83,8 +86,6 @@ def main(argv: list[str] | None = None) -> int:
     import matplotlib.pyplot as plt
     import numpy as np
     import torch
-    import wandb as _wandb
-
     from JacobianODE.jacobians.checkpoints.loader import load_run, load_checkpoint
 
     output_dir = Path(args.output_dir)
@@ -93,47 +94,48 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"device={device}")
 
-    api = _wandb.Api()
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
+    explicit_run_ids = (
+        [s.strip() for s in args.run_ids.split(",")] if args.run_ids else [None] * len(groups)
+    )
+    if len(explicit_run_ids) != len(groups):
+        raise ValueError("--run-ids must have one entry per --groups entry")
+    reports_dir = Path(args.reports_dir)
     logger.info(f"groups: {groups}")
 
     results: list[dict] = []  # per-group dict
 
-    for group in groups:
+    for group, run_id_override in zip(groups, explicit_run_ids):
         logger.info(f"=== {group} ===")
-        runs = list(api.runs(
-            f"{args.wandb_entity}/{args.wandb_project}",
-            filters={"group": group},
-        ))
-        # Filter to runs with checkpoints
-        ckpt_base = save_dir / args.wandb_project
-        candidates = [r for r in runs
-                      if (ckpt_base / r.id / "checkpoints").is_dir()]
-        if not candidates:
-            logger.warning(f"  no runs with checkpoints for {group}; skipping")
-            continue
 
-        # Pick best by loss-key
-        keyed = []
-        for r in candidates:
-            v = r.summary.get(args.loss_key)
-            if v is None:
+        # Resolve best run: explicit override > metrics.json overall_chosen_run
+        if run_id_override:
+            best_run_id = run_id_override
+            loss_val = None
+            logger.info(f"  using explicit run_id={best_run_id}")
+        else:
+            metrics_path = reports_dir / args.wandb_project / group / "metrics.json"
+            if not metrics_path.is_file():
+                logger.warning(f"  metrics.json not found at {metrics_path}; skipping")
                 continue
-            try:
-                keyed.append((float(v), r))
-            except (TypeError, ValueError):
+            metrics = json.loads(metrics_path.read_text())
+            chosen = metrics.get("metrics_summary", {}).get("overall_chosen_run") or {}
+            best_run_id = chosen.get("run_id")
+            loss_val = chosen.get("best_traj_loss")
+            if not best_run_id:
+                logger.warning(f"  no overall_chosen_run in {metrics_path}; skipping")
                 continue
-        if not keyed:
-            logger.warning(f"  no runs with {args.loss_key}; skipping")
+            logger.info(f"  chosen run: {best_run_id}  best_traj_loss={loss_val}")
+
+        ckpt_base = save_dir / args.wandb_project
+        if not (ckpt_base / best_run_id / "checkpoints").is_dir():
+            logger.warning(f"  no checkpoint dir for {best_run_id}; skipping")
             continue
-        keyed.sort(key=lambda kv: kv[0], reverse=(args.rank == "max"))
-        loss_val, best = keyed[0]
-        logger.info(f"  best run: {best.id}  {args.loss_key}={loss_val:.6f}")
 
         try:
             loaded = load_run(
                 f"{args.wandb_entity}/{args.wandb_project}",
-                run_id=best.id, save_dir=str(save_dir),
+                run_id=best_run_id, save_dir=str(save_dir),
                 generate_data=True, verbose=False, return_full_obs=False,
             )
             run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
@@ -142,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
             lit_model = lit_model.to(device).eval()
 
             if not hasattr(lit_model, "encoder"):
-                logger.warning(f"  {best.id} has no encoder (vanilla MLP?); skipping")
+                logger.warning(f"  {best_run_id} has no encoder (vanilla MLP?); skipping")
                 continue
 
             sigma = float(cfg.data.postprocessing.get("obs_noise", 0.0))
@@ -190,9 +192,8 @@ def main(argv: list[str] | None = None) -> int:
 
             results.append({
                 "group": group,
-                "run_id": best.id,
-                "loss": loss_val,
-                "loss_key": args.loss_key,
+                "run_id": best_run_id,
+                "best_traj_loss": loss_val,
                 "sigma_obs": sigma,
                 "sigma_eff": sigma_eff,
                 "n_obs": n_obs,
@@ -217,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"log|J|_median={np.median(log_det):+.3f}"
             )
         except Exception as e:
-            logger.exception(f"  FAILED for {best.id}: {e}")
+            logger.exception(f"  FAILED for {best_run_id}: {e}")
         finally:
             try:
                 del lit_model
