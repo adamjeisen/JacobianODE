@@ -62,9 +62,14 @@ def fnn_dim_estimate(
         Falls back to ``D`` if neither condition fires within the available
         embedding dimensions.
     """
-    xt = torch.as_tensor(np.asarray(x), dtype=dtype)
-    if device is not None:
-        xt = xt.to(device)
+    if isinstance(x, torch.Tensor):
+        xt = x.to(dtype=dtype)
+        if device is not None:
+            xt = xt.to(device)
+    else:
+        xt = torch.as_tensor(np.asarray(x), dtype=dtype)
+        if device is not None:
+            xt = xt.to(device)
     _, weights = loss_false(
         xt, k=k, use_pca=True, n_samples=n_samples, return_fnn_weights=True,
     )
