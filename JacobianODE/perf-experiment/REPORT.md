@@ -55,6 +55,26 @@ only if delta is meaningfully larger than that.
 
 ## Attempt log
 
+### Attempt 6: l1_loss via `_foreach_norm` instead of cat+abs+sum — REJECTED
+
+**Hypothesis**: the per-step `l1_loss = sum(|cat(view(-1) for p in params)|)`
+allocates a 27 MB contiguous buffer (all 6.8 M params concatenated) before
+abs+sum. Replacing with `torch.stack(torch._foreach_norm(params, ord=1)).sum()`
+keeps the same numerical scalar but uses one fused per-param reduction
+launch instead of cat → abs → sum.
+
+**Measurement (seed=42, vs original pre-change baselines)**:
+
+| Config | Per-step (s) | Cumulative Δ% | vs prior best | max \|Δloss\| |
+|---|---|---|---|---|
+| lorenz (max_steps=80) | 1.0360 ± 0.043 | −0.37% | +0.01% (no change) | 0.000e+00 |
+| wmtask (max_steps=25) | 0.9554 ± 0.027 | **−1.20%** | **+0.23% regression** vs A5's −1.43% | 2.98e-08 |
+
+**Decision**: REVERT. wmtask got slightly slower with `_foreach_norm`,
+likely because the fused-norm launches of 80 small reductions don't
+amortize against the cat-then-one-reduce shape on this Pascal GPU
+where launch overhead is high. l1_loss is bit-exact either way.
+
 ### Attempt 5: DataLoader `num_workers=0` default — KEPT (lorenz −0.4%, wmtask −0.2% marginal)
 
 **Hypothesis**: `TimeSeriesDataset.__getitem__` is `return self.sequence[index]`
@@ -215,4 +235,89 @@ sweep with no payoff. Documented and moving on.
 
 ## Summary
 
-_To be written at end-of-window._
+End-of-window state.
+
+### Cumulative speedup
+
+Final per-step times after all kept changes, vs the original pre-change
+baselines:
+
+| Config | Baseline | Final | Cumulative Δ% | max \|Δloss\| | allclose@1e-4 |
+|---|---|---|---|---|---|
+| lorenz (max_steps=80) | 1.0399 ± 0.052 s | **1.0359 ± 0.044 s** | **−0.38%** | 0.000e+00 | ✓ |
+| wmtask (max_steps=25) | 0.9670 ± 0.030 s | **0.9530 ± 0.027 s** | **−1.45%** | 2.98e-08 | ✓ |
+
+Both regressions pass cleanly at the 1e-4 gate. lorenz is bit-exact;
+wmtask shows a 3e-8 max divergence from the fused-AdamW reduction order
+(the only kept change that touches reduction order).
+
+Final traces: `runs/final-{lorenz,wmtask}-*.json`.
+
+### Accepted changes (3)
+
+| # | Change | File | Lorenz | wmtask |
+|---|---|---|---|---|
+| A1 | `fused=True` for AdamW when CUDA available | `lightning_base.py:configure_optimizers` | −0.5% | −1.0% |
+| A4 | Drop `.cpu()` syncs in `JacobianODEint.generate_dynamics` (n_steps + teacher-forcing index) | `jacobianODE.py:531,561` | −0.1% | −1.2% |
+| A5 | `num_workers=0` default (TimeSeriesDataset is in-memory) | `dataloaders.py` | −0.4% | −0.2% |
+
+(Marginal effects measured one-at-a-time vs the prior cumulative state.
+The headline cumulative is smaller than the sum of marginals because
+of run-to-run variance ~1 % and because the changes touch overlapping
+overhead.)
+
+### Rejected changes (2) and skipped probes (1)
+
+| # | Change | Reason for revert / skip |
+|---|---|---|
+| A0 | `cudnn.benchmark=True` | Both target configs are pure MLP / matmul (no `nn.Conv*`), so cuDNN is never selected. Skipped without measuring. |
+| A2 | `torch.compile(mode=default | reduce-overhead, dynamic=True)` on `model` + `encoder` | Hard-blocked: GTX 1050 Ti is CC 6.1, Inductor/Triton requires ≥ 7.0 (`GPUTooOldForTriton`). `backend="cudagraphs"` fails on dynamic shapes inside the JacobianODEint integration loop. Probe script left in tree (`run_with_compile.py`) for re-runs on Volta+. |
+| A3 | `torch.nan_to_num(loss)` instead of `if torch.isnan(loss):` | Bit-exact loss but +0.3 % (noise) — the sync wasn't on the critical path because Lightning's optimizer.step already syncs soon after. |
+| A6 | `_foreach_norm` instead of cat+abs+sum for L1 reg | wmtask got slightly slower (−1.20 % vs A5's −1.43 %). The 80 small per-param launches don't amortize against one big cat+reduce on this Pascal GPU. |
+
+### Where the headline gain on this hardware *is* coming from
+
+Profiling (`profile_step.py`) shows the dominant CPU cost is
+**~18 k `cudaLaunchKernel` calls per training step** (~12.7 µs each
+≈ 230 ms / step ≈ 22 % of step time). On Volta+ that would be the
+torch.compile target. On Pascal sandbox we have to attack overhead by
+hand:
+
+- A1 (fused AdamW) collapses the per-param `_foreach_*` adam launches
+  into a single `_fused_adamw_` launch — directly attacks launch count.
+- A4 removes 1 + n_steps CUDA syncs per `generate_dynamics`, each of
+  which can stall the host's next-step kernel-dispatch.
+- A5 removes per-batch IPC overhead from a needless worker fork.
+
+The wins are larger on **wmtask** because `accumulate_grad_batches=4`
+plus the per-area direct-sum coupling means each global step makes
+many more `generate_dynamics` calls than lorenz, multiplying the
+benefit of A4 in particular.
+
+### Time spent
+
+- Framework + baselines: ~25 min
+- 7 attempts (3 kept, 2 rejected, 1 skipped pre-flight, 1 hardware-blocked): ~3 h elapsed wall-clock from kickoff.
+- Stopped early because:
+  1. The single biggest lever (`torch.compile`) is hardware-blocked.
+  2. Remaining low-hanging branches (CPU-side noise generation, encoder
+     vectorization, l1_loss restructuring) either change RNG semantics
+     (forbidden under "computation unchanged" rule) or have been tried
+     and didn't help on this GPU. Quality-over-duration.
+
+### What I deliberately did NOT touch
+
+- The trajectory-noise injection path
+  (`batch + (torch.randn(*batch.shape)*scaled_noise).type(batch.dtype).to(batch.device)`).
+  Generating noise directly on GPU would change the RNG stream and so
+  the loss at step 1 — would fail the 1e-4 gate. Forbidden.
+- `latent_jacobian.trajectory_model_step` window-stack Python loop. Would
+  vectorize cleanly with `torch.stack(unfold(...))` but the loop is
+  small (B=8 × n_windows≤4) and not on the profile hot path.
+- `log_training_metrics` per-step calls. The expensive Jacobian-loss
+  branch only fires when `self.eq is not None`, which neither target
+  config triggers (n_delays>1 ⇒ `eq=None` for lorenz; wmtask returns
+  `eq=None` from its dataset_loader path).
+- `compute_jacobians` itself — already a single forward pass through
+  the Jacobian MLP; the heavy work is in cuBLAS.
+
