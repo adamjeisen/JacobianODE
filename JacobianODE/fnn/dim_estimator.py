@@ -26,6 +26,8 @@ def fnn_dim_estimate(
     threshold: float = 0.01,
     n_samples: int = 2500,
     k: int = 1,
+    device: str | torch.device | None = None,
+    dtype: torch.dtype = torch.float64,
 ) -> int:
     """Return the FNN-estimated embedding dimension of ``x``.
 
@@ -42,6 +44,12 @@ def fnn_dim_estimate(
     k : int, default 1
         Nearest-neighbor count for the Kennel test. ``k=1`` is canonical;
         higher k smooths but biases the dim transition outward.
+    device : str | torch.device | None
+        Where to run the FNN computation. ``None`` keeps the input's device
+        (CPU for numpy inputs).
+    dtype : torch.dtype, default torch.float64
+        Compute dtype. ``float32`` halves the O(N^2 D) memory — needed for
+        n_samples >> 2500 on GPU.
 
     Returns
     -------
@@ -54,7 +62,9 @@ def fnn_dim_estimate(
         Falls back to ``D`` if neither condition fires within the available
         embedding dimensions.
     """
-    xt = torch.as_tensor(np.asarray(x), dtype=torch.float64)
+    xt = torch.as_tensor(np.asarray(x), dtype=dtype)
+    if device is not None:
+        xt = xt.to(device)
     _, weights = loss_false(
         xt, k=k, use_pca=True, n_samples=n_samples, return_fnn_weights=True,
     )
