@@ -186,17 +186,86 @@ def _run_training(cfg: DictConfig) -> float:
     _init_pca_basis = OmegaConf.select(
         cfg, "model.encoder.init_pca_basis", default=False
     )
+    # FNN-based autodim opt-in. When set to "fnn", n_target_dims is chosen by
+    # whitened-PCA-FNN k=1 stop-at-min on the training delay embeddings; the
+    # PCA-99% branches below are skipped. Default ("pca") preserves existing
+    # behavior. n_target_fnn_threshold is the Kennel false-neighbor cutoff.
+    _n_target_dim_method = OmegaConf.select(
+        cfg, "model.n_target_dim_method", default="pca"
+    )
+    _n_target_fnn_thresh = OmegaConf.select(
+        cfg, "model.n_target_fnn_threshold", default=0.01
+    )
+    if _n_target_dim_method not in ("pca", "fnn"):
+        raise ValueError(
+            f"model.n_target_dim_method must be 'pca' or 'fnn', got "
+            f"{_n_target_dim_method!r}"
+        )
+    if _n_target_dim_method == "fnn" and _init_pca_basis:
+        raise ValueError(
+            "model.n_target_dim_method='fnn' is not compatible with "
+            "model.encoder.init_pca_basis=true (would require running both "
+            "FNN and PCA at autodim time). Set one or the other."
+        )
     # DirectSumCouplingEncoder partitions the input axis into N subsystems via
     # area_indices. With n_target_var_threshold set, we do PCA *per area* (each
     # area's input data is decomposed independently) and pick n_target_dims for
     # each area as the smallest k that captures the threshold of that area's
-    # variance. The total n_target_dims is the sum across areas.
+    # variance. The total n_target_dims is the sum across areas. The FNN path
+    # below mirrors this per-area structure.
     _is_direct_sum = (
         str(OmegaConf.select(cfg, "model.encoder._target_", default=""))
         .endswith("DirectSumCouplingEncoder")
     )
     pca_basis_tensor = None
-    if _is_direct_sum and _n_target_var_thresh is not None:
+    if _n_target_dim_method == "fnn":
+        from JacobianODE.fnn.dim_estimator import fnn_dim_estimate
+        train_seq = trajs["train_trajs"].sequence
+        flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
+        flat_np = flat.cpu().numpy()
+        if _is_direct_sum:
+            area_indices = OmegaConf.to_container(
+                cfg.model.encoder.area_indices, resolve=True
+            )
+            n_target_per_block = []
+            for i, idxs in enumerate(area_indices):
+                n_k = int(fnn_dim_estimate(
+                    flat_np[:, idxs], threshold=_n_target_fnn_thresh,
+                ))
+                n_target_per_block.append(n_k)
+                log.info(
+                    f"  area {i}: input_dims={len(idxs)}, "
+                    f"n_target_dims (FNN)={n_k}"
+                )
+            total = int(sum(n_target_per_block))
+            log.info(
+                f"DirectSum FNN-auto: n_target_dims_per_block={n_target_per_block} "
+                f"(total={total}, fnn_threshold={_n_target_fnn_thresh})"
+            )
+            cfg.model.encoder.n_target_dims_per_block = list(n_target_per_block)
+            cfg.model.n_target_dims = total
+            cfg.model.params.input_dim = total
+            cfg.model.params.output_dim = total ** 2
+            OmegaConf.update(
+                cfg, "model.n_target_dims_per_block_fnn_auto",
+                list(n_target_per_block), force_add=True,
+            )
+        else:
+            n_target = int(fnn_dim_estimate(
+                flat_np, threshold=_n_target_fnn_thresh,
+            ))
+            log.info(
+                f"FNN-auto n_target_dims: D_embed={flat_np.shape[-1]}, "
+                f"N_samples={flat_np.shape[0]}, fnn_threshold={_n_target_fnn_thresh}, "
+                f"chose n_target_dims={n_target}"
+            )
+            cfg.model.n_target_dims = n_target
+            cfg.model.params.input_dim = n_target
+            cfg.model.params.output_dim = n_target ** 2
+            OmegaConf.update(
+                cfg, "model.n_target_dims_fnn_auto", n_target, force_add=True,
+            )
+    elif _is_direct_sum and _n_target_var_thresh is not None:
         if _init_pca_basis:
             raise ValueError(
                 "init_pca_basis is not supported for DirectSumCouplingEncoder "
