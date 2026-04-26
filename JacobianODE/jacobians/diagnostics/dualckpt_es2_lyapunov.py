@@ -1,12 +1,11 @@
 """Lyapunov spectra from the patience-2 sidecar (`es2-best.ckpt`) for a
 ShadowPercentEarlyStoppingCheckpoint sweep.
 
-The standard per-run Lyapunov diagnostic loads each run's primary best.ckpt
-(saved by Lightning's ModelCheckpoint, picked by best val loss). For dualckpt
-sweeps where ShadowPercentEarlyStoppingCheckpoint also writes `es2-best.ckpt`
-at the state a patience=2 ES would have triggered, this script computes the
-same overlay against the sidecar — useful for "did patience=5 over-train into
-a different Lyapunov regime?" comparisons.
+Per-run subplot grid: each panel shows one run's predicted Lyapunov spectrum
+(blue, from es2-best.ckpt) overlaid on the empirical ground-truth spectrum
+(black, from eq.jac on the raw trajectories). Title carries run_idx, run_id,
+swept hyperparameters, and best traj_loss for direct comparison across the
+sweep.
 
 Usage:
     python -m JacobianODE.jacobians.diagnostics.dualckpt_es2_lyapunov \\
@@ -15,7 +14,8 @@ Usage:
         --group <sweep_group> \\
         --save-dir /orcd/.../latent_jac_runs \\
         --output-dir /orcd/.../diagnostics \\
-        --sidecar es2-best.ckpt
+        --sidecar es2-best.ckpt \\
+        [--sentinel /orcd/.../sweeps/{done,processed,failed}/<group>.done.json]
 """
 from __future__ import annotations
 
@@ -23,9 +23,35 @@ import argparse
 import gc
 import json
 import logging
+import math
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _nested_get(d: dict, dotted: str):
+    cur = d
+    for part in dotted.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+        if cur is None:
+            return None
+    return cur
+
+
+def _fmt_param_value(v):
+    if v is None:
+        return "?"
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if f == 0:
+        return "0"
+    if abs(f) < 1e-2 or abs(f) >= 1e3:
+        return f"{f:.0e}"
+    return f"{f:g}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,13 +63,22 @@ def main(argv: list[str] | None = None) -> int:
                         help="Base dir containing <project>/<run_id>/checkpoints/")
     parser.add_argument("--output-dir", required=True,
                         help="Where to write the .png + .json")
+    parser.add_argument("--sentinel", default=None,
+                        help="Path to <group>.done.json sentinel (for run_idx + "
+                             "swept-key auto-detection). If omitted, the script "
+                             "searches /orcd/.../sweeps/{done,processed,failed}/.")
+    parser.add_argument("--sweeps-dir", default="/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps",
+                        help="Used only when --sentinel is omitted.")
     parser.add_argument("--sidecar", default="es2-best.ckpt",
-                        help="Sidecar checkpoint filename to load (default: es2-best.ckpt)")
+                        help="Sidecar checkpoint filename (default: es2-best.ckpt)")
     parser.add_argument("--n-sample-trajectories", type=int, default=24)
     parser.add_argument("--chunk-size", type=int, default=8)
-    parser.add_argument("--swept-key",
-                        default="training.lightning.loop_closure_weight",
-                        help="Config path used to color per-run curves")
+    parser.add_argument("--swept-keys", default=None,
+                        help="Comma-separated config paths to display in titles. "
+                             "If omitted, derived from sentinel's overrides_template.")
+    parser.add_argument("--ncols", type=int, default=4)
+    parser.add_argument("--loss-key", default="best_traj_loss",
+                        help="wandb summary key to display in subplot titles")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -56,15 +91,52 @@ def main(argv: list[str] | None = None) -> int:
     import wandb as _wandb
 
     from JacobianODE.jacobians.checkpoints.loader import load_run, load_checkpoint
+    from JacobianODE.jacobians.tuning.analyze_sweep import _compute_empirical_lyapunov
+    from JacobianODE.jacobians.tuning.monitor import match_run_to_idx
     from JacobianODE.models.latent_jacobian import LitLatentJacobianODE
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     save_dir = Path(args.save_dir)
 
+    # ---- Locate sentinel for run_idx + swept-key resolution ----
+    sentinel_path: Path | None = None
+    if args.sentinel:
+        sentinel_path = Path(args.sentinel)
+    else:
+        for sub in ("done", "processed", "failed"):
+            cand = Path(args.sweeps_dir) / sub / f"{args.group}.done.json"
+            if cand.is_file():
+                sentinel_path = cand
+                break
+    expected_snapshot: dict = {}
+    if sentinel_path and sentinel_path.is_file():
+        sentinel_doc = json.loads(sentinel_path.read_text())
+        expected_snapshot = sentinel_doc.get("expected_snapshot", {})
+        logger.info(f"sentinel: {sentinel_path}")
+    else:
+        logger.warning("No sentinel found; run_idx + auto swept-key disabled.")
+
+    # ---- Determine swept keys (CLI > sentinel.overrides_template > default) ----
+    if args.swept_keys:
+        swept_keys = [s.strip() for s in args.swept_keys.split(",") if s.strip()]
+    else:
+        swept_keys = []
+        tpl = expected_snapshot.get("hydra", {}).get("overrides_template", []) or []
+        for ov in tpl:
+            if "=" not in ov:
+                continue
+            k, v = ov.split("=", 1)
+            if "," in v and k not in ("experiment",) and not k.startswith("hydra."):
+                swept_keys.append(k)
+        if not swept_keys:
+            swept_keys = ["training.lightning.loop_closure_weight"]
+    logger.info(f"swept_keys: {swept_keys}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"device={device}, sidecar={args.sidecar}")
 
+    # ---- List runs ----
     api = _wandb.Api()
     raw_runs = list(api.runs(
         f"{args.wandb_entity}/{args.wandb_project}",
@@ -73,18 +145,20 @@ def main(argv: list[str] | None = None) -> int:
     ckpt_base = save_dir / args.wandb_project
     runs = []
     for r in raw_runs:
-        ckpt_dir = ckpt_base / r.id / "checkpoints"
-        if (ckpt_dir / args.sidecar).is_file():
+        if (ckpt_base / r.id / "checkpoints" / args.sidecar).is_file():
             runs.append(r)
         else:
-            logger.warning(f"  skipping {r.id}: missing {args.sidecar} in {ckpt_dir}")
+            logger.warning(f"  skipping {r.id}: missing {args.sidecar}")
     logger.info(f"Found {len(runs)} run(s) with {args.sidecar} (out of {len(raw_runs)})")
     if not runs:
         logger.error("No runs with sidecar checkpoint; nothing to do.")
         return 1
 
+    # ---- Compute predicted spectra + cache empirical from first run ----
     per_run: dict[str, dict] = {}
-    swept_vals: dict[str, float | str | None] = {}
+    empirical_mean: np.ndarray | None = None
+
+    resolved_runs = expected_snapshot.get("hydra", {}).get("resolved_runs", []) or []
 
     for i, run in enumerate(runs):
         rid = run.id
@@ -92,9 +166,29 @@ def main(argv: list[str] | None = None) -> int:
             loaded = load_run(
                 f"{args.wandb_entity}/{args.wandb_project}",
                 run_id=rid, save_dir=str(save_dir),
-                generate_data=True, verbose=False, return_full_obs=False,
+                generate_data=True, verbose=False,
+                return_full_obs=(empirical_mean is None),
             )
             run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
+
+            if empirical_mean is None and eq is not None and trajs is not None:
+                mu_val = cfg.data.postprocessing.get("mu", 0.0)
+                sigma_val = cfg.data.postprocessing.get("sigma", 1.0)
+                if "train_trajs_full" in trajs:
+                    traj_for_emp = trajs["train_trajs_full"].sequence
+                elif values is not None:
+                    traj_for_emp = values
+                else:
+                    traj_for_emp = (trajs.get("test_trajs_full")
+                                    or trajs["test_trajs"]).sequence
+                logger.info("Computing empirical Lyapunov spectrum (one-time)...")
+                em_mean, _ = _compute_empirical_lyapunov(
+                    eq, traj_for_emp, dt, mu_val, sigma_val, device,
+                )
+                if em_mean is not None:
+                    empirical_mean = em_mean
+                    logger.info(f"  empirical: λ₁={em_mean[0]:.4f}  λ_min={em_mean[-1]:.4f}  "
+                                f"Σλ={em_mean.sum():.3f}  D={len(em_mean)}")
 
             load_checkpoint(
                 run_obj, cfg, lit_model, save_dir=str(save_dir),
@@ -102,8 +196,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             lit_model = lit_model.to(device).eval()
 
-            if trajs is None or "test_trajs" not in trajs:
-                raise RuntimeError(f"No trajectories from load_run for {rid}")
             seq = trajs.get("train_trajs", trajs["test_trajs"]).sequence
             test_trajs_this = seq[: args.n_sample_trajectories].to(device)
 
@@ -125,29 +217,26 @@ def main(argv: list[str] | None = None) -> int:
 
             lambda_per_traj = torch.cat(lambdas, dim=0).numpy()
             lambda_mean = lambda_per_traj.mean(axis=0)
-            cum = np.cumsum(lambda_mean)
-            k_star = int(np.searchsorted(-cum, 0))
-            ky = (float(k_star + cum[k_star - 1] / max(abs(lambda_mean[k_star]), 1e-12))
-                  if 0 < k_star < len(lambda_mean) else None)
 
             cfg_dict = dict(run.config)
-            swept = cfg_dict
-            for part in args.swept_key.split("."):
-                swept = swept.get(part, {}) if isinstance(swept, dict) else None
-            swept_vals[rid] = swept if not isinstance(swept, dict) else None
+            run_idx = match_run_to_idx(cfg_dict, resolved_runs) if resolved_runs else None
+            swept_vals = {k: _nested_get(cfg_dict, k) for k in swept_keys}
+            traj_loss = run.summary.get(args.loss_key)
 
             per_run[rid] = {
+                "run_idx": run_idx,
                 "lambda_spectrum": lambda_mean.tolist(),
                 "lambda_max": float(lambda_mean.max()),
                 "lambda_sum": float(lambda_mean.sum()),
-                "kaplan_yorke_dim": ky,
-                "swept_value": swept_vals[rid],
+                "swept_values": swept_vals,
+                "traj_loss": float(traj_loss) if traj_loss is not None else None,
                 "error": None,
             }
             logger.info(
-                f"  [{i + 1}/{len(runs)}] {rid}  "
-                f"{args.swept_key.split('.')[-1]}={swept_vals[rid]}  "
-                f"λ_max={per_run[rid]['lambda_max']:.4f}  Σλ={per_run[rid]['lambda_sum']:.2f}"
+                f"  [{i + 1}/{len(runs)}] {rid}  idx={run_idx}  "
+                + "  ".join(f"{k.split('.')[-1]}={_fmt_param_value(v)}"
+                            for k, v in swept_vals.items())
+                + f"  λ_max={per_run[rid]['lambda_max']:.4f}"
             )
         except Exception as e:
             per_run[rid] = {"error": f"{type(e).__name__}: {e}"}
@@ -161,55 +250,66 @@ def main(argv: list[str] | None = None) -> int:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # ---- Plot ----
+    # ---- Plot per-run grid ----
     success = [(rid, d) for rid, d in per_run.items() if d.get("error") is None]
     if not success:
-        logger.error("No successful runs; skipping plot.")
+        logger.error("No successful runs; saving JSON only.")
         (output_dir / f"{args.group}_es2_lyapunov.json").write_text(
             json.dumps({"sidecar": args.sidecar, "per_run": per_run}, indent=2)
         )
         return 1
 
-    # Color by swept value (numeric → log-norm; else categorical)
-    swept_numeric = []
-    for rid, d in success:
-        v = d.get("swept_value")
-        try:
-            swept_numeric.append(float(v))
-        except (TypeError, ValueError):
-            swept_numeric.append(None)
-    use_numeric = all(v is not None for v in swept_numeric)
-    if use_numeric:
-        positives = [v for v in swept_numeric if v > 0]
-        vmin = min(positives) if positives else 1e-12
-        vmax = max(positives) if positives else 1.0
-        from matplotlib.colors import LogNorm
-        norm = LogNorm(vmin=vmin, vmax=vmax)
-        cmap = plt.colormaps["viridis"]
+    # Sort by run_idx (None last)
+    success.sort(key=lambda rd: (rd[1]["run_idx"] is None, rd[1]["run_idx"] or 0))
+    n = len(success)
+    ncols = max(1, args.ncols)
+    nrows = math.ceil(n / ncols)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for (rid, d), v in zip(success, swept_numeric):
+    # Y-range: union of empirical + all predicted, for honest comparison
+    all_vals: list[float] = []
+    if empirical_mean is not None:
+        all_vals.extend(float(v) for v in empirical_mean)
+    for _, d in success:
+        all_vals.extend(d["lambda_spectrum"])
+    ymin = math.floor(min(all_vals) - 1)
+    ymax = math.ceil(max(all_vals) + 1)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.0 * ncols, 3.0 * nrows),
+                              sharex=True, sharey=True, squeeze=False)
+    for ax_i, (rid, d) in enumerate(success):
+        ax = axes[ax_i // ncols][ax_i % ncols]
         spec = np.asarray(d["lambda_spectrum"])
-        if use_numeric and v is not None and v > 0:
-            color = cmap(norm(v))
-        else:
-            color = "C0"
-        ax.plot(spec, "o-", color=color, lw=1.0, ms=3, alpha=0.85)
-    ax.axhline(0, color="k", ls="--", lw=0.6, alpha=0.5)
-    ax.set_xlabel("index (sorted desc)")
-    ax.set_ylabel(r"$\lambda_i$")
-    ax.set_title(
-        f"Lyapunov spectra from {args.sidecar} ({len(success)} runs)\n"
-        f"group: {args.group}"
+        x = np.arange(len(spec))
+        if empirical_mean is not None:
+            ax.plot(np.arange(len(empirical_mean)), empirical_mean,
+                    "k-", lw=1.0, label="empirical")
+        ax.plot(x, spec, "o-", color="C0", lw=1.0, ms=3, label="pred")
+        ax.axhline(0, color="k", ls=":", lw=0.5, alpha=0.5)
+        ax.set_ylim(ymin, ymax)
+
+        title_bits = [f"idx={d['run_idx']}" if d['run_idx'] is not None else f"idx=?"]
+        title_bits.append(rid)
+        for k, v in d["swept_values"].items():
+            title_bits.append(f"{k.split('.')[-1]}={_fmt_param_value(v)}")
+        line1 = "  ".join(title_bits)
+        line2 = (f"traj_loss={d['traj_loss']:.4f}"
+                 if d['traj_loss'] is not None else "traj_loss=?")
+        ax.set_title(f"{line1}\n{line2}", fontsize=8)
+        ax.grid(True, alpha=0.25)
+        if ax_i == 0:
+            ax.legend(fontsize=7, loc="upper right")
+
+    # Hide trailing empty axes
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    fig.suptitle(
+        f"Lyapunov spectra from {args.sidecar}  ·  {n} runs  ·  group: {args.group}",
+        y=1.0,
     )
-    ax.grid(True, alpha=0.3)
-    if use_numeric:
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-        cbar = fig.colorbar(sm, ax=ax)
-        cbar.set_label(args.swept_key.split(".")[-1])
     fig.tight_layout()
 
-    fig_path = output_dir / f"{args.group}_es2_lyapunov.png"
+    fig_path = output_dir / f"{args.group}_es2_lyapunov_per_run.png"
     fig.savefig(fig_path, dpi=130, bbox_inches="tight")
     logger.info(f"Saved figure → {fig_path}")
 
@@ -217,7 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     json_path.write_text(json.dumps({
         "sidecar": args.sidecar,
         "group": args.group,
-        "swept_key": args.swept_key,
+        "swept_keys": swept_keys,
+        "empirical_lyapunov": (empirical_mean.tolist()
+                               if empirical_mean is not None else None),
         "per_run": per_run,
     }, indent=2))
     logger.info(f"Saved data → {json_path}")
