@@ -29,6 +29,13 @@
     "source=${localEnv:HOME}/.config/claude-sandbox/gh-pat,target=/run/secrets/gh-pat,type=bind,readonly",
     "source=${localEnv:HOME}/.config/claude-sandbox/wandb-api-key,target=/run/secrets/wandb-api-key,type=bind,readonly",
     "source=${localEnv:HOME}/mnt/engaging-weights,target=${localEnv:ENGAGING_MOUNT_PATH},type=bind,readonly",
+    // ControlJacobians (sibling of JacobianODE on engaging) — needed for
+    // wmtask training, which loads pretrained BiologicalRNN models from
+    // ${ENGAGING_PARENT}/ControlJacobians/WMTaskModels/. Mounted as a
+    // separate sshfs unit (engaging-controljacobians.service) so the
+    // JacobianODE mount stays narrow and unrelated subdirs (miniforge3,
+    // AnesthesiaDSA, etc.) remain invisible to the sandbox.
+    "source=${localEnv:HOME}/mnt/engaging-controljacobians,target=/orcd/data/ekmiller/001/eisenaj/ControlJacobians,type=bind,readonly",
     "source=claude-sandbox-uv-cache,target=/home/claude/.cache/uv,type=volume",
     "source=claude-sandbox-claude,target=/home/claude/.claude,type=volume"
   ],
