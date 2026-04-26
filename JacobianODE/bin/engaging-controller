@@ -461,14 +461,47 @@ def process_pending_instructions(dry_run: bool) -> int:
                 "JacobianODE.jacobians.tuning.analyze_sweep",
                 "--backfill", group,
             ]
+            # Capture combined stdout+stderr to a per-attempt log inside the
+            # analysis dir so failures are visible from the repo (the controller's
+            # own stdout only lives in cron logs we usually can't reach). The log
+            # file is overwritten by _publish_analysis copytree, so it lands in
+            # the repo whether the subprocess succeeded or failed.
+            analysis_dir = SWEEPS_DIR / "analysis" / group
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            ts_safe = utc_iso().replace(":", "").replace("-", "")
+            backfill_log = analysis_dir / f"backfill_{ts_safe}.log"
+            backfill_outcome = "ok"
             try:
-                run(backfill_cmd, cwd=JACODE_REPO, check=True, capture=False)
-                # Copy updated analysis into repo
-                analysis_dir = SWEEPS_DIR / "analysis" / group
-                if analysis_dir.exists():
+                with backfill_log.open("w") as logf:
+                    logf.write(f"# backfill cmd: {' '.join(backfill_cmd)}\n")
+                    logf.write(f"# cwd: {JACODE_REPO}\n")
+                    logf.write(f"# started: {utc_iso()}\n\n")
+                    logf.flush()
+                    subprocess.run(
+                        backfill_cmd, cwd=str(JACODE_REPO), check=True,
+                        stdout=logf, stderr=subprocess.STDOUT, text=True,
+                    )
+            except subprocess.CalledProcessError as e:
+                backfill_outcome = f"FAILED (exit {e.returncode})"
+                with backfill_log.open("a") as logf:
+                    logf.write(f"\n# exited: {utc_iso()} — {backfill_outcome}\n")
+                log(f"[{f.name}] backfill {backfill_outcome}; see {backfill_log.name}")
+            except Exception as e:
+                backfill_outcome = f"FAILED ({type(e).__name__})"
+                with backfill_log.open("a") as logf:
+                    logf.write(
+                        f"\n# controller-side exception: {type(e).__name__}: {e}\n"
+                    )
+                log(f"[{f.name}] backfill FAILED: {e}")
+            else:
+                with backfill_log.open("a") as logf:
+                    logf.write(f"\n# exited: {utc_iso()} — ok\n")
+            # Always publish so the log file lands in the repo, even on failure.
+            try:
+                if (analysis_dir / "metrics.json").exists():
                     _publish_analysis(group)
             except Exception as e:
-                log(f"[{f.name}] backfill FAILED: {e}")
+                log(f"[{f.name}] publish after backfill failed: {e}")
             claimed_dir.mkdir(parents=True, exist_ok=True)
             target = claimed_dir / f.name
             shutil.move(str(f), str(target))
