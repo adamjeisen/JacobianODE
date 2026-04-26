@@ -543,7 +543,12 @@ def get_all_checkpoints(
     checkpoint_dir = os.path.join(save_dir, run.project, run.id, "checkpoints")
     checkpoint_files = os.listdir(checkpoint_dir)
 
-    # Sort by epoch number
+    # Sort by epoch number — restrict to filenames matching the `epoch=N-...`
+    # pattern so dual-checkpoint extras (best.ckpt, last.ckpt, es2-best.ckpt,
+    # etc.) don't break the sort key. Downstream callers in this module only
+    # consult `epoch=*` files, so dropping the extras here is semantically a
+    # no-op.
+    checkpoint_files = [f for f in checkpoint_files if f.startswith("epoch=")]
     checkpoint_files = sorted(
         checkpoint_files, key=lambda x: int(x.split("=")[1].split("-")[0])
     )
