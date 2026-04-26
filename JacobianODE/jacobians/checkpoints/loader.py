@@ -564,6 +564,7 @@ def load_checkpoint(
     epoch: Optional[int] = None,
     loss_key: str = "mean_val_loss",
     verbose: bool = False,
+    checkpoint_filename: Optional[str] = None,
 ) -> None:
     """Load a specific checkpoint for a model.
 
@@ -586,6 +587,25 @@ def load_checkpoint(
         logger.info(f"Loading checkpoint from {save_dir}")
 
     checkpoint_files, checkpoint_dir = get_all_checkpoints(run, cfg, save_dir)
+
+    # Direct filename override — bypasses the epoch/best-by-val-loss logic
+    # below. Used for sidecar checkpoints that don't follow the epoch=N pattern
+    # (e.g. ShadowPercentEarlyStoppingCheckpoint's `es2-best.ckpt`).
+    if checkpoint_filename is not None:
+        checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                f"Requested checkpoint {checkpoint_filename!r} not found in "
+                f"{checkpoint_dir}. Available: {os.listdir(checkpoint_dir)}"
+            )
+        if verbose:
+            logger.info(f"Loading explicit checkpoint {checkpoint_filename}")
+            print(f"Loading checkpoint {checkpoint_filename}...", flush=True)
+        checkpoint_data = torch.load(
+            checkpoint_path, weights_only=False, map_location="cpu", mmap=True,
+        )
+        lit_model.load_state_dict(checkpoint_data["state_dict"])
+        return
 
     if verbose:
         epochs = [int(f.split("=")[1].split("-")[0]) for f in checkpoint_files]
