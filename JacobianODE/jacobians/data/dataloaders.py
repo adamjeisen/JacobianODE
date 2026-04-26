@@ -20,8 +20,14 @@ def create_dataloaders(
     cfg: DictConfig,
     values: Union[np.ndarray, torch.Tensor, "TimeSeriesData"],
     verbose: bool = False,
-    num_workers: int = 2,
-    persistent_workers: bool = True,
+    # Default num_workers=0: TimeSeriesDataset is a thin wrapper over an
+    # already-in-memory torch tensor (see splitting.TimeSeriesDataset.__getitem__);
+    # spawning worker processes adds fork + IPC overhead with no payoff. The
+    # parameter remains tunable for cases where data is on disk.
+    num_workers: int = 0,
+    # persistent_workers must be False when num_workers=0 (Lightning warns
+    # otherwise). Caller can opt in by setting num_workers > 0 here.
+    persistent_workers: bool = False,
     pin_memory: bool = True,
     return_full_obs: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:

@@ -55,6 +55,38 @@ only if delta is meaningfully larger than that.
 
 ## Attempt log
 
+### Attempt 5: DataLoader `num_workers=0` default — KEPT (lorenz −0.4%, wmtask −0.2% marginal)
+
+**Hypothesis**: `TimeSeriesDataset.__getitem__` is `return self.sequence[index]`
+on an already-in-memory `torch.Tensor`. With `num_workers=2` (current default
+in `dataloaders.py`), each batch fetch forks a worker, copies the slice
+across IPC, and unpickles — pure overhead for an in-memory dataset. Setting
+`num_workers=0` runs the trivial `__getitem__` inline on the main process.
+
+**Change**: `JacobianODE/jacobians/data/dataloaders.py` — change the
+default of `num_workers` from `2` to `0`, and `persistent_workers` from
+`True` to `False` (Lightning would otherwise warn about the
+inconsistent combination). Caller signature unchanged so any code that
+passes `num_workers=N` explicitly is unaffected.
+
+**Measurement (seed=42, against pre-change baselines)**:
+
+| Config | Per-step (s) | Cumulative Δ% | max \|Δloss\| | allclose@1e-4 |
+|---|---|---|---|---|
+| lorenz (max_steps=80) | 1.0359 ± 0.045 | −0.38% | 0.000e+00 | ✓ |
+| wmtask (max_steps=25) | 0.9532 ± 0.027 | −1.43% | 2.98e-08 | ✓ |
+
+(The wmtask 3e-8 noise is the carried-through fused-AdamW residual; this
+attempt itself is bit-exact since the shuffle sampler is seeded on the
+main process and the order doesn't depend on `num_workers`.)
+
+The marginal effect of *just this attempt* (vs A4 cumulative) is
+roughly −0.3% lorenz, −0.2% wmtask — at the noise floor. But it's
+strictly cleaner code (matches the dataset's actual on-disk-or-memory
+character) and bit-exact, so the change is essentially free.
+
+**Decision**: KEEP. Trace files: `runs/A5-dl-workers0-{lorenz,wmtask}.json`.
+
 ### Attempt 4: Eliminate `.cpu()` syncs in JacobianODEint hot loop — KEPT (wmtask −1.2%, lorenz noise)
 
 **Hypothesis**: `JacobianODEint.generate_dynamics` had two `.cpu().numpy()`
