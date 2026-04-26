@@ -55,6 +55,12 @@
   },
 
   "remoteUser": "claude",
+  // Pin the workspace bind-mount target so it doesn't depend on the host
+  // folder's basename. Lets us launch from either ~/Documents/code/JacobianODE
+  // (main checkout, latent-JacobianODE) or ~/Documents/code/JacobianODE-perf
+  // (sandbox-only clone, perf-experiment-claude) — both land at the same
+  // /workspaces/JacobianODE inside the container.
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/JacobianODE,type=bind",
   "workspaceFolder": "/workspaces/JacobianODE",
 
   "postCreateCommand": "bash .devcontainer/post-create.sh",
