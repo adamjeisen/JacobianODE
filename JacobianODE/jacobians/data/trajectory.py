@@ -240,12 +240,22 @@ def make_dysts_trajectories(
     lockfile = filename + ".lock"
 
     # Use file-based locking so only one job generates data; others wait.
-    jlog.info("[host=%s] acquiring lock %s", host, lockfile)
-    lock_fd = open(lockfile, "w")
-    try:
+    # On a read-only filesystem (e.g. the sandbox's sshfs mount of engaging),
+    # we can't open the lockfile for writing — but the race the lock guards
+    # against (two jobs generating cache simultaneously) can't happen there
+    # either, since nobody can write. Skip the lock and fall through to the
+    # cache-read path; if cache is missing on a ro fs, the write below would
+    # fail anyway with a clear errno.
+    lock_fd = None
+    if os.access(data_save_dir, os.W_OK):
+        jlog.info("[host=%s] acquiring lock %s", host, lockfile)
+        lock_fd = open(lockfile, "w")
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         jlog.info("[host=%s] lock acquired", host)
+    else:
+        jlog.info("[host=%s] data dir %s is read-only, skipping lock", host, data_save_dir)
 
+    try:
         cache_exists = os.path.exists(filename)
         jlog.info("[host=%s] cache path=%s, exists=%s", host, filename, cache_exists)
 
@@ -280,7 +290,8 @@ def make_dysts_trajectories(
                     os.unlink(tmp_path)
                     raise
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
+        if lock_fd is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
 
     return eq, sol, dt
