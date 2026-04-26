@@ -66,11 +66,16 @@ def loss_false(
         idx = torch.randperm(len(code_batch), device=code_batch.device)[:n_samples]
         code_batch = code_batch[idx]
 
-    # Optional PCA projection for rotation invariance
+    # Optional PCA-whitening: rotate to PC basis, then rescale each PC to unit
+    # variance. Whitening matters because Kennel's FNN test (rtol on distance
+    # ratios, atol vs characteristic scale) assumes equal-scale coords — a raw
+    # PCA rotation keeps large variance differences across PCs, which biases
+    # the test toward under-reporting dimension on low-D data.
     if use_pca:
         z_centered = code_batch - code_batch.mean(dim=0, keepdim=True)
         _, _, Vh = torch.linalg.svd(z_centered, full_matrices=False)
         code_batch = z_centered @ Vh.T
+        code_batch = code_batch / code_batch.std(dim=0, keepdim=True).clamp(min=1e-12)
 
     n_batch, n_latent = code_batch.shape
     device = code_batch.device
