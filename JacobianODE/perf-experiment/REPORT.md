@@ -55,6 +55,91 @@ only if delta is meaningfully larger than that.
 
 ## Attempt log
 
+### Attempt 4: Eliminate `.cpu()` syncs in JacobianODEint hot loop — KEPT (wmtask −1.2%, lorenz noise)
+
+**Hypothesis**: `JacobianODEint.generate_dynamics` had two `.cpu().numpy()`
+syncs in the per-trajectory rollout — one outside the loop computing
+`n_steps`, one inside the inner integration loop computing the
+teacher-forcing time index. Both convert tensor → Python int via a CUDA
+sync. Both indices are determined entirely by Python-side ints + floats
+(shapes + `self.dt` + `steps_per_dt`) so the syncs are pure overhead.
+
+**Change** (`JacobianODE/jacobians/jacobianODE.py`, two narrow edits):
+- Line ~531: `n_steps = int(np.round(t_sim.cpu().numpy()/dt_sim))`
+  → `int(np.round((traj.shape[-2] - traj_init.shape[-2]) * self.dt / dt_sim))`
+- Line ~561: `int(np.round((t + dt_sim).cpu().numpy()/self.dt))`
+  → `(traj_init.shape[-2] - 1) + step_counter // steps_per_dt`
+  (this branch only fires when `step_counter % steps_per_dt == 0`, so the
+  index is exact — no rounding ambiguity).
+
+**Measurement (seed=42)**:
+
+| Config | Run | Per-step (s) | Δ% vs baseline | max \|Δloss\| | allclose@1e-4 |
+|---|---|---|---|---|---|
+| lorenz (max_steps=80) | r1 | 1.0388 ± 0.052 | −0.11% | 0.000e+00 | ✓ |
+| lorenz (max_steps=80) | r2 | 1.0386 ± 0.050 | −0.13% | 0.000e+00 | ✓ |
+| wmtask (max_steps=25) | r1 | 0.9552 ± 0.027 | **−1.22%** | 2.98e-08 | ✓ |
+| wmtask (max_steps=25) | r2 | 0.9550 ± 0.028 | **−1.24%** | 2.98e-08 | ✓ |
+
+Loss is bit-exact on lorenz; wmtask shows only the 3e-8 noise from the
+already-kept fused AdamW change (this attempt by itself preserves bit
+exactness). Two runs back-to-back on each config disambiguate signal
+from run-to-run noise.
+
+**Decision**: KEEP. Real and reproducible −1.2% on wmtask (more
+JacobianODEint calls per global step due to `accumulate_grad_batches=4`
+× per-area direct-sum branches), neutral on lorenz (already
+GPU-bound — CPU dispatch wasn't the lorenz bottleneck). Trace files:
+`runs/A4-nosync-jacode-{lorenz,wmtask}.json`.
+
+### Attempt 3: Replace `if torch.isnan(loss)` with `nan_to_num` — REJECTED (no improvement)
+
+**Hypothesis**: `if torch.isnan(loss):` (lightning_base.py:678,681) forces a
+CPU↔GPU sync every step (and twice per pred_type, so up to 4× per step
+when both trajectory and loop_closure losses are active). Replacing with
+`torch.nan_to_num(loss, nan=0.0)` keeps the same NaN-protection
+semantics — NaN → 0 contribution to `total_loss` — without the sync.
+
+**Change**: replaced two `if torch.isnan` lines in
+`JacobianODE/jacobians/lightning_base.py:training_step` with one
+`torch.nan_to_num` call.
+
+**Measurement (lorenz, max_steps=80, seed=42)**:
+- max \|Δloss\| = **0** (bit-exact, as expected — no NaN at any step)
+- per-step: **1.043 s ± 0.051** vs baseline **1.040 s ± 0.052** → **+0.3%** (noise)
+
+**Decision**: REVERT. Loss is bit-exact so the change is safe, but the
+sync wasn't on the critical path (probably because Lightning's backward +
+optimizer.step already includes a sync soon after, so any latency we
+hide here just gets absorbed by the next sync). No improvement → revert
+per the task rules. The bigger CPU overhead is still kernel-launch
+volume (~18 k/step), and only torch.compile / cudagraphs would attack
+that — both blocked on this hardware (Attempt 2).
+
+### Attempt 2: torch.compile — BLOCKED on hardware (sandbox GPU)
+
+**Hypothesis**: 18 k kernel launches per training step (`cudaLaunchKernel`
+~1.14 s of 9.7 s CPU total, profiler trace) dominate CPU overhead. Wrapping
+the inner `model` (Jacobian MLP) and `encoder` with `torch.compile` should
+fuse small element-wise + linear ops into many fewer big kernels.
+
+**Outcome**: hard-blocked by GPU compute capability. The sandbox runs on a
+**GTX 1050 Ti (CC 6.1, Pascal)**; Inductor's Triton backend requires
+**CC ≥ 7.0** and refuses with `GPUTooOldForTriton`. Tried fallbacks:
+- `backend="cudagraphs"`: graph captures fail because the JacobianODEint
+  inner loop produces calls with **varying tensor shapes** (`size of tensor
+  a (20) must match (22)`); CUDA-graph capture requires fixed shapes.
+- `backend="aot_eager"`: graph capture only, no kernel codegen — known to
+  give no speedup, skipped.
+- `backend="eager"`: identity wrapper, skipped.
+
+**Decision**: SKIPPED for this hardware. On a Volta+ GPU
+(`uv run --no-sync ...` on engaging) the same code change should give a
+meaningful win — roughly the per-step `cudaLaunchKernel` total (~230 ms
+in our trace, ~22 % of step time) is the headline target. The probe
+script `run_with_compile.py` is left in tree so this can be re-run
+trivially elsewhere.
+
 ### Attempt 1: Fused AdamW — KEPT (lorenz −0.5%, wmtask −1.0%, marginal)
 
 **Hypothesis**: passing `fused=True` to `torch.optim.AdamW` collapses the

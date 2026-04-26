@@ -527,8 +527,12 @@ class JacobianODEint:
 
         # set up simulation parameters
         dt_sim = self.dt/steps_per_dt
-        t_sim = (traj.shape[-2] - 1)*self.dt - t
-        n_steps = int(np.round(t_sim.cpu().numpy()/dt_sim))
+        # t_sim and n_steps were originally derived from the GPU-resident t
+        # (= time_vals[-1]) via .cpu().numpy(), forcing a CUDA sync every
+        # training_step. Both t_sim and n_steps are determined entirely by
+        # Python-side ints/floats (shapes + self.dt + steps_per_dt), so we
+        # compute them on the CPU directly. Behaviour is unchanged.
+        n_steps = int(np.round((traj.shape[-2] - traj_init.shape[-2]) * self.dt / dt_sim))
         x_out = traj_init
 
         step_counter = 0
@@ -558,7 +562,12 @@ class JacobianODEint:
             if step_counter % steps_per_dt == 0:
                 x_out = torch.cat((x_out, x_t_new.unsqueeze(-2)), dim=-2)
                 if alpha_teacher_forcing > 0 and step_counter/steps_per_dt % teacher_forcing_steps == 0:
-                    x_t_new = (1 - alpha_teacher_forcing)*x_t_new + alpha_teacher_forcing*traj[..., int(np.round((t + dt_sim).cpu().numpy()/self.dt)), :]
+                    # Python-side index (= round((t+dt_sim)/self.dt)) avoids a
+                    # per-iteration CUDA sync on .cpu(). Inside this gate
+                    # step_counter is a multiple of steps_per_dt, so the
+                    # index is exact (no rounding ambiguity).
+                    _tf_idx = (traj_init.shape[-2] - 1) + step_counter // steps_per_dt
+                    x_t_new = (1 - alpha_teacher_forcing)*x_t_new + alpha_teacher_forcing*traj[..., _tf_idx, :]
                     # WARNING: will not work for steps_per_dt > 1
             # we only need to update the spline if we're not using fast mode or if the inner path is a spline
             if not fast_mode or inner_path == "spline":
