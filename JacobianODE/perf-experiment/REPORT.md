@@ -55,7 +55,46 @@ only if delta is meaningfully larger than that.
 
 ## Attempt log
 
-_To be populated as attempts run._
+### Attempt 1: Fused AdamW — KEPT (lorenz −0.5%, wmtask −1.0%, marginal)
+
+**Hypothesis**: passing `fused=True` to `torch.optim.AdamW` collapses the
+per-parameter `_foreach_*` kernel launches into one fused launch, which
+should help when there are many small parameter groups (coupling encoder
+heads, per-area branches in the wmtask config).
+
+**Change**: `JacobianODE/jacobians/lightning_base.py` `configure_optimizers`
+sets `fused=True` for AdamW when CUDA is available (and only if the user
+hasn't already set it). All other optimizers untouched.
+
+**Measurement (max_steps=25, seed=42)**:
+
+| Config | Baseline (s/step) | Candidate (s/step) | Δ% | max \|Δloss\| | allclose@1e-4 |
+|---|---|---|---|---|---|
+| lorenz | 1.063 ± 0.104 | 1.057 ± 0.085 | **−0.53%** | 0.000e+00 | ✓ |
+| wmtask | 0.967 ± 0.030 | 0.957 ± 0.029 | **−0.99%** | 2.980e-08 | ✓ |
+
+Lorenz is bit-exact; wmtask shows ~3e-8 max divergence, well within the
+1e-4 gate (and consistent with float32 op-order differences from the
+fused kernel's reduction).
+
+**Decision**: KEEP. Improvement is at the run-to-run noise floor (~1%) so
+it's marginal, but the delta is in the right direction on both configs
+and the regression test passes cleanly. Cost is tiny (a single kwarg).
+
+Trace files: `runs/A1-fused-adamw-{lorenz,wmtask}.json`.
+
+### Attempt 0: cudnn.benchmark — SKIPPED (not applicable)
+
+**Hypothesis**: setting `torch.backends.cudnn.benchmark=True` selects faster
+cuDNN convolution algorithms once input shapes are stable.
+
+**Decision**: skipped without measuring. Both target configs are pure MLP /
+matmul stacks (`grep -rn Conv` returns no nn.Conv usage in the project's
+training code path; `latent_additive_coupling` is a coupling-block
+encoder with linear layers and the deriv head is also MLP-based). Linear
+layers route through cuBLAS, not cuDNN, so cudnn.benchmark has nothing
+to optimize and would add a tiny startup cost for the first benchmark
+sweep with no payoff. Documented and moving on.
 
 ## Summary
 

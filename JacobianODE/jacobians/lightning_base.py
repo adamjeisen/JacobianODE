@@ -977,7 +977,14 @@ class LitBase(L.LightningModule):
         elif self.optimizer == 'RAdam':
             optimizer = torch.optim.RAdam(self.parameters(), **self.optimizer_kwargs)
         elif self.optimizer == 'AdamW':
-            optimizer = torch.optim.AdamW(self.parameters(), **self.optimizer_kwargs)
+            # Use fused=True when CUDA is available — fused AdamW launches a
+            # single kernel for all params instead of one kernel per param,
+            # which is a measurable win when there are many small parameter
+            # groups (typical for coupling encoders / per-area heads).
+            adamw_kwargs = dict(self.optimizer_kwargs)
+            if torch.cuda.is_available() and "fused" not in adamw_kwargs:
+                adamw_kwargs["fused"] = True
+            optimizer = torch.optim.AdamW(self.parameters(), **adamw_kwargs)
         elif self.optimizer == 'LBFGS':
             optimizer = torch.optim.LBFGS(self.parameters(), **self.optimizer_kwargs)
         else:
