@@ -77,8 +77,8 @@ def _measure_grad_on_J(lit_model, batch, alpha):
     captured: list = []
     orig = lit_model.compute_jacobians
 
-    def patched(b, **kw):
-        j = orig(b, **kw)
+    def patched(*a, **kw):
+        j = orig(*a, **kw)
         captured.append(j)
         return j
 
