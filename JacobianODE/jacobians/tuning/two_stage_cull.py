@@ -258,6 +258,57 @@ def _resolve_project(api, group: str, project: str | None) -> str | None:
     return None
 
 
+def _write_and_push_instruction(
+    experiment: str,
+    overrides: list[str],
+    run_id: str,
+    migrate_to: dict | None = None,
+    repo_dir: Path | None = None,
+) -> None:
+    """Write a sweep instruction file directly to jacobian-reports/instructions/pending
+    and push. Mirrors what ~/bin/j-submit does, but lets us include
+    arbitrary block-level fields like ``migrate_to:`` that the bash
+    script doesn't support.
+
+    Used by the two_stage cull tool when Stage A had ``migrate_to:`` so
+    Stage B inherits it.
+    """
+    import datetime
+    repo = repo_dir or (Path.home() / "Documents" / "jacobian-analyses"
+                         if (Path.home() / "Documents" / "jacobian-analyses").is_dir()
+                         else Path.home() / "code" / "jacobian-reports")
+    pending = repo / "instructions" / "pending"
+    pending.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    fname = f"{ts}-{experiment}-stage-b-{run_id}.yaml"
+    target = pending / fname
+
+    lines = [f"experiment: {experiment}", "overrides:"]
+    for ov in overrides:
+        # Quote each override to preserve = and special chars.
+        lines.append(f'  - "{ov}"')
+    if migrate_to is not None:
+        lines.append("migrate_to:")
+        for k, v in migrate_to.items():
+            lines.append(f"  {k}: {json.dumps(v)}")
+    import socket
+    lines.append(f"submitted_at: {ts}")
+    lines.append(f"submitted_from: {socket.gethostname()}")
+    target.write_text("\n".join(lines) + "\n")
+
+    # git pull --rebase, add, commit, push
+    subprocess.run(["git", "pull", "--rebase", "--autostash"],
+                   cwd=repo, check=False, capture_output=True)
+    subprocess.run(["git", "add", str(target)], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", f"submit (stage-b): {experiment} run={run_id}"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    subprocess.run(["git", "push"], cwd=repo, check=True, capture_output=True)
+    logger.info(f"  wrote + pushed {fname}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--group", required=True,
@@ -285,7 +336,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--audit-out", default=None,
                         help="path to write survivors.json (default: "
                              "/tmp/two_stage_survivors_<group>.json)")
+    parser.add_argument("--migrate-to-json", default=None,
+                        help="JSON-encoded migrate_to block to inherit into "
+                             "Stage B's instruction YAML (e.g. "
+                             "'{\"partition\": \"mit_normal_gpu\"}'). When "
+                             "set, bypasses j-submit and writes the "
+                             "instruction file directly so the block is "
+                             "included.")
     args = parser.parse_args(argv)
+
+    migrate_to_block = None
+    if args.migrate_to_json:
+        try:
+            migrate_to_block = json.loads(args.migrate_to_json)
+        except json.JSONDecodeError as e:
+            logger.error(f"invalid --migrate-to-json: {e}")
+            return 1
+        if not isinstance(migrate_to_block, dict):
+            logger.error(f"--migrate-to-json must decode to a dict, got "
+                         f"{type(migrate_to_block).__name__}")
+            return 1
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
@@ -370,16 +440,31 @@ def main(argv: list[str] | None = None) -> int:
                      "cannot j-submit. Aborting.")
         return 1
     logger.info(f"  dispatching {len(survivors_meta)} stage-B run(s) "
-                f"under experiment={experiment}")
-    j_submit = Path.home() / "bin" / "j-submit"
-    for s in survivors_meta:
-        cmd = [str(j_submit), experiment] + s["overrides"]
-        logger.info(f"  $ {' '.join(cmd)}")
-        try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError as e:
-            logger.error(f"j-submit failed for {s['run_id']}: {e}")
-            return 1
+                f"under experiment={experiment}"
+                + (f" with migrate_to={migrate_to_block}" if migrate_to_block else ""))
+    if migrate_to_block:
+        # Bypass j-submit so we can include the migrate_to: block in the
+        # instruction YAML. j-submit's bash script doesn't support
+        # arbitrary block-level fields.
+        for s in survivors_meta:
+            try:
+                _write_and_push_instruction(
+                    experiment, s["overrides"], s["run_id"],
+                    migrate_to=migrate_to_block,
+                )
+            except subprocess.CalledProcessError as e:
+                logger.error(f"instruction write/push failed for {s['run_id']}: {e}")
+                return 1
+    else:
+        j_submit = Path.home() / "bin" / "j-submit"
+        for s in survivors_meta:
+            cmd = [str(j_submit), experiment] + s["overrides"]
+            logger.info(f"  $ {' '.join(cmd)}")
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"j-submit failed for {s['run_id']}: {e}")
+                return 1
 
     # Idempotency sentinel for engaging-controller auto-dispatch
     marker = stage_b_dispatched_marker(args.group)

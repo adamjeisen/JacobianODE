@@ -1,0 +1,24 @@
+# @package _global_
+#
+# MIT-AMF GPU partition. The mit_amf_advanced_gpu QOS gives us up to 4
+# concurrent GPUs on this partition (NOT 4 reserved — it's a concurrency
+# entitlement on a shared pool). Pinned to H200 because pickup time is
+# usually 1–2 min and the ~2–3x speedup vs L40S amortizes to nothing on
+# multi-hour training jobs. Drop the gres line / switch to gpu:l40s:1 if
+# you want faster pickup at the cost of throughput.
+#
+# Use via:  j-submit <experiment> slurm=mit_normal_gpu
+defaults:
+  - override /hydra/launcher: submitit_slurm
+
+hydra:
+  launcher:
+    cpus_per_task: 4
+    nodes: 1
+    mem_gb: 16
+    timeout_min: 180
+    tasks_per_node: 1
+    partition: mit_normal_gpu
+    account: mit_amf_advanced_gpu
+    qos: mit_amf_advanced_gpu
+    gres: "gpu:h200:1"

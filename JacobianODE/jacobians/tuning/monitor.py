@@ -438,56 +438,25 @@ def classify_run_idx(
 def resubmit_run(expected: dict, run_idx: int, sweeps_dir: Path) -> str:
     """Submit a retry for ``run_idx`` via direct sbatch. Returns the new job
     ID, or empty string on failure.
+
+    Thin wrapper around ``cell_submit.submit_cell``: reads the partition
+    spec from the sweep's ``expected.slurm`` block (preserved on initial
+    submission OR updated by migration to the migrated partition), then
+    delegates the sbatch construction. Migrated cells therefore retry on
+    mit_normal_gpu rather than falling back to ou_bcs_normal.
     """
-    resolved = next(
-        r for r in expected["hydra"]["resolved_runs"] if r["run_idx"] == run_idx
-    )
-    experiment = resolved["experiment"]
-    overrides = resolved["overrides"]
-    repo_dir = expected["git"]["repo_dir"]
-    slurm = expected["slurm"]
+    from .cell_submit import spec_from_expected_slurm, submit_cell
     group = expected["wandb"]["group"]
-
-    # Single-run (not --multirun) invocation — runs directly on the allocated node.
-    run_cmd_parts = [
-        "cd", repo_dir, "&&", "OPENBLAS_NUM_THREADS=4",
-        "/home/eisenaj/.local/bin/uv", "run", "--no-sync",
-        "python", "-m", "JacobianODE.jacobians.run_jacobians",
-        f"experiment={experiment}",
-    ] + list(overrides)
-    wrap_cmd = " ".join(run_cmd_parts)
-
-    gres_num = "1"
-    if isinstance(slurm.get("gres"), str) and ":" in slurm["gres"]:
-        gres_num = slurm["gres"].split(":")[-1]
-
-    log_dir = sweeps_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    sbatch_args = [
-        "sbatch",
-        "--parsable",
-        f"--partition={slurm.get('partition', 'ou_bcs_normal')}",
-        f"--gpus-per-node={gres_num}",
-        f"--cpus-per-task={slurm.get('cpus_per_task', 4)}",
-        f"--mem={slurm.get('mem', '16GB')}",
-        f"--time={slurm.get('timeout_min', 180)}",
-        f"--job-name=jacobian_retry",
-        f"--output={log_dir}/retry_{group}_%j.out",
-        f"--error={log_dir}/retry_{group}_%j.err",
-        "--wrap", wrap_cmd,
-    ]
-
+    partition = spec_from_expected_slurm(expected.get("slurm") or {})
     try:
-        result = subprocess.run(
-            sbatch_args, check=True, capture_output=True, text=True,
+        return submit_cell(
+            expected, run_idx, partition, sweeps_dir,
+            job_name_prefix="jacobian_retry",
         )
-        jid = result.stdout.strip()
-        logger.info(f"Resubmitted {group}/run_idx={run_idx} -> SLURM job {jid}")
-        return jid
     except subprocess.CalledProcessError as e:
         logger.error(
-            f"sbatch failed for {group}/run_idx={run_idx}: {e.stderr.strip()}"
+            f"sbatch failed for {group}/run_idx={run_idx}: "
+            f"{(e.stderr or '').strip()}"
         )
         return ""
 

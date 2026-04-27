@@ -1,0 +1,89 @@
+# @package _global_
+#
+# Monolithic CouplingEncoder companion to the DirectSum dual-ckpt sweep.
+# Same 21-cell grid (7 LC × 3 obs_noise_scale), same dual checkpoint,
+# but with the standard monolithic additive coupling encoder +
+# final_perm_identity=true. Apples-to-apples vs the DirectSum
+# random-init dualckpt sweep.
+
+defaults:
+  - override /data: wmtask
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    WMTask fully-observed (N1=N2=64), latent JacobianODE with monolithic
+    additive coupling encoder, 128->128, final_perm_identity=true. 21-run
+    sweep over 7 LC × 3 obs_noise_scale. Split-mode loss. Dual checkpoint:
+    primary ES at patience=5, shadow-freeze at patience=2.
+  hypothesis: |
+    Monolithic additive at this prediction horizon (p=30) shows the same
+    negative-Lyapunov suppression as DirectSum when trained for many epochs
+    (replication_v2 result). This sweep tests whether suppression is driven
+    by LC weight, obs_noise_scale, or develops uniformly across the
+    (LC, obs_noise) grid. Dual-ckpt isolates "ES patience caused it" from
+    a true late-training drift.
+  success_criteria:
+    - "All 21 cells train without divergence"
+    - "es2-best.ckpt and es5-best.ckpt both saved per cell"
+    - "Best val traj_loss (at either ckpt) within 2x of i73jwojr's 0.0105"
+    - "Lyapunov spectrum at es2-best vs es5-best directly comparable across LC × obs_noise"
+
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1"
+  training.lightning.obs_noise_scale: "0,0.01,0.05"
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "wmtask_latent_additive_mse_p30_permidentity_dualckpt__lc_x_obsnoisescale_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: false
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 1
+      delay_spacing: 1
+
+model:
+  n_target_dims: 128
+  prediction_steps: 30
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    final_perm_identity: true
+    zero_init: true
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 16
+  trainer_params:
+    max_epochs: 1000              # overridden by two-stage protocol
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 1e-5     # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.05         # overridden by sweep_grid
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5    # primary ES controls actual stop
+    shadow_patience: 2            # parallel checkpoint frozen at hypothetical patience=2 stop
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01

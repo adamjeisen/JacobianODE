@@ -33,6 +33,18 @@ import yaml
 from datetime import datetime, timezone
 from pathlib import Path
 
+from JacobianODE.jacobians.tuning.migration import (
+    audit_journals,
+    process_migrations,
+    count_running_mit_jobs,
+    MIT_BUDGET,
+)
+from JacobianODE.jacobians.tuning.cell_submit import (
+    OU_BCS_NORMAL,
+    MIT_NORMAL_GPU,
+    submit_cell,
+)
+
 # ---------------------------------------------------------------------------
 # Paths and constants
 # ---------------------------------------------------------------------------
@@ -200,6 +212,7 @@ def _submit_one(
     exp: str,
     overrides: list[str],
     two_stage: dict | None = None,
+    migrate_to: dict | None = None,
 ) -> dict:
     """Run prepare_sweep + jsweep for one experiment. Returns dict of metadata
     including the SLURM array id (or raises on failure).
@@ -207,7 +220,16 @@ def _submit_one(
     ``two_stage`` is the opt-in block from the instruction YAML (see the
     two-stage protocol). When present, it's persisted into ``expected.json``
     so ``_maybe_dispatch_stage_b`` can find it after analysis publishes.
+
+    ``migrate_to`` is the opt-in dynamic-allocation block. When set,
+    routes through ``_submit_one_split`` which submits the first
+    ``min(K, mit_budget)`` cells directly to mit_normal_gpu and the rest
+    to ou_bcs_normal — avoiding the initial scancel-and-resubmit overhead
+    on the first batch. The block is persisted into ``expected.json`` so
+    ``process_migrations`` finds it next cycle.
     """
+    if migrate_to and migrate_to.get("partition") == "mit_normal_gpu":
+        return _submit_one_split(exp, overrides, two_stage, migrate_to)
     branch, commit = _git_head_info()
     expected_path = STATE_DIR / "expected_tmp.json"
     expected_path.parent.mkdir(parents=True, exist_ok=True)
@@ -426,19 +448,141 @@ def _submit_one(
     # expected.json so the post-publish hook can find it. Done after both
     # the fresh-write and extend-write branches above so the patch lands
     # regardless of which path created the file.
-    if two_stage and final_expected.is_file():
+    if (two_stage or migrate_to) and final_expected.is_file():
         try:
             doc = json.loads(final_expected.read_text())
-            doc["two_stage"] = two_stage
+            if two_stage:
+                doc["two_stage"] = two_stage
+            if migrate_to:
+                doc["migrate_to"] = migrate_to
             final_expected.write_text(json.dumps(doc, indent=2) + "\n")
         except Exception as e:
-            log(f"[{exp}] WARN failed to persist two_stage block: {e}")
+            log(f"[{exp}] WARN failed to persist two_stage/migrate_to block: {e}")
 
     return {
         "wandb_group": group,
         "expected_run_count": expected_run_count,
         "slurm_array_id": array_id,
         "slurm_submitted_at": utc_iso(),
+    }
+
+
+def _submit_one_split(
+    exp: str,
+    overrides: list[str],
+    two_stage: dict | None,
+    migrate_to: dict,
+) -> dict:
+    """Migration-eligible variant of ``_submit_one``.
+
+    Resolves the sweep grid via prepare_sweep (writes expected.json with
+    ``hydra.resolved_runs``), then submits each cell as an INDIVIDUAL sbatch
+    job. The first ``min(K, mit_budget)`` cells go directly to
+    mit_normal_gpu (avoiding the initial scancel-and-resubmit round trip);
+    the rest go to ou_bcs_normal where they're candidates for opportunistic
+    migration on later cycles.
+
+    Bypasses jsweep entirely. ``slurm_arrays`` ends up keyed on bare jobids
+    (no array suffix), which monitor handles via the b120de62 alias.
+    """
+    branch, commit = _git_head_info()
+    expected_path = STATE_DIR / "expected_tmp.json"
+    expected_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. prepare_sweep: write expected.json with resolved_runs (no submission).
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "JacobianODE.jacobians.tuning.prepare_sweep",
+        "--git-branch", branch,
+        "--git-commit", commit,
+        "--git-repo-dir", str(JACODE_REPO),
+        "--launched-from", HOSTNAME,
+        "--output", str(expected_path),
+        "--", f"experiment={exp}", *overrides,
+    ]
+    run(cmd, cwd=JACODE_REPO)
+
+    expected = json.loads(expected_path.read_text())
+    group = expected["wandb"].get("group")
+    if not group:
+        raise RuntimeError("expected.json has no wandb_group")
+    resolved_runs = expected["hydra"]["resolved_runs"]
+    n_total = len(resolved_runs)
+
+    # 2. Compute initial split: first K → mit (K = current free QOS slots),
+    #    rest → ou_bcs (where they're candidates for later migration).
+    current_mit = count_running_mit_jobs()
+    budget = max(0, MIT_BUDGET - current_mit)
+    mit_count = min(budget, n_total)
+    log(f"[{exp}] split-submit: {mit_count}/{n_total} cells -> mit_normal_gpu "
+        f"(QOS budget={budget}, mit currently has {current_mit})")
+
+    # 3. Submit each cell individually. We need a working expected.json to
+    #    pass to submit_cell, so write the temp file in place first.
+    slurm_arrays: dict[str, str] = {}
+    partition_per_cell: dict[str, str] = {}
+    sbatch_failures: list[tuple[int, str]] = []
+    for i, r in enumerate(resolved_runs):
+        run_idx = r["run_idx"]
+        partition = MIT_NORMAL_GPU if i < mit_count else OU_BCS_NORMAL
+        try:
+            jid = submit_cell(
+                expected, run_idx, partition, SWEEPS_DIR,
+                job_name_prefix="jacobian",
+            )
+            slurm_arrays[str(run_idx)] = jid
+            partition_per_cell[str(run_idx)] = partition.partition
+        except subprocess.CalledProcessError as e:
+            sbatch_failures.append((run_idx, (e.stderr or str(e))[:200]))
+            log(f"[{exp}] sbatch FAILED for run_idx={run_idx} on "
+                f"{partition.partition}: {(e.stderr or '').strip()[:200]}")
+
+    if sbatch_failures and not slurm_arrays:
+        # Total wipeout — nothing submitted. Bubble up so caller fails.
+        raise RuntimeError(
+            f"all cells failed to submit ({len(sbatch_failures)} failures); "
+            f"first error: {sbatch_failures[0][1]}"
+        )
+    if sbatch_failures:
+        log(f"[{exp}] WARN: {len(sbatch_failures)} cells failed to submit; "
+            f"continuing with the {len(slurm_arrays)} that did")
+
+    # 4. Finalize expected.json.
+    SWEEPS_DIR.joinpath("active").mkdir(parents=True, exist_ok=True)
+    final_expected = SWEEPS_DIR / "active" / f"{group}.expected.json"
+    expected["slurm_arrays"] = slurm_arrays
+    expected["partition_per_cell"] = partition_per_cell
+    # Top-level slurm block: record OU_BCS_NORMAL as the "default" because
+    # most cells start there. Migrated cells will overwrite this when they
+    # migrate (so monitor retries on those use mit). Initial mit cells use
+    # the per-cell partition_per_cell map; their monitor retries will use
+    # whatever's in expected.slurm — which means they could fall back to
+    # ou_bcs on retry. ACCEPTABLE: a crashed mit cell retrying on ou_bcs is
+    # safer than retrying on mit and OOMing again.
+    expected["slurm"] = {
+        "partition": OU_BCS_NORMAL.partition,
+        "gres": OU_BCS_NORMAL.gres,
+        "cpus_per_task": OU_BCS_NORMAL.cpus_per_task,
+        "mem": OU_BCS_NORMAL.mem,
+        "timeout_min": OU_BCS_NORMAL.timeout_min,
+    }
+    if two_stage:
+        expected["two_stage"] = two_stage
+    expected["migrate_to"] = migrate_to
+
+    final_expected.write_text(json.dumps(expected, indent=2) + "\n")
+    expected_path.unlink(missing_ok=True)
+
+    return {
+        "wandb_group": group,
+        "expected_run_count": n_total,
+        "slurm_array_id": "split",  # sentinel — no single array id
+        "slurm_submitted_at": utc_iso(),
+        "split_submission": {
+            "mit_count": mit_count,
+            "ou_bcs_count": n_total - mit_count,
+            "n_failures": len(sbatch_failures),
+        },
     }
 
 
@@ -544,12 +688,19 @@ def process_pending_instructions(dry_run: bool) -> int:
             log(f"[{f.name}] WARN ignoring non-dict two_stage block: "
                 f"{type(two_stage).__name__}")
             two_stage = None
+        migrate_to = data.get("migrate_to")
+        if migrate_to is not None and not isinstance(migrate_to, dict):
+            log(f"[{f.name}] WARN ignoring non-dict migrate_to block: "
+                f"{type(migrate_to).__name__}")
+            migrate_to = None
         log(f"[{f.name}] submitting experiment={exp} overrides={overrides}"
-            + (f" two_stage={two_stage}" if two_stage else ""))
+            + (f" two_stage={two_stage}" if two_stage else "")
+            + (f" migrate_to={migrate_to}" if migrate_to else ""))
 
         try:
             meta = _submit_one(
-                exp, [str(o) for o in overrides], two_stage=two_stage,
+                exp, [str(o) for o in overrides],
+                two_stage=two_stage, migrate_to=migrate_to,
             )
         except subprocess.CalledProcessError as e:
             err = (e.stderr or e.stdout or "")[-2000:]
@@ -756,6 +907,14 @@ def _maybe_dispatch_stage_b(group: str) -> None:
         "--cull-fraction", str(spec.get("cull_fraction", 0.5)),
         "--metric", spec.get("metric", "trajectory val_loss"),
     ]
+    # Stage B inherits migrate_to from Stage A's expected.json, so the
+    # full-budget runs also use dynamic mit↔ou_bcs allocation.
+    try:
+        migrate_to = json.loads(expected_path.read_text()).get("migrate_to")
+    except Exception:
+        migrate_to = None
+    if migrate_to:
+        cmd.extend(["--migrate-to-json", json.dumps(migrate_to)])
     log(f"[two_stage {group}] auto-dispatching cull: {' '.join(cmd)}")
     try:
         run(cmd, cwd=JACODE_REPO, check=True)
@@ -1047,10 +1206,30 @@ def main() -> int:
         # in-repo move), so updating it requires the next cron tick to pull.
         git_pull_jacode()
 
+        # Audit any half-finished migrations from a prior controller crash.
+        # Must run BEFORE process_pending_instructions so a freshly-submitted
+        # sweep can't accidentally collide with an orphan from a previous one.
+        try:
+            audit_summary = audit_journals(SWEEPS_DIR)
+            if any(audit_summary.values()):
+                log(f"[migration] startup audit: {audit_summary}")
+        except Exception as e:
+            log(f"[migration] startup audit raised: {e}")
+
         n_new = process_pending_instructions(args.dry_run)
         if n_new:
             log(f"processed {n_new} instruction(s)")
         run_monitor_cycle()
+
+        # Dynamic migration step. Runs AFTER monitor so the next monitor
+        # cycle picks up the new task IDs and doesn't trigger spurious
+        # retries on the scancel'd old tasks.
+        try:
+            mig_summary = process_migrations(SWEEPS_DIR)
+            if mig_summary["migrated"] or mig_summary["attempted"]:
+                log(f"[migration] cycle: {mig_summary}")
+        except Exception as e:
+            log(f"[migration] process_migrations raised: {e}")
 
         inflight = load_inflight()
         n_disp = dispatch_pending_analyses(inflight)
