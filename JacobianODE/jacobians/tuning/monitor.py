@@ -62,6 +62,14 @@ ALIVE_SLURM_STATES = (
     "PENDING", "RUNNING", "CONFIGURING", "REQUEUED", "SUSPENDED",
 )
 
+# Hysteresis: a slot must miss this many consecutive monitor cycles
+# (squeue reporting no alive task) before it can be reclassified into the
+# failed_retrying lifecycle. squeue queries occasionally return empty
+# transiently (scheduler load, NFS hiccup); requiring N consecutive
+# misses prevents false-positive ghost retries while still catching real
+# failures within ~N · cron_interval (default 2 · 5min = 10min).
+DEFAULT_MISSING_CYCLES_THRESHOLD = 2
+
 
 def _slurm_task_id(slurm_arrays: dict, k: str) -> str | None:
     """Return the SLURM task_id for a run_idx, or None if not recorded.
@@ -559,6 +567,9 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
     slurm_arrays = expected.get("slurm_arrays") or {}
     ckpt_base = _ckpt_base(expected)
     retry_cap = expected.get("retry", {}).get("cap_per_run", 2)
+    missing_threshold = expected.get("retry", {}).get(
+        "missing_cycles_threshold", DEFAULT_MISSING_CYCLES_THRESHOLD,
+    )
 
     # STATELESS classification: recompute each run_idx's classification from
     # scratch every cycle. This replaces the previous sticky-terminal logic
@@ -574,6 +585,7 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             "last_slurm_state": None,
             "classification": "pending",
             "terminal": False,
+            "consecutive_missing_cycles": 0,
         })
 
         cls, wids, last_wb = classify_run_idx(
@@ -585,17 +597,6 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             slurm_arrays=slurm_arrays,
             slurm_timeout_min=timeout_min,
         )
-
-        # Translate "failed" into the retry lifecycle (failed_retrying vs
-        # failed_exhausted). Retry logic itself lives below and still uses
-        # state.runs[k].slurm_job_ids for monitor-initiated retries; the
-        # classification -> retry hookup is the only stateful piece that
-        # remains, and Phase 4 of the redesign will retire it.
-        if cls == "failed":
-            if len(wids) > retry_cap:
-                cls = "failed_exhausted"
-            else:
-                cls = "failed_retrying"
 
         # Track whether we've *ever* observed this slot's array task alive
         # in squeue. Guards the "pending → failed_retrying" reclass below:
@@ -609,22 +610,58 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
             if slurm_states.get(task_id) in ALIVE_SLURM_STATES:
                 entry["ever_alive"] = True
 
+        # Hysteresis on "task is missing from squeue" — a single missed
+        # squeue snapshot can be a transient (scheduler load, NFS hiccup)
+        # and should NOT immediately escalate the slot into the retry
+        # lifecycle. Increment a counter on each consecutive miss; reset
+        # to 0 the moment the task is observed alive again. Reclass to
+        # failed_retrying only after `missing_threshold` consecutive misses.
+        # This catches the false-positive ghost-retry mode where the
+        # original SLURM array task is still RUNNING but squeue briefly
+        # didn't return it.
+        if task_id is not None:
+            if slurm_states.get(task_id) in ALIVE_SLURM_STATES:
+                entry["consecutive_missing_cycles"] = 0
+            else:
+                entry["consecutive_missing_cycles"] = (
+                    entry.get("consecutive_missing_cycles", 0) + 1
+                )
+        missing_confirmed = (
+            task_id is not None
+            and entry.get("consecutive_missing_cycles", 0) >= missing_threshold
+        )
+
+        # Translate "failed" into the retry lifecycle (failed_retrying vs
+        # failed_exhausted). Gated on hysteresis: a single squeue miss is
+        # not enough to declare failure when there's no completion
+        # criterion met yet. (If task_id is None — slot was never even
+        # tracked in slurm_arrays — we have no SLURM evidence either way
+        # and fall back to the unconditional behavior.)
+        if cls == "failed":
+            if task_id is not None and not missing_confirmed:
+                # Treat as still-running for now; await more evidence.
+                cls = "running"
+            elif len(wids) > retry_cap:
+                cls = "failed_exhausted"
+            else:
+                cls = "failed_retrying"
+
         # A "pending" slot that was previously dispatched, has been seen
         # alive in at least one prior cycle, and is no longer alive,
         # without any wandb evidence, failed *before* wandb.init —
         # e.g. srun step error, wandb API 429 at startup, OOM before
-        # training began. Route it into the retry lifecycle.
+        # training began. Route it into the retry lifecycle. Also gated
+        # on the same hysteresis.
         if (
             cls == "pending"
             and state["monitor_cycle"] > 1
             and entry.get("ever_alive")
-            and task_id is not None
+            and missing_confirmed
         ):
-            if slurm_states.get(task_id) not in ALIVE_SLURM_STATES:
-                cls = (
-                    "failed_exhausted" if entry.get("attempts", 0) >= retry_cap
-                    else "failed_retrying"
-                )
+            cls = (
+                "failed_exhausted" if entry.get("attempts", 0) >= retry_cap
+                else "failed_retrying"
+            )
 
         entry["wandb_run_ids"] = wids
         entry["attempts"] = len(wids)
