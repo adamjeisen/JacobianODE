@@ -36,7 +36,14 @@ lightning:
   alpha_teacher_forcing: 1
   teacher_forcing_annealing: True
   gamma_teacher_forcing: 0.999
-  teacher_forcing_update_interval: 5
+  # 1 = update alpha every batch. Was 5 (every 5 batches), but the EMA
+  # is so over-smoothed that alpha trails alpha_target by ~25 epochs of
+  # lag — this is most of the slow val-loss descent in current latent
+  # runs. Validated by perf-experiment Step 1 pilot: with interval=1,
+  # alpha schedule compresses ~3-4× without mid-training loss instability;
+  # see perf-experiment/PHASE1_HYPOTHESES.md and
+  # perf-experiment/runs/pilot-step1-int1.json.
+  teacher_forcing_update_interval: 1
   teacher_forcing_steps: 1
   min_alpha_teacher_forcing: 0
   alpha_validation: 0
