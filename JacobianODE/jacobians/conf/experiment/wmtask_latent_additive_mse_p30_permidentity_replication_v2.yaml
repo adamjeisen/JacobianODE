@@ -1,0 +1,90 @@
+# @package _global_
+#
+# Single-run replication of the monolithic CouplingEncoder best cell
+# (LC=1e-5, obs_noise_scale=0.05) but with final_perm_identity=true so
+# the encoder is exactly identity at init (no random inter-layer
+# permutation scrambling). Same dual-checkpoint setup as the previous
+# replication so we get both es5 best.ckpt and es2-best.ckpt.
+#
+# Purpose: provide the apples-to-apples trained-monolithic baseline for
+# the dynamics-MLP gradient-signal diagnostic. Without final_perm_identity
+# the encoder Jacobian at init is a permutation matrix that mixes
+# visual/cognitive area indices, making the area-block split on z
+# uninterpretable. With final_perm_identity=true the encoder Jacobian
+# is the identity matrix (exact area alignment) — directly comparable
+# to DirectSum.
+
+defaults:
+  - override /data: wmtask
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Same as wmtask_latent_additive_mse_p30_dualckpt_replication except
+    encoder.final_perm_identity=true. Single run, LC=1e-5,
+    obs_noise_scale=0.05, dual checkpoint (patience=5 + shadow=2).
+  hypothesis: |
+    Trained monolithic with final_perm_identity=true should reach
+    similar best_traj_loss as the original (i73jwojr ~0.0105) and
+    produce a clean Lyapunov spectrum (Δλ_min ≈ 0). The diagnostic on
+    its trained best.ckpt should give the apples-to-apples gradient-
+    signal numbers we need to compare against DirectSum.
+  success_criteria:
+    - "Run trains without divergence"
+    - "Both es2-best.ckpt and (epoch-best) best.ckpt saved"
+    - "best_traj_loss within ~2x of i73jwojr's 0.0105"
+
+sweep_grid:
+  training.lightning.loop_closure_weight: "1e-5"
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "wmtask_latent_additive_mse_p30_permidentity_replication_v2"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: false
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 1
+      delay_spacing: 1
+
+model:
+  n_target_dims: 128
+  prediction_steps: 30
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  vae_sample_all_losses: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+  encoder:
+    final_perm_identity: true       # ONLY change vs dualckpt_replication
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 16
+  trainer_params:
+    max_epochs: 1000
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    loss_func: mse
+    loop_closure_weight: 1e-5
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    obs_noise_scale: 0.05
+  early_stopping:
+    early_stopping_patience: 5
+    shadow_patience: 2
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01
