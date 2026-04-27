@@ -42,6 +42,13 @@ class PerStepTimingCallback(L.Callback):
             loss_val = float(outputs.detach().item())
         elif isinstance(outputs, dict) and "loss" in outputs:
             loss_val = float(outputs["loss"].detach().item())
+        # Capture alpha_teacher_forcing if the model exposes it (LitBase
+        # stores it as a python float on self.alpha_teacher_forcing).
+        alpha = getattr(pl_module, "alpha_teacher_forcing", None)
+        try:
+            alpha_val = float(alpha) if alpha is not None else None
+        except (TypeError, ValueError):
+            alpha_val = None
         self.records.append(
             {
                 "step": int(trainer.global_step),
@@ -49,6 +56,7 @@ class PerStepTimingCallback(L.Callback):
                 "epoch": int(trainer.current_epoch),
                 "loss": loss_val,
                 "walltime_seconds": dt,
+                "alpha_teacher_forcing": alpha_val,
             }
         )
         self._flush()
