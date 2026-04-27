@@ -124,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wandb-entity", required=True)
     parser.add_argument("--wandb-project", required=True)
     parser.add_argument("--groups", required=True)
+    parser.add_argument("--run-ids", default=None,
+                        help="Comma-separated explicit run ids, one per group "
+                             "(overrides metrics.json overall_chosen_run lookup). "
+                             "Useful when the analysis hasn't published yet.")
     parser.add_argument("--save-dir", required=True)
     parser.add_argument("--reports-dir", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -170,21 +174,29 @@ def main(argv: list[str] | None = None) -> int:
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+    overrides = ([s.strip() for s in args.run_ids.split(",")]
+                 if args.run_ids else [None] * len(groups))
+    if len(overrides) != len(groups):
+        raise ValueError("--run-ids must have one entry per --groups entry")
     logger.info(f"groups={groups}  stages={stages}  alpha={args.alpha}  device={device}")
 
     rows: list[dict] = []
 
-    for group in groups:
-        mp = reports_dir / args.wandb_project / group / "metrics.json"
-        if not mp.is_file():
-            logger.warning(f"  no metrics.json at {mp}; skipping {group}")
-            continue
-        chosen = json.loads(mp.read_text()).get("metrics_summary", {}).get("overall_chosen_run") or {}
-        run_id = chosen.get("run_id")
-        if not run_id:
-            logger.warning(f"  no overall_chosen_run for {group}; skipping")
-            continue
-        logger.info(f"=== {group}  chosen={run_id} ===")
+    for group, run_id_override in zip(groups, overrides):
+        if run_id_override:
+            run_id = run_id_override
+            logger.info(f"=== {group}  run={run_id} (explicit override) ===")
+        else:
+            mp = reports_dir / args.wandb_project / group / "metrics.json"
+            if not mp.is_file():
+                logger.warning(f"  no metrics.json at {mp}; skipping {group}")
+                continue
+            chosen = json.loads(mp.read_text()).get("metrics_summary", {}).get("overall_chosen_run") or {}
+            run_id = chosen.get("run_id")
+            if not run_id:
+                logger.warning(f"  no overall_chosen_run for {group}; skipping")
+                continue
+            logger.info(f"=== {group}  chosen={run_id} ===")
 
         for stage in stages:
             try:
