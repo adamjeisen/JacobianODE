@@ -94,6 +94,9 @@ def main(argv: list[str] | None = None) -> int:
         orig_encode_traj = lit_model.encode_trajectory
         orig_compute_jacs = lit_model.compute_jacobians
         orig_decode_traj = lit_model.decode_trajectory
+        orig_recon = lit_model._reconstruction_loss
+        orig_loop_close = getattr(lit_model, "loop_closure_model_step", None)
+        orig_traj_step = lit_model.trajectory_model_step
 
         def wrapped_encode_traj(*a, **kw):
             with cuda_timer("encode_trajectory", sink, device):
@@ -107,36 +110,60 @@ def main(argv: list[str] | None = None) -> int:
             with cuda_timer("decode_trajectory", sink, device):
                 return orig_decode_traj(*a, **kw)
 
+        def wrapped_recon(*a, **kw):
+            with cuda_timer("recon_loss", sink, device):
+                return orig_recon(*a, **kw)
+
+        def wrapped_loop_close(*a, **kw):
+            with cuda_timer("loop_closure_step", sink, device):
+                return orig_loop_close(*a, **kw)
+
+        def wrapped_traj_step(*a, **kw):
+            with cuda_timer("trajectory_model_step", sink, device):
+                return orig_traj_step(*a, **kw)
+
         lit_model.encode_trajectory = wrapped_encode_traj
         lit_model.compute_jacobians = wrapped_compute_jacs
         lit_model.decode_trajectory = wrapped_decode_traj
+        lit_model._reconstruction_loss = wrapped_recon
+        if orig_loop_close is not None:
+            lit_model.loop_closure_model_step = wrapped_loop_close
+        lit_model.trajectory_model_step = wrapped_traj_step
 
-        # Optimizer for the backward step (don't actually update; just want
-        # to time the backward pass realistically)
         optimizer = torch.optim.Adam(lit_model.parameters(), lr=1e-4)
+
+        def _do_train_step():
+            """Run the FULL Lightning training_step + backward."""
+            optimizer.zero_grad(set_to_none=True)
+            loss = lit_model.training_step(batch, batch_idx=0)
+            if isinstance(loss, dict):
+                loss = loss.get("loss", loss)
+            loss.backward()
 
         # Warmup
         for _ in range(args.n_warmup):
-            optimizer.zero_grad(set_to_none=True)
-            result = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=args.alpha)
-            (result["loss"] + result["metric_vals"]["latent_pred_loss"]).backward()
-        # Reset sink after warmup
+            _do_train_step()
         sink.clear()
 
-        # Timed iterations
-        per_iter_total = []
+        # Timed iterations — full training_step
         for _ in range(args.n_iters):
             optimizer.zero_grad(set_to_none=True)
             with cuda_timer("TOTAL_iter", sink, device):
-                with cuda_timer("forward_step", sink, device):
-                    result = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=args.alpha)
+                with cuda_timer("training_step_forward", sink, device):
+                    loss = lit_model.training_step(batch, batch_idx=0)
+                    if isinstance(loss, dict):
+                        loss = loss.get("loss", loss)
                 with cuda_timer("backward", sink, device):
-                    (result["loss"] + result["metric_vals"]["latent_pred_loss"]).backward()
+                    loss.backward()
 
         # Restore
         lit_model.encode_trajectory = orig_encode_traj
         lit_model.compute_jacobians = orig_compute_jacs
         lit_model.decode_trajectory = orig_decode_traj
+        lit_model._reconstruction_loss = orig_recon
+        if orig_loop_close is not None:
+            lit_model.loop_closure_model_step = orig_loop_close
+        lit_model.trajectory_model_step = orig_traj_step
 
         stats = {}
         for k, vs in sink.items():
@@ -151,7 +178,8 @@ def main(argv: list[str] | None = None) -> int:
                           "iter_total_ms": stats.get("TOTAL_iter", {}).get("total_ms_per_iter")}
 
         logger.info(f"  --- {group} ---")
-        for k in ("TOTAL_iter", "forward_step", "encode_trajectory",
+        for k in ("TOTAL_iter", "training_step_forward", "trajectory_model_step",
+                  "loop_closure_step", "recon_loss", "encode_trajectory",
                   "compute_jacobians", "decode_trajectory", "backward"):
             if k in stats:
                 s = stats[k]
