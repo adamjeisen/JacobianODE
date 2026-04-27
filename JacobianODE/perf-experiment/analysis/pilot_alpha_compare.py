@@ -62,15 +62,13 @@ def main():
     pilot_paths = sys.argv[1:-1] if len(sys.argv) >= 4 else [sys.argv[1]]
     out_label = sys.argv[-1]
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     BATCHES_PER_EPOCH = 200
 
     # Baseline (W&B median)
     wb = load_wandb_alpha()
-    # Convert epoch axis to batch-idx-equivalent
-    wb_batch = wb.index * BATCHES_PER_EPOCH
-    axes[0].plot(wb.index, wb.values, "k", linewidth=2, label="W&B baseline (interval=5, γ=0.999)")
-    axes[1].plot(wb_batch, wb.values, "k", linewidth=2, label="W&B baseline")
+    axes[0, 0].plot(wb.index, wb.values, "k", linewidth=2, label="W&B baseline (interval=5, γ=0.999)")
+    axes[0, 1].plot(wb.index, wb.values, "k", linewidth=2, label="W&B baseline")
 
     colors = ["C0", "C1", "C2", "C3"]
     for i, p in enumerate(pilot_paths):
@@ -79,21 +77,38 @@ def main():
             print(f"[skip] {p}: no alpha column")
             continue
         a = pd.to_numeric(df["alpha_teacher_forcing"], errors="coerce")
+        loss = pd.to_numeric(df["loss"], errors="coerce")
         ok = a.notna()
-        # Convert pilot batch_idx_global to epoch
         ep = df.loc[ok, "batch_idx_global"] / BATCHES_PER_EPOCH
         label = Path(p).stem
-        axes[0].plot(ep, a[ok], colors[i], alpha=0.9, label=label)
-        axes[1].plot(df.loc[ok, "batch_idx_global"], a[ok], colors[i], alpha=0.9, label=label)
+        axes[0, 0].plot(ep, a[ok], colors[i], alpha=0.9, label=label)
+        axes[0, 1].plot(ep, a[ok], colors[i], alpha=0.9, label=label)
+        # Per-batch loss (lower row), with rolling mean for visibility
+        loss_ok = loss.notna()
+        loss_ep = df.loc[loss_ok, "batch_idx_global"] / BATCHES_PER_EPOCH
+        # smooth with a 50-batch rolling mean
+        loss_smooth = loss[loss_ok].rolling(50, min_periods=10).mean()
+        axes[1, 0].plot(loss_ep, loss[loss_ok], colors[i], alpha=0.15)
+        axes[1, 0].plot(loss_ep, loss_smooth, colors[i], alpha=0.95, label=label)
+        axes[1, 1].plot(loss_ep, loss_smooth, colors[i], alpha=0.95, label=label)
 
-    for ax, xlabel in zip(axes, ["epoch", "batch index (cumulative)"]):
-        ax.set_xlabel(xlabel)
+    for ax in axes[0]:
+        ax.set_xlabel("epoch")
         ax.set_ylabel("alpha_teacher_forcing")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=9, loc="upper right")
-    axes[0].set_xlim(0, 12)  # zoom into pilot range
-    axes[1].set_xlim(0, 2400)
-    fig.suptitle("Pilot α trajectory vs W&B baseline (lorenz_current)")
+    axes[0, 0].set_xlim(0, 12)
+    axes[0, 1].set_xlim(0, 110)  # full baseline range
+    for ax in axes[1]:
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("training loss (per-batch, 50-batch rolling mean)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9, loc="upper right")
+    axes[1, 0].set_xlim(0, 12)
+    axes[1, 0].set_yscale("log")
+    axes[1, 1].set_xlim(0, 12)
+    axes[1, 1].set_yscale("linear")
+    fig.suptitle("Pilot α trajectory + training loss vs W&B baseline (lorenz_current)")
     fig.tight_layout()
     out = FIGS / f"pilot_alpha_{out_label}.png"
     fig.savefig(out, dpi=120)
