@@ -58,16 +58,21 @@ def _block_norms(M, split):
     }
 
 
-def _instantiate_encoder(cfg, n_input, instantiate_fn):
-    """Build a fresh encoder, passing n_input only if the encoder class accepts it."""
-    target = cfg.model.encoder.get("_target_", "")
+def _instantiate_encoder_from(enc_cfg, n_input, instantiate_fn):
+    """Build a fresh encoder from the given encoder cfg, passing n_input only
+    if the encoder class accepts it."""
+    target = enc_cfg.get("_target_", "")
     if target:
         mod_path, cls_name = target.rsplit(".", 1)
         encoder_cls = getattr(importlib.import_module(mod_path), cls_name)
         sig = inspect.signature(encoder_cls.__init__)
         if "n_input" in sig.parameters:
-            return instantiate_fn(cfg.model.encoder, n_input=n_input)
-    return instantiate_fn(cfg.model.encoder)
+            return instantiate_fn(enc_cfg, n_input=n_input)
+    return instantiate_fn(enc_cfg)
+
+
+def _instantiate_encoder(cfg, n_input, instantiate_fn):
+    return _instantiate_encoder_from(cfg.model.encoder, n_input, instantiate_fn)
 
 
 def _measure_grad_on_J(lit_model, batch, alpha):
@@ -127,6 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alpha", type=float, default=0.5,
                         help="Teacher-forcing alpha for trajectory_model_step (0..1)")
     parser.add_argument("--stages", default="init,trained")
+    parser.add_argument("--encoder-overrides", default=None,
+                        help="Comma-separated key=value pairs applied to "
+                             "cfg.model.encoder for the 'init' stage only "
+                             "(e.g. 'final_perm_identity=true'). Lets you "
+                             "build a hypothetical fresh encoder variant "
+                             "without re-training.")
     parser.add_argument("--tag", default=None)
     args = parser.parse_args(argv)
 
@@ -180,7 +191,24 @@ def main(argv: list[str] | None = None) -> int:
                             + cfg.training.run_number + 1)
                     seed_everything(seed)
                     n_input = trajs["train_trajs"].sequence.shape[-1]
-                    fresh_encoder = _instantiate_encoder(cfg, n_input, instantiate)
+                    enc_cfg = cfg.model.encoder
+                    if args.encoder_overrides:
+                        from omegaconf import OmegaConf
+                        enc_cfg = OmegaConf.create(OmegaConf.to_container(enc_cfg, resolve=True))
+                        for kv in args.encoder_overrides.split(","):
+                            k, v = kv.split("=", 1)
+                            v = v.strip()
+                            # Hydra-style scalar coercion
+                            if v.lower() == "true":   v = True
+                            elif v.lower() == "false": v = False
+                            else:
+                                try: v = int(v)
+                                except ValueError:
+                                    try: v = float(v)
+                                    except ValueError: pass
+                            OmegaConf.update(enc_cfg, k.strip(), v)
+                            logger.info(f"  [encoder override] {k.strip()}={v!r}")
+                    fresh_encoder = _instantiate_encoder_from(enc_cfg, n_input, instantiate)
                     lit_model.encoder = fresh_encoder
                 lit_model = lit_model.to(device).train()  # train mode for full graph
                 # Make sure ALL params allow grad (we don't actually update them,
