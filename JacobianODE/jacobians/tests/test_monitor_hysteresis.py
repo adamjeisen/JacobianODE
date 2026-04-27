@@ -197,3 +197,63 @@ def test_alive_after_one_miss_resets(sweep_paths):
 
     assert state["runs"]["0"]["consecutive_missing_cycles"] == 0
     assert state["runs"]["0"]["classification"] == "running"
+
+
+def test_single_task_array_bare_id_treated_as_alive(sweep_paths):
+    """SLURM compresses size-1 arrays to bare array_id (no _0 suffix).
+
+    Bug: query_squeue_states populated only the bare key, but
+    _slurm_task_id constructed '<array_id>_0', so the lookup always
+    missed and the slot was classified as failed every cycle —
+    defeating the hysteresis. Fix: synthesize the canonical _0 key
+    from any bare array_id reported by squeue.
+    """
+    _seed_state(sweep_paths["state_path"], {
+        "wandb_run_ids": ["wid_a"], "attempts": 1,
+        "last_wandb_state": "running", "last_slurm_state": "RUNNING",
+        "classification": "running", "ever_alive": True,
+        "consecutive_missing_cycles": 0,
+        "_monitor_cycle": 2,
+    })
+
+    # squeue returns ONLY the bare array_id (no _0) — what SLURM does
+    # for single-task arrays even with the -r flag.
+    from JacobianODE.jacobians.tuning import monitor as mon
+
+    # Patch query_squeue_states to return that real-world output. Then
+    # check_sweep should still classify the slot as running because the
+    # bare-id-as-alias logic kicks in inside query_squeue_states.
+    # Here we go through the patched version (the synthesizer is built
+    # into query_squeue_states) by emulating the synthesized output:
+    state = _drive_cycle(
+        sweep_paths,
+        squeue_states={"9999": "RUNNING", "9999_0": "RUNNING"},
+        wandb_runs=[_wandb_run("wid_a")],
+    )
+
+    assert state["runs"]["0"]["consecutive_missing_cycles"] == 0
+    assert state["runs"]["0"]["classification"] == "running"
+
+
+def test_query_squeue_states_synthesizes_bare_array_id_alias(monkeypatch):
+    """query_squeue_states must add a `<array_id>_0` alias for any bare
+    array_id reported by squeue (the single-task-array case)."""
+    import subprocess
+    from JacobianODE.jacobians.tuning import monitor as mon
+
+    fake_output = (
+        "12637732|RUNNING\n"      # bare (single-task array)
+        "12345_0|RUNNING\n"       # already in canonical form
+        "12345_1|PENDING\n"
+    )
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: fake_output)
+    states = mon.query_squeue_states()
+    # Bare array_id present
+    assert states["12637732"] == "RUNNING"
+    # Synthesized alias present with same state
+    assert states["12637732_0"] == "RUNNING"
+    # Canonical-form entries unchanged
+    assert states["12345_0"] == "RUNNING"
+    assert states["12345_1"] == "PENDING"
+    # Don't synthesize an alias for already-canonical entries
+    assert "12345" not in states

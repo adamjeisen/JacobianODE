@@ -160,7 +160,16 @@ def query_squeue_states(user: str = "eisenaj") -> dict[str, str]:
         if "|" not in line:
             continue
         jid, state = line.split("|", 1)
-        result[jid.strip()] = state.strip()
+        jid = jid.strip()
+        state = state.strip()
+        result[jid] = state
+        # SLURM compresses single-task arrays (size 1) to just the bare
+        # array_id without the `_0` suffix — even with -r. Downstream
+        # lookups (`_slurm_task_id` constructs `<array_id>_<task_idx>`)
+        # would miss for those single-task arrays. Synthesize the
+        # canonical task_id form so per-slot lookups succeed.
+        if "_" not in jid:
+            result[f"{jid}_0"] = state
     return result
 
 
