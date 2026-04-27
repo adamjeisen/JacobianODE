@@ -1934,30 +1934,38 @@ class LitLatentJacobianODE(LitBase):
             one_step_ret['metric_vals']['persistence_mae'].float().item()
         )
 
-        # Fast eigenvalue fraction (C3 diagnostic)
-        with self._timed("val/6.eigvals"):
-            with torch.no_grad():
-                pred_jacs = self.compute_jacobians(z_dyn)  # (B, T, D, D)
-                B, T, D, _ = pred_jacs.shape
-                jacs_flat = pred_jacs.reshape(B * T, D, D)
-                if self.n_eigval_jacobians is not None and self.n_eigval_jacobians < B * T:
-                    idx = torch.randperm(B * T, device=jacs_flat.device)[:self.n_eigval_jacobians]
-                    jacs_flat = jacs_flat[idx]
-                finite_mask = torch.isfinite(jacs_flat).all(dim=-1).all(dim=-1)
-                jacs_finite = jacs_flat[finite_mask]
-                if jacs_finite.numel() > 0:
-                    eigs_real = torch.linalg.eigvals(jacs_finite).real.flatten()
-                    threshold = -1.0 / self.dt
-                    n_too_fast = torch.sum(eigs_real <= threshold).float().item()
-                    n_total = len(eigs_real)
-                else:
-                    n_too_fast = 0.0
-                    n_total = 0
+        # Fast eigenvalue fraction (C3 diagnostic) — first val batch per
+        # epoch only. torch.linalg.eigvals on general matrices can spike
+        # to seconds-per-call when the dynamics MLP wanders into a region
+        # producing near-defective Jacobians (clustered eigenvalues /
+        # Jordan structure). Running it on every val batch turned 100ms
+        # of training into 7s/batch on some monolithic-encoder runs and
+        # dominated wall-clock per epoch (~16x val slowdown). Once per
+        # epoch is plenty for a fraction-of-eigenvalues-too-fast metric.
         if not hasattr(self, '_val_eig_too_fast'):
             self._val_eig_too_fast = []
             self._val_eig_total = []
-        self._val_eig_too_fast.append(n_too_fast)
-        self._val_eig_total.append(n_total)
+        if batch_idx == 0:
+            with self._timed("val/6.eigvals"):
+                with torch.no_grad():
+                    pred_jacs = self.compute_jacobians(z_dyn)  # (B, T, D, D)
+                    B, T, D, _ = pred_jacs.shape
+                    jacs_flat = pred_jacs.reshape(B * T, D, D)
+                    if self.n_eigval_jacobians is not None and self.n_eigval_jacobians < B * T:
+                        idx = torch.randperm(B * T, device=jacs_flat.device)[:self.n_eigval_jacobians]
+                        jacs_flat = jacs_flat[idx]
+                    finite_mask = torch.isfinite(jacs_flat).all(dim=-1).all(dim=-1)
+                    jacs_finite = jacs_flat[finite_mask]
+                    if jacs_finite.numel() > 0:
+                        eigs_real = torch.linalg.eigvals(jacs_finite).real.flatten()
+                        threshold = -1.0 / self.dt
+                        n_too_fast = torch.sum(eigs_real <= threshold).float().item()
+                        n_total = len(eigs_real)
+                    else:
+                        n_too_fast = 0.0
+                        n_total = 0
+            self._val_eig_too_fast.append(n_too_fast)
+            self._val_eig_total.append(n_total)
 
         with self._timed("val/7.log_metrics"):
             if log_metrics:
