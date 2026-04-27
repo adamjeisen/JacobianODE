@@ -196,9 +196,17 @@ def _current_array_jobs() -> set[str]:
     return ids
 
 
-def _submit_one(exp: str, overrides: list[str]) -> dict:
+def _submit_one(
+    exp: str,
+    overrides: list[str],
+    two_stage: dict | None = None,
+) -> dict:
     """Run prepare_sweep + jsweep for one experiment. Returns dict of metadata
     including the SLURM array id (or raises on failure).
+
+    ``two_stage`` is the opt-in block from the instruction YAML (see the
+    two-stage protocol). When present, it's persisted into ``expected.json``
+    so ``_maybe_dispatch_stage_b`` can find it after analysis publishes.
     """
     branch, commit = _git_head_info()
     expected_path = STATE_DIR / "expected_tmp.json"
@@ -414,6 +422,18 @@ def _submit_one(exp: str, overrides: list[str]) -> dict:
         shutil.move(str(expected_path), str(final_expected))
         expected_run_count = batch_count
 
+    # Two-stage protocol: persist the instruction's `two_stage:` block into
+    # expected.json so the post-publish hook can find it. Done after both
+    # the fresh-write and extend-write branches above so the patch lands
+    # regardless of which path created the file.
+    if two_stage and final_expected.is_file():
+        try:
+            doc = json.loads(final_expected.read_text())
+            doc["two_stage"] = two_stage
+            final_expected.write_text(json.dumps(doc, indent=2) + "\n")
+        except Exception as e:
+            log(f"[{exp}] WARN failed to persist two_stage block: {e}")
+
     return {
         "wandb_group": group,
         "expected_run_count": expected_run_count,
@@ -519,10 +539,18 @@ def process_pending_instructions(dry_run: bool) -> int:
         overrides = data.get("overrides") or []
         if not isinstance(overrides, list):
             overrides = [str(overrides)]
-        log(f"[{f.name}] submitting experiment={exp} overrides={overrides}")
+        two_stage = data.get("two_stage")
+        if two_stage is not None and not isinstance(two_stage, dict):
+            log(f"[{f.name}] WARN ignoring non-dict two_stage block: "
+                f"{type(two_stage).__name__}")
+            two_stage = None
+        log(f"[{f.name}] submitting experiment={exp} overrides={overrides}"
+            + (f" two_stage={two_stage}" if two_stage else ""))
 
         try:
-            meta = _submit_one(exp, [str(o) for o in overrides])
+            meta = _submit_one(
+                exp, [str(o) for o in overrides], two_stage=two_stage,
+            )
         except subprocess.CalledProcessError as e:
             err = (e.stderr or e.stdout or "")[-2000:]
             log(f"[{f.name}] FAILED: {err.strip()[:500]}")
@@ -685,6 +713,58 @@ def _publish_analysis(group: str) -> Path | None:
     return target
 
 
+def _maybe_dispatch_stage_b(group: str) -> None:
+    """Two-stage protocol auto-dispatch hook.
+
+    Called after a Stage A analysis report publishes. If the group's
+    expected.json has a ``two_stage:`` block (set by the instruction YAML),
+    shells out to the cull tool with those params. The cull tool selects
+    survivors, dispatches per-survivor j-submits, and writes an
+    idempotency sentinel so a controller restart can't double-fire.
+
+    Failures are logged and swallowed — the user can re-run the cull tool
+    by hand to debug. Stage A's report is already published so no data
+    is lost.
+    """
+    if not group.endswith("__stage_a"):
+        return
+    expected_path = SWEEPS_DIR / "active" / f"{group}.expected.json"
+    if not expected_path.is_file():
+        return
+    try:
+        spec = json.loads(expected_path.read_text()).get("two_stage")
+    except Exception as e:
+        log(f"[two_stage {group}] could not read expected.json: {e}")
+        return
+    if not spec:
+        return  # opt-in only
+
+    # Idempotency: cull tool writes this on success. If it's already there,
+    # Stage B was already dispatched (e.g. from a prior controller cycle
+    # before a restart) and we shouldn't re-fire.
+    sentinel = SWEEPS_DIR / "active" / f"{group}.stage_b_dispatched"
+    if sentinel.is_file():
+        log(f"[two_stage {group}] already dispatched (sentinel exists), "
+            "skipping")
+        return
+
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "JacobianODE.jacobians.tuning.two_stage_cull",
+        "--group", group,
+        "--full-max-epochs", str(spec["full_max_epochs"]),
+        "--cull-fraction", str(spec.get("cull_fraction", 0.5)),
+        "--metric", spec.get("metric", "trajectory val_loss"),
+    ]
+    log(f"[two_stage {group}] auto-dispatching cull: {' '.join(cmd)}")
+    try:
+        run(cmd, cwd=JACODE_REPO, check=True)
+        log(f"[two_stage {group}] cull OK")
+    except subprocess.CalledProcessError as e:
+        log(f"[two_stage {group}] cull FAILED ({e.returncode}): "
+            f"{(e.stderr or e.stdout or '').strip()[:500]}")
+
+
 def reap_completed_analyses(inflight: dict) -> int:
     n_reaped = 0
     for group in list(inflight.keys()):
@@ -725,6 +805,11 @@ def reap_completed_analyses(inflight: dict) -> int:
             shutil.move(str(sentinel), str(dest / sentinel.name))
         if published:
             log(f"[reap {group}] OK -> {published.relative_to(REPO_DIR)}")
+            try:
+                _maybe_dispatch_stage_b(group)
+            except Exception as e:
+                # Defensive: never let two-stage dispatch crash the cycle.
+                log(f"[reap {group}] two_stage dispatch hook raised: {e}")
         else:
             log(f"[reap {group}] FAILED (publish error)")
         del inflight[group]

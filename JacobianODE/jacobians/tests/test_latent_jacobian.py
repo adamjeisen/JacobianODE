@@ -7,6 +7,7 @@ import torch.nn as nn
 from JacobianODE.models.mlp import MLP
 from JacobianODE.models.latent_jacobian import LitLatentJacobianODE
 from JacobianODE.fnn.networks import MLPAutoencoder
+from JacobianODE.fnn.sequence_networks import SequenceAutoencoder
 
 
 @pytest.fixture
@@ -207,4 +208,4 @@ class TestConfigIntegration:
 
         assert isinstance(lit_model, LitLatentJacobianODE)
         assert hasattr(lit_model, 'encoder')
-        assert isinstance(lit_model.encoder, MLPAutoencoder)
+        assert isinstance(lit_model.encoder, (MLPAutoencoder, SequenceAutoencoder))

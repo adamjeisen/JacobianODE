@@ -387,6 +387,37 @@ class LitBase(L.LightningModule):
         # Initialize validation loss tracking
         self.validation_losses = []
         self.percent_improvements = []
+
+    # ------------------------------------------------------------------
+    # Checkpoint state preservation
+    # ------------------------------------------------------------------
+    # Lightning's standard ckpt saves model state_dict, optimizer state,
+    # and LR scheduler state — but NOT plain Python attributes on the
+    # LightningModule. ``alpha_teacher_forcing`` is updated each batch
+    # via ``update_alpha_teacher_forcing`` (a teacher-forcing anneal
+    # schedule) and lives as a plain float on ``self``. Without these
+    # hooks, a ckpt-resume restarts alpha at the YAML init value
+    # (typically 1.0) regardless of how far it had annealed, which
+    # introduces a discontinuity in training dynamics.
+    #
+    # Stored under a dedicated ``lit_runtime_state`` key so the diff
+    # to existing ckpts is additive: older ckpts (no key) load with
+    # whatever alpha __init__ set; newer ckpts restore the saved value.
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        super().on_save_checkpoint(checkpoint)
+        checkpoint["lit_runtime_state"] = {
+            "alpha_teacher_forcing": float(self.alpha_teacher_forcing),
+            "teacher_forcing_steps": int(self.teacher_forcing_steps or 0),
+        }
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        super().on_load_checkpoint(checkpoint)
+        state = checkpoint.get("lit_runtime_state") or {}
+        if "alpha_teacher_forcing" in state:
+            self.alpha_teacher_forcing = float(state["alpha_teacher_forcing"])
+        if "teacher_forcing_steps" in state:
+            self.teacher_forcing_steps = int(state["teacher_forcing_steps"])
+
     def base_deriv_func(self, _t, _x):
         """Compute the base derivative function.
 

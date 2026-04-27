@@ -19,6 +19,7 @@ from .sweep import (
     select_best_from_sweep,
     select_from_wandb_runs,
 )
+from . import two_stage_cull
 
 __all__ = [
     "ALL_RANKING_METHODS",
@@ -38,4 +39,5 @@ __all__ = [
     "select_best_from_sweep",
     "select_best_model",
     "select_from_wandb_runs",
+    "two_stage_cull",
 ]

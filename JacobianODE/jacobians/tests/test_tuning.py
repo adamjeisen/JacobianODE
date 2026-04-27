@@ -167,13 +167,19 @@ class TestSelectBestModel:
         assert result.best_index == 1
 
     def test_use_loop_closure_false(self):
-        """NeuralODE mode: C2 not applied."""
+        """NeuralODE mode: C2 not applied even when ranking would normally use it.
+
+        Uses ``ranking_method="best_traj_loss"`` because that's the only
+        ranking method where C2 is a *hard filter*; the default
+        ``pareto_knee`` ranks on loop-closure loss directly so C2 is never
+        applied regardless of ``use_loop_closure``."""
         candidates = [
             self._make(loop=100.0, traj=2.0),  # would fail C2 if applied
             self._make(loop=0.1, traj=3.0),
         ]
         result = select_best_model(
             candidates, n_dims=4, use_loop_closure=False,
+            ranking_method="best_traj_loss",
         )
         assert result.best_index == 0  # lowest traj, C2 not applied
         assert "C2" not in result.criteria_applied
@@ -204,11 +210,18 @@ class TestSelectBestModel:
         assert len(result.surviving_indices) == 2
 
     def test_criteria_applied_tracks_correctly(self):
-        """Verify criteria_applied reflects actual enforcement."""
+        """Verify criteria_applied reflects actual enforcement.
+
+        Tested under ``ranking_method="best_traj_loss"`` so all three
+        criteria (incl. C2) are hard filters; under the default
+        ``pareto_knee`` C2 is never applied (loop closure becomes a
+        ranking signal instead)."""
         candidates = [
             self._make(mase=0.1, loop=0.1, eig=0.0, traj=1.0),
         ]
-        result = select_best_model(candidates, n_dims=4)
+        result = select_best_model(
+            candidates, n_dims=4, ranking_method="best_traj_loss",
+        )
         assert "C1" in result.criteria_applied
         assert "C2" in result.criteria_applied
         assert "C3" in result.criteria_applied

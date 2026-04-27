@@ -26,6 +26,10 @@ from ..lightning_base import (
     PercentEarlyStopping,
     ShadowPercentEarlyStoppingCheckpoint,
 )
+from ..tuning.two_stage_cull import (
+    STAGE_A_SUFFIX,
+    two_stage_ckpt_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +232,24 @@ def train_model(
                 + (f" (wandb id={wandb_resume_id})" if wandb_resume_id else "")
             )
 
+    # Two-stage opt-in: Hydra override `+training.ckpt_path=<path>` (set by
+    # `two_stage_cull` when dispatching Stage B) initializes Stage B from
+    # Stage A's weights. SLURM-preempt resume wins over this — once Stage B
+    # has its own last.ckpt in resume_dir, we resume Stage B's progress
+    # rather than restarting from Stage A. Stage B is conceptually a *new*
+    # wandb run that warm-starts from Stage A, not a continuation of Stage A.
+    explicit_ckpt = cfg.training.get("ckpt_path", None)
+    if explicit_ckpt and ckpt_path_resume is None:
+        ep = Path(explicit_ckpt)
+        if not ep.is_file():
+            raise FileNotFoundError(
+                f"[two-stage] cfg.training.ckpt_path={explicit_ckpt!r} does "
+                "not exist. The Stage A run probably failed before saving "
+                "last.ckpt; re-run the cull tool after fixing Stage A."
+            )
+        ckpt_path_resume = str(ep)
+        logger.info(f"[two-stage] initializing from explicit ckpt {ep}")
+
     logger_kwargs = {
         "name": name,
         "project": project,
@@ -427,6 +449,34 @@ def train_model(
         val_dataloaders=val_dataloaders,
         ckpt_path=ckpt_path_resume,
     )
+
+    # Two-stage protocol: if this is a Stage A run (wandb_group ends in
+    # __stage_a), copy resume_dir/last.ckpt to a stable cell-keyed path
+    # so the cull tool can find it after the SLURM-keyed resume_dir is
+    # cleaned up below. The copy happens BEFORE cleanup. We gate on the
+    # __stage_a suffix so non-stage-A sweeps don't leave stray ckpts.
+    if (
+        group
+        and group.endswith(STAGE_A_SUFFIX)
+        and resume_dir is not None
+        and resume_dir.is_dir()
+    ):
+        stage_a_src = resume_dir / "last.ckpt"
+        stage_a_dst = two_stage_ckpt_path(cfg)
+        if stage_a_src.is_file() and stage_a_dst is not None:
+            try:
+                stage_a_dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(stage_a_src), str(stage_a_dst))
+                logger.info(f"[two-stage] copied Stage A ckpt -> {stage_a_dst}")
+            except Exception as e:
+                logger.warning(
+                    f"[two-stage] failed to copy {stage_a_src} -> "
+                    f"{stage_a_dst}: {e}"
+                )
+        elif not stage_a_src.is_file():
+            logger.warning(
+                f"[two-stage] no last.ckpt at {stage_a_src} to copy"
+            )
 
     # trainer.fit returning normally means training finished (early stop or
     # max_epochs). Drop the heavy artifacts (last.ckpt, anything > 1 KB)
