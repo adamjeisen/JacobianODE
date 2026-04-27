@@ -167,7 +167,9 @@ def main(argv: list[str] | None = None) -> int:
     import numpy as np
     import torch
 
-    from JacobianODE.jacobians.checkpoints.loader import load_run, load_checkpoint
+    from hydra.utils import instantiate
+    from JacobianODE.jacobians.checkpoints.loader import load_run
+    from JacobianODE.jacobians.core.reproducibility import seed_everything
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -203,10 +205,20 @@ def main(argv: list[str] | None = None) -> int:
                     generate_data=True, verbose=False, return_full_obs=False,
                 )
                 run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
-                if stage == "trained":
-                    load_checkpoint(run_obj, cfg, lit_model, save_dir=str(save_dir),
-                                    verbose=False)
-                # else: leave at random init
+                # NOTE: load_run always calls load_checkpoint internally, so
+                # lit_model now has the TRAINED encoder. For "init" stage we
+                # swap the encoder for a fresh one built from the same cfg
+                # (re-seeded so the random init matches what training would
+                # have started from). Only the encoder/decoder are used by
+                # this diagnostic — the dynamics MLP is never run — so we
+                # don't need to rebuild anything else.
+                if stage == "init":
+                    seed = (cfg.data.flow.random_state
+                            + cfg.training.run_number + 1)
+                    seed_everything(seed)
+                    n_input = trajs["train_trajs"].sequence.shape[-1]
+                    fresh_encoder = instantiate(cfg.model.encoder, n_input=n_input)
+                    lit_model.encoder = fresh_encoder
                 lit_model = lit_model.to(device).eval()
 
                 n_dyn = getattr(lit_model, "n_target_dims", None)
