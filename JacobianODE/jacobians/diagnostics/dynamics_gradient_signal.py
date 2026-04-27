@@ -138,6 +138,15 @@ def main(argv: list[str] | None = None) -> int:
                              "(e.g. 'final_perm_identity=true'). Lets you "
                              "build a hypothetical fresh encoder variant "
                              "without re-training.")
+    parser.add_argument("--reinit-mlp", action="store_true",
+                        help="Also rebuild the dynamics MLP from cfg at "
+                             "the init stage (with the original training "
+                             "seed). Without this, init = (trained MLP + "
+                             "fresh encoder), which mixes a trained-model "
+                             "effect into the encoder-only diagnostic.")
+    parser.add_argument("--mlp-seed", type=int, default=None,
+                        help="If set, override the seed used when "
+                             "re-initializing the MLP (default: cfg's seed).")
     parser.add_argument("--tag", default=None)
     args = parser.parse_args(argv)
 
@@ -210,6 +219,23 @@ def main(argv: list[str] | None = None) -> int:
                             logger.info(f"  [encoder override] {k.strip()}={v!r}")
                     fresh_encoder = _instantiate_encoder_from(enc_cfg, n_input, instantiate)
                     lit_model.encoder = fresh_encoder
+
+                    if args.reinit_mlp:
+                        # Rebuild the dynamics MLP fresh from cfg.model.params.
+                        # We re-seed FIRST so the MLP init is reproducible and
+                        # comparable across groups (with --mlp-seed: identical).
+                        mlp_seed = args.mlp_seed if args.mlp_seed is not None else seed
+                        seed_everything(mlp_seed)
+                        params_cfg = cfg.model.params
+                        n_t = int(getattr(lit_model, "n_target_dims", n_input))
+                        # input_dim/output_dim are set at runtime per cfg pattern
+                        from omegaconf import OmegaConf
+                        params_cfg = OmegaConf.create(OmegaConf.to_container(params_cfg, resolve=True))
+                        OmegaConf.update(params_cfg, "input_dim", n_t)
+                        OmegaConf.update(params_cfg, "output_dim", n_t * n_t)
+                        fresh_mlp = instantiate(params_cfg)
+                        lit_model.model = fresh_mlp
+                        logger.info(f"  [reinit-mlp] seed={mlp_seed} input_dim={n_t} output_dim={n_t*n_t}")
                 lit_model = lit_model.to(device).train()  # train mode for full graph
                 # Make sure ALL params allow grad (we don't actually update them,
                 # but the autograd graph needs them).
