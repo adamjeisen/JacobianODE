@@ -1,27 +1,26 @@
-"""Gradient signal arriving at the dynamics MLP, per area-block, per loss type.
+"""∂L/∂J_f at the dynamics-MLP output, per area-block, per loss type.
 
 For each (group, stage ∈ {init, trained}, loss_type ∈ {obs, latent}):
-  - Load the model (init = fresh from factory, trained = chosen-best ckpt).
-  - Sample a batch of test trajectories x[t], x[t+1].
-  - Treat z' = E(x[t+1])[..., :n_dyn] as a leaf variable (the "target" of the
-    dynamics MLP), backprop the chosen loss into z', and use the outer-product
-    decomposition
 
-        ∂L / ∂J_f[i, j]  ≈  E_{batch, time}[ (∂L/∂z'[..., i]) * z[..., j] ]
+1. Set up the model. ``stage='trained'`` loads the chosen-best ckpt;
+   ``stage='init'`` rebuilds the encoder from cfg with the original training
+   seed (the dynamics MLP itself isn't used for this diagnostic, only
+   indirectly — see step 2 — but for "init" it remains the freshly-built
+   one so that the J_f outputs reflect random-init MLP behavior).
+2. Monkey-patch ``lit_model.compute_jacobians`` to capture the produced
+   J_f tensors (the actual MLP output, reshaped to (..., D, D)).
+3. Call ``lit_model.trajectory_model_step(batch, alpha_teacher_forcing=0.5)``
+   — the same code path training uses, so ``loss`` is the obs-space rollout
+   loss and ``metric_vals['latent_pred_loss']`` is the latent-space loss.
+4. ``∂loss/∂J_f`` via ``torch.autograd.grad(loss, captured)``. Concatenate
+   across calls, take abs-mean over (batch, time). Result: a (D, D) matrix
+   of per-J-entry gradient magnitudes. Split into 4 area-blocks.
 
-    to get the (D × D) "gradient-on-effective-Jacobian" — i.e. the signal the
-    optimizer would push the dynamics MLP's effective J towards if it could
-    perturb J directly. Block-split this matrix into vv / vc / cv / cc and
-    report mean |.| per block.
-
-This isolates the encoder/decoder gradient-flow from the MLP architecture
-itself: the MLP isn't actually run during the diagnostic. Only the
-encoder/decoder shape the gradient-on-J pattern.
-
-Why "init" is uninformative: with zero_init=true the additive coupling
-encoder is exact identity at init, so J_E = J_D = I and the per-block
-gradient-on-J is identical across DirectSum and monolithic. Differences
-only emerge after the encoder trains away from identity.
+The point: this is the gradient the optimizer would apply to whatever
+makes up J_f — it tells us how strongly each block of J_f is being
+"pulled" by the loss. If DirectSum's block-diagonal encoder/decoder
+zero out the cross-area gradient channels, we'd see vc/cv blocks
+strictly smaller than monolithic.
 
 Usage:
     python -m JacobianODE.jacobians.diagnostics.dynamics_gradient_signal \\
@@ -37,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -50,112 +51,82 @@ def _block_norms(M, split):
         "vc": float(M[:split, split:].abs().mean().item()),
         "cv": float(M[split:, :split].abs().mean().item()),
         "cc": float(M[split:, split:].abs().mean().item()),
+        "vv_max": float(M[:split, :split].abs().max().item()),
+        "vc_max": float(M[:split, split:].abs().max().item()),
+        "cv_max": float(M[split:, :split].abs().max().item()),
+        "cc_max": float(M[split:, split:].abs().max().item()),
     }
 
 
-def _compute_grad_on_J(lit_model, x_input, x_target, *, loss_type, n_dyn):
-    """Returns (D × D) ∂L/∂J_f via outer-product decomposition.
+def _instantiate_encoder(cfg, n_input, instantiate_fn):
+    """Build a fresh encoder, passing n_input only if the encoder class accepts it."""
+    target = cfg.model.encoder.get("_target_", "")
+    if target:
+        mod_path, cls_name = target.rsplit(".", 1)
+        encoder_cls = getattr(importlib.import_module(mod_path), cls_name)
+        sig = inspect.signature(encoder_cls.__init__)
+        if "n_input" in sig.parameters:
+            return instantiate_fn(cfg.model.encoder, n_input=n_input)
+    return instantiate_fn(cfg.model.encoder)
 
-    x_input  : (B, T, D_obs)  observations at t
-    x_target : (B, T, D_obs)  observations at t+1
-    loss_type: 'obs' (decode then MSE in obs space) or 'latent' (MSE in z space)
-    n_dyn    : dyn-subspace size (so we can pad with the actual encoded null)
-    """
+
+def _measure_grad_on_J(lit_model, batch, alpha):
+    """Returns ((D, D) obs-grad, (D, D) latent-grad) — abs-mean per entry."""
     import torch
 
-    device = x_input.device
-    has_enc = hasattr(lit_model, "encoder") and lit_model.encoder is not None
+    captured: list = []
+    orig = lit_model.compute_jacobians
 
-    # --- Encode the input to get z (and its null part for obs-loss padding) ---
-    if has_enc:
-        with torch.no_grad():
-            z_full_in = lit_model.encoder.encode(x_input)
-            # z_full = [z_dyn || z_null] with dyn first.
-            z_in_dyn = z_full_in[..., :n_dyn]
-            z_in_null = z_full_in[..., n_dyn:]
-    else:
-        z_in_dyn = x_input
-        z_in_null = None
+    def patched(b, **kw):
+        j = orig(b, **kw)
+        captured.append(j)
+        return j
 
-    # --- Treat z' (the MLP output) as a leaf, equal to the encoded target ---
-    if has_enc:
-        with torch.no_grad():
-            z_full_tgt = lit_model.encoder.encode(x_target)
-            z_tgt_dyn = z_full_tgt[..., :n_dyn]
-            z_tgt_null = z_full_tgt[..., n_dyn:]
-    else:
-        z_tgt_dyn = x_target
-        z_tgt_null = None
+    lit_model.compute_jacobians = patched
+    try:
+        # Use the same training code path. alpha=0.5 is partial teacher forcing.
+        result = lit_model.trajectory_model_step(batch, alpha_teacher_forcing=alpha)
+    finally:
+        lit_model.compute_jacobians = orig
 
-    z_prime = z_tgt_dyn.detach().clone().requires_grad_(True)
+    obs_loss = result["loss"]
+    lat_loss = result["metric_vals"]["latent_pred_loss"]
 
-    # --- Build the loss ---
-    if loss_type == "latent":
-        # MSE between MLP output and encoded target (no decoder).
-        loss = ((z_prime - z_tgt_dyn) ** 2).mean()
-    elif loss_type == "obs":
-        if not has_enc:
-            # Vanilla: no decoder, "obs loss" == MSE in obs space directly.
-            loss = ((z_prime - x_target) ** 2).mean()
-        else:
-            # Pad z' with the actual encoded null subspace, then decode.
-            if z_tgt_null is not None and z_tgt_null.shape[-1] > 0:
-                z_full_pred = torch.cat([z_prime, z_tgt_null], dim=-1)
-            else:
-                z_full_pred = z_prime
-            x_pred = lit_model.encoder.decode(z_full_pred)
-            loss = ((x_pred - x_target) ** 2).mean()
-    else:
-        raise ValueError(loss_type)
+    g_obs = torch.autograd.grad(
+        obs_loss, captured, retain_graph=True, allow_unused=True,
+    )
+    g_lat = torch.autograd.grad(
+        lat_loss, captured, retain_graph=False, allow_unused=True,
+    )
 
-    # NOTE: z_prime ≡ z_tgt_dyn at the linearization point, so ∂L/∂z' is
-    # the gradient *direction*, not a residual. For obs loss this isolates
-    # the decoder pull-back; for latent it's exactly zero (z_prime − z_tgt = 0).
-    # That's a feature of the diagnostic: latent loss has trivially zero
-    # gradient at the target, so we offset z_prime slightly so the gradient
-    # lives along a representative direction. Done by re-anchoring at z_in_dyn:
-    # what would the gradient be if we predicted z_in_dyn instead of z_tgt_dyn?
-    # That makes z_prime − z_tgt = z_in − z_tgt (= the per-step latent
-    # increment), which is the realistic prediction error.
+    def agg(grads):
+        # Each g has shape (..., D, D). Stack last-2 dims, abs-mean over the rest.
+        flat = []
+        for g in grads:
+            if g is None:
+                continue
+            flat.append(g.reshape(-1, g.shape[-2], g.shape[-1]).abs())
+        if not flat:
+            return None
+        cat = torch.cat(flat, dim=0)
+        return cat.mean(dim=0)  # (D, D)
 
-    # Override: re-do with z_prime = z_in_dyn so loss has nontrivial gradient.
-    z_prime = z_in_dyn.detach().clone().requires_grad_(True)
-    if loss_type == "latent":
-        loss = ((z_prime - z_tgt_dyn) ** 2).mean()
-    elif loss_type == "obs":
-        if not has_enc:
-            loss = ((z_prime - x_target) ** 2).mean()
-        else:
-            if z_in_null is not None and z_in_null.shape[-1] > 0:
-                z_full_pred = torch.cat([z_prime, z_in_null], dim=-1)
-            else:
-                z_full_pred = z_prime
-            x_pred = lit_model.encoder.decode(z_full_pred)
-            loss = ((x_pred - x_target) ** 2).mean()
-
-    grad_zp = torch.autograd.grad(loss, z_prime)[0]  # (B, T, D)
-
-    # Outer-product into (D × D): grad-on-J[i, j] = E[ grad_zp[..., i] * z_in_dyn[..., j] ]
-    B, T, D = z_in_dyn.shape
-    flat_g = grad_zp.reshape(-1, D)
-    flat_z = z_in_dyn.reshape(-1, D)
-    grad_J = (flat_g.unsqueeze(2) * flat_z.unsqueeze(1)).mean(dim=0)  # (D, D)
-    return grad_J.detach()
+    return agg(g_obs), agg(g_lat)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--wandb-entity", required=True)
     parser.add_argument("--wandb-project", required=True)
-    parser.add_argument("--groups", required=True,
-                        help="Comma-separated wandb group names")
+    parser.add_argument("--groups", required=True)
     parser.add_argument("--save-dir", required=True)
     parser.add_argument("--reports-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--area-split", type=int, default=64)
     parser.add_argument("--n-trajectories", type=int, default=16)
+    parser.add_argument("--alpha", type=float, default=0.5,
+                        help="Teacher-forcing alpha for trajectory_model_step (0..1)")
     parser.add_argument("--stages", default="init,trained")
-    parser.add_argument("--loss-types", default="obs,latent")
     parser.add_argument("--tag", default=None)
     args = parser.parse_args(argv)
 
@@ -166,8 +137,8 @@ def main(argv: list[str] | None = None) -> int:
     import matplotlib.pyplot as plt
     import numpy as np
     import torch
-
     from hydra.utils import instantiate
+
     from JacobianODE.jacobians.checkpoints.loader import load_run
     from JacobianODE.jacobians.core.reproducibility import seed_everything
 
@@ -179,13 +150,11 @@ def main(argv: list[str] | None = None) -> int:
 
     groups = [g.strip() for g in args.groups.split(",") if g.strip()]
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
-    loss_types = [s.strip() for s in args.loss_types.split(",") if s.strip()]
-    logger.info(f"groups={groups}  stages={stages}  losses={loss_types}  device={device}")
+    logger.info(f"groups={groups}  stages={stages}  alpha={args.alpha}  device={device}")
 
     rows: list[dict] = []
 
     for group in groups:
-        # Pick chosen-best run id from the published metrics.json
         mp = reports_dir / args.wandb_project / group / "metrics.json"
         if not mp.is_file():
             logger.warning(f"  no metrics.json at {mp}; skipping {group}")
@@ -205,52 +174,49 @@ def main(argv: list[str] | None = None) -> int:
                     generate_data=True, verbose=False, return_full_obs=False,
                 )
                 run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
-                # NOTE: load_run always calls load_checkpoint internally, so
-                # lit_model now has the TRAINED encoder. For "init" stage we
-                # swap the encoder for a fresh one built from the same cfg
-                # (re-seeded so the random init matches what training would
-                # have started from). Only the encoder/decoder are used by
-                # this diagnostic — the dynamics MLP is never run — so we
-                # don't need to rebuild anything else.
+                # load_run loads ckpt by default; for "init" rebuild encoder
                 if stage == "init":
                     seed = (cfg.data.flow.random_state
                             + cfg.training.run_number + 1)
                     seed_everything(seed)
                     n_input = trajs["train_trajs"].sequence.shape[-1]
-                    fresh_encoder = instantiate(cfg.model.encoder, n_input=n_input)
+                    fresh_encoder = _instantiate_encoder(cfg, n_input, instantiate)
                     lit_model.encoder = fresh_encoder
-                lit_model = lit_model.to(device).eval()
-
-                n_dyn = getattr(lit_model, "n_target_dims", None)
-                if n_dyn is None:
-                    n_dyn = trajs["train_trajs"].sequence.shape[-1]
-                logger.info(f"  stage={stage}  n_dyn={n_dyn}")
+                lit_model = lit_model.to(device).train()  # train mode for full graph
+                # Make sure ALL params allow grad (we don't actually update them,
+                # but the autograd graph needs them).
+                for p in lit_model.parameters():
+                    p.requires_grad_(True)
 
                 seq = trajs.get("train_trajs", trajs["test_trajs"]).sequence
                 batch = seq[: args.n_trajectories].to(device).float()
-                x_in, x_tgt = batch[..., :-1, :], batch[..., 1:, :]
 
-                for loss_type in loss_types:
-                    has_enc = hasattr(lit_model, "encoder") and lit_model.encoder is not None
-                    if loss_type == "latent" and not has_enc:
-                        logger.info(f"    skip latent loss (no encoder)")
-                        continue
-                    grad_J = _compute_grad_on_J(
-                        lit_model, x_in, x_tgt,
-                        loss_type=loss_type, n_dyn=int(n_dyn),
-                    )
-                    bn = _block_norms(grad_J, args.area_split)
+                G_obs, G_lat = _measure_grad_on_J(lit_model, batch, alpha=args.alpha)
+                if G_obs is None and G_lat is None:
+                    logger.warning(f"  stage={stage}: no captured Jacobians")
+                    continue
+
+                bn_obs = _block_norms(G_obs, args.area_split) if G_obs is not None else None
+                bn_lat = _block_norms(G_lat, args.area_split) if G_lat is not None else None
+                if bn_obs is not None:
+                    rows.append(dict(group=group, run_id=run_id, stage=stage,
+                                     loss_type="obs", block_norms=bn_obs,
+                                     n_dyn=int(G_obs.shape[-1])))
                     logger.info(
-                        f"    loss={loss_type}  "
-                        f"vv={bn['vv']:.3e}  vc={bn['vc']:.3e}  "
-                        f"cv={bn['cv']:.3e}  cc={bn['cc']:.3e}"
+                        f"  {stage} obs:    "
+                        f"vv={bn_obs['vv']:.3e}  vc={bn_obs['vc']:.3e}  "
+                        f"cv={bn_obs['cv']:.3e}  cc={bn_obs['cc']:.3e}  "
+                        f"(max: vv={bn_obs['vv_max']:.2e}, cc={bn_obs['cc_max']:.2e})"
                     )
-                    rows.append({
-                        "group": group, "run_id": run_id,
-                        "stage": stage, "loss_type": loss_type,
-                        "block_norms": bn,
-                        "n_dyn": int(n_dyn),
-                    })
+                if bn_lat is not None:
+                    rows.append(dict(group=group, run_id=run_id, stage=stage,
+                                     loss_type="latent", block_norms=bn_lat,
+                                     n_dyn=int(G_lat.shape[-1])))
+                    logger.info(
+                        f"  {stage} latent: "
+                        f"vv={bn_lat['vv']:.3e}  vc={bn_lat['vc']:.3e}  "
+                        f"cv={bn_lat['cv']:.3e}  cc={bn_lat['cc']:.3e}"
+                    )
             except Exception as e:
                 logger.exception(f"  {stage} FAILED for {group}: {e}")
             finally:
@@ -266,8 +232,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("No results.")
         return 1
 
-    # ---- Plot: 2 rows (stages) × 2 cols (loss types), bars per block per group ----
-    n_rows = len(stages); n_cols = len(loss_types)
+    # Plot: 2 stages x 2 losses, bars per block per group
+    n_rows = len(stages); n_cols = 2
+    loss_types = ["obs", "latent"]
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.5 * n_cols, 4.0 * n_rows),
                               squeeze=False, sharey=False)
     blocks = ["vv", "vc", "cv", "cc"]
@@ -276,21 +243,19 @@ def main(argv: list[str] | None = None) -> int:
     for r_i, stage in enumerate(stages):
         for c_i, loss_type in enumerate(loss_types):
             ax = axes[r_i][c_i]
-            cell_rows = [row for row in rows
-                         if row["stage"] == stage and row["loss_type"] == loss_type]
-            if not cell_rows:
+            cell = [r for r in rows if r["stage"] == stage and r["loss_type"] == loss_type]
+            if not cell:
                 ax.text(0.5, 0.5, "no data", ha="center", va="center",
                         transform=ax.transAxes)
                 ax.set_title(f"{stage} · {loss_type}", fontsize=10)
                 continue
             x = np.arange(len(blocks))
-            width = 0.8 / max(len(cell_rows), 1)
-            for g_i, row in enumerate(cell_rows):
-                vals = [row["block_norms"][b] for b in blocks]
-                offset = (g_i - (len(cell_rows) - 1) / 2) * width
-                color = cmap(g_i % 10)
-                lbl = row["group"][:30] + ("…" if len(row["group"]) > 30 else "")
-                ax.bar(x + offset, vals, width, color=color, label=lbl)
+            width = 0.8 / max(len(cell), 1)
+            for g_i, r in enumerate(cell):
+                vals = [r["block_norms"][b] for b in blocks]
+                offset = (g_i - (len(cell) - 1) / 2) * width
+                lbl = r["group"][:30] + ("…" if len(r["group"]) > 30 else "")
+                ax.bar(x + offset, vals, width, color=cmap(g_i % 10), label=lbl)
             ax.set_xticks(x)
             ax.set_xticklabels(block_labels, fontsize=9)
             ax.set_yscale("log")
@@ -301,10 +266,9 @@ def main(argv: list[str] | None = None) -> int:
                 ax.legend(fontsize=7, loc="best")
 
     fig.suptitle(
-        "Gradient signal at the dynamics MLP, per area-block — outer-product "
-        "decomposition\nE[ ∂L/∂z'[i] · z[j] ]; off-diagonals = signal asking the MLP "
-        "to learn cross-area structure",
-        y=1.02,
+        f"∂L/∂J_f (dynamics-MLP output) per area-block — measured via "
+        f"trajectory_model_step (α={args.alpha})",
+        y=1.01,
     )
     fig.tight_layout()
 
