@@ -189,14 +189,20 @@ class TestAtomicUpdate:
 
 class TestApplyMigration:
     def test_updates_slurm_arrays_and_partition_per_cell(self):
+        """_apply_migration must update slurm_arrays + partition_per_cell
+        + migrations counter ONLY. Top-level expected.slurm must NOT
+        change — it's read by monitor.resubmit_run for every cell, and
+        leaking one migrated cell's partition into the rest causes
+        ALL retries to land on mit (saturating QOS for unrelated cells).
+        """
         e = _make_expected(n_cells=4)
+        original_slurm = dict(e["slurm"])
         _apply_migration(e, 2, "9999", MIT_NORMAL_GPU)
         assert e["slurm_arrays"]["2"] == "9999"
         assert e["partition_per_cell"]["2"] == "mit_normal_gpu"
-        # Top-level slurm partition updated so monitor retries inherit
-        assert e["slurm"]["partition"] == "mit_normal_gpu"
-        assert e["slurm"]["account"] == "mit_amf_advanced_gpu"
-        assert e["slurm"]["qos"] == "mit_amf_advanced_gpu"
+        # Top-level slurm UNCHANGED — per-cell partition lives in
+        # partition_per_cell, NOT here.
+        assert e["slurm"] == original_slurm
         # Migration counter
         assert e["migrations"]["2"] == 1
 

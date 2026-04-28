@@ -248,6 +248,13 @@ def _values_match(wanted, actual) -> bool:
     return wanted == actual
 
 
+def _strip_hydra_prefix(key: str) -> str:
+    """Strip Hydra add/delete-key prefixes (``+``, ``~``, ``++``) before
+    looking the key up in a resolved wandb config — those prefixes are
+    consumed by Hydra and don't appear in the resolved cfg."""
+    return key.lstrip("+~")
+
+
 def _is_matchable_override(ov: str) -> bool:
     """An override is matchable against a wandb run's config if it targets
     a training-visible key. Hydra consumes ``hydra.*`` and ``experiment=...``
@@ -255,7 +262,7 @@ def _is_matchable_override(ov: str) -> bool:
     present in the wandb config and would cause spurious non-matches."""
     if "=" not in ov:
         return False
-    key = ov.split("=", 1)[0]
+    key = _strip_hydra_prefix(ov.split("=", 1)[0])
     if key.startswith("hydra."):
         return False
     if key == "experiment":
@@ -305,7 +312,10 @@ def match_run_to_idx(wandb_config: dict, resolved_runs: list) -> int | None:
         if all(
             _values_match(
                 _coerce(ov.split("=", 1)[1]),
-                _get_nested(wandb_config, ov.split("=", 1)[0]),
+                _get_nested(
+                    wandb_config,
+                    _strip_hydra_prefix(ov.split("=", 1)[0]),
+                ),
             )
             for ov in filtered_overrides
         ):

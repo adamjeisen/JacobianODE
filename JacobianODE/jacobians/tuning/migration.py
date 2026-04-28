@@ -128,19 +128,17 @@ def _atomic_update_json(path: Path, mutator) -> None:
 
 def _apply_migration(expected: dict, run_idx: int, new_task_id: str,
                      new_partition: PartitionSpec) -> None:
-    """In-place mutation: update slurm_arrays + slurm partition + per-cell
-    partition map + bump migration counter."""
+    """In-place mutation: update slurm_arrays + per-cell partition map +
+    bump migration counter.
+
+    DO NOT mutate top-level ``expected.slurm`` — that block is read by
+    monitor.resubmit_run for ALL cells in the sweep, so changing it for
+    one migrated cell leaks the partition into every other cell's retry
+    path. Per-cell partition fidelity is preserved by ``partition_per_cell``;
+    monitor.resubmit_run should consult that for migrated cells (TODO).
+    """
     expected.setdefault("slurm_arrays", {})[str(run_idx)] = new_task_id
-    # Update top-level slurm so monitor.resubmit_run uses the migrated
-    # partition for any future retries (Q2 decision: cap=1, retries inherit).
-    slurm = expected.setdefault("slurm", {})
-    slurm["partition"] = new_partition.partition
-    slurm["account"] = new_partition.account
-    slurm["qos"] = new_partition.qos
-    slurm["gres"] = new_partition.gres
-    # Per-cell partition map so subsequent migration cycles know which
-    # cells are still on ou_bcs_normal vs already on mit. This is the
-    # canonical "where is each cell" record.
+    # Per-cell partition map: the canonical "where is each cell" record.
     pcp = expected.setdefault("partition_per_cell", {})
     pcp[str(run_idx)] = new_partition.partition
     # Audit counter
