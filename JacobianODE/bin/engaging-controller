@@ -547,9 +547,77 @@ def _submit_one_split(
         log(f"[{exp}] WARN: {len(sbatch_failures)} cells failed to submit; "
             f"continuing with the {len(slurm_arrays)} that did")
 
-    # 4. Finalize expected.json.
+    # 4. Finalize expected.json — EXTEND if file already exists for this
+    #    group (same as legacy _submit_one's extend behaviour). Stage B
+    #    dispatches each survivor as a SEPARATE instruction with shared
+    #    wandb_group; without this merge, each instruction would overwrite
+    #    the previous one's expected.json and we'd lose all but the last
+    #    cell.
     SWEEPS_DIR.joinpath("active").mkdir(parents=True, exist_ok=True)
     final_expected = SWEEPS_DIR / "active" / f"{group}.expected.json"
+
+    if final_expected.is_file():
+        old = json.loads(final_expected.read_text())
+        old_runs = old.get("hydra", {}).get("resolved_runs", [])
+        old_slurm_arrays = old.get("slurm_arrays", {}) or {}
+        old_partition_per_cell = old.get("partition_per_cell", {}) or {}
+        next_idx = max(
+            (r["run_idx"] for r in old_runs), default=-1
+        ) + 1
+        # Re-index this submission's resolved_runs onto the new index
+        # space so they don't collide with cells already in expected.json.
+        merged_runs = list(old_runs)
+        merged_slurm_arrays = dict(old_slurm_arrays)
+        merged_partition_per_cell = dict(old_partition_per_cell)
+        for r in resolved_runs:
+            offset_idx = next_idx + r["run_idx"]
+            merged_runs.append({**r, "run_idx": offset_idx})
+            # slurm_arrays + partition_per_cell were keyed on the
+            # PRE-OFFSET run_idx in this submission. Rekey to the new idx.
+            old_key = str(r["run_idx"])
+            new_key = str(offset_idx)
+            if old_key in slurm_arrays:
+                merged_slurm_arrays[new_key] = slurm_arrays[old_key]
+            if old_key in partition_per_cell:
+                merged_partition_per_cell[new_key] = partition_per_cell[old_key]
+        merged = dict(old)
+        merged.setdefault("hydra", {})["resolved_runs"] = merged_runs
+        merged["slurm_arrays"] = merged_slurm_arrays
+        merged["partition_per_cell"] = merged_partition_per_cell
+        merged["expected_run_count"] = len(merged_runs)
+        # Carry through latest two_stage / migrate_to values (in case the
+        # submitter intends to update them; for Stage B they're identical).
+        if two_stage:
+            merged["two_stage"] = two_stage
+        merged["migrate_to"] = migrate_to
+        # Keep top-level slurm as ou_bcs for retry-safety (see comment below).
+        merged["slurm"] = {
+            "partition": OU_BCS_NORMAL.partition,
+            "gres": OU_BCS_NORMAL.gres,
+            "cpus_per_task": OU_BCS_NORMAL.cpus_per_task,
+            "mem": OU_BCS_NORMAL.mem,
+            "timeout_min": OU_BCS_NORMAL.timeout_min,
+        }
+        # Atomic write.
+        tmp_final = final_expected.with_suffix(final_expected.suffix + ".tmp")
+        tmp_final.write_text(json.dumps(merged, indent=2) + "\n")
+        os.replace(str(tmp_final), str(final_expected))
+        expected_path.unlink(missing_ok=True)
+        log(f"[{exp}] split-extend {group}: +{len(resolved_runs)} cells "
+            f"(total now {len(merged_runs)})")
+        return {
+            "wandb_group": group,
+            "expected_run_count": len(merged_runs),
+            "slurm_array_id": "split-extend",
+            "slurm_submitted_at": utc_iso(),
+            "split_submission": {
+                "mit_count": mit_count,
+                "ou_bcs_count": n_total - mit_count,
+                "n_failures": len(sbatch_failures),
+            },
+        }
+
+    # Fresh-write path (this group's first submission).
     expected["slurm_arrays"] = slurm_arrays
     expected["partition_per_cell"] = partition_per_cell
     # Top-level slurm block: record OU_BCS_NORMAL as the "default" because
