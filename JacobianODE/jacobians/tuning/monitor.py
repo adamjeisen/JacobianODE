@@ -680,7 +680,14 @@ def check_sweep(expected_path: Path, sweeps_dir: Path) -> None:
 
     # Fold in SLURM states for monitor-retry jobs we've tracked (still used by
     # the resubmit loop below to decide whether a retry is already queued).
-    for entry in state["runs"].values():
+    # Also populate last_slurm_state from the CANONICAL task_id (slurm_arrays)
+    # so cells that have never had a monitor-retry still get a real-time
+    # SLURM state recorded — needed by the migration system's candidate
+    # filter, which uses last_slurm_state to identify PENDING ou_bcs cells.
+    for k, entry in state["runs"].items():
+        canon = _slurm_task_id(slurm_arrays, k)
+        if canon is not None and canon in slurm_states:
+            entry["last_slurm_state"] = slurm_states[canon]
         for jid in entry["slurm_job_ids"]:
             if jid in slurm_states:
                 entry["last_slurm_state"] = slurm_states[jid]

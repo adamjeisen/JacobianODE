@@ -101,6 +101,15 @@ class TestIsCleanForMigration:
         assert not eligible
         assert "not_pending" in reason
 
+    def test_none_last_state_eligible(self):
+        """last_slurm_state==None is permitted (not all monitor versions
+        populate it for the canonical task). migrate_one re-checks via
+        real-time squeue before acting."""
+        state = _make_state()
+        state["runs"]["0"]["last_slurm_state"] = None
+        eligible, _ = _is_clean_for_migration(state["runs"], 0)
+        assert eligible
+
     def test_terminal_classification_skipped(self):
         for cls in ("done_finished", "done_walltime", "failed_exhausted"):
             state = _make_state()

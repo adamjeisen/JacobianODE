@@ -215,9 +215,16 @@ def _is_clean_for_migration(state_runs: dict, run_idx: int) -> tuple[bool, str]:
     cls = s.get("classification") or ""
     if cls.startswith("done_") or cls == "failed_exhausted":
         return False, f"terminal_classification_{cls}"
-    # Last seen SLURM state must be PENDING (PD)
+    # Last seen SLURM state should be PENDING (PD) when known.
+    # ``None`` is allowed because monitor's last_slurm_state is only
+    # populated when squeue has been queried for this exact task_id; for
+    # cells that have never been migrated/retried, this can be None even
+    # when the task IS pending in squeue. ``migrate_one`` re-checks via
+    # real-time _squeue_state before acting, so allowing None here is
+    # safe — worst case is we attempt a migration that aborts cleanly
+    # because the cell is no longer PD.
     last_state = (s.get("last_slurm_state") or "").upper()
-    if last_state not in {"PENDING", "PD"}:
+    if last_state and last_state not in {"PENDING", "PD"}:
         return False, f"not_pending_{last_state}"
     return True, ""
 
