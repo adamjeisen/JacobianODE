@@ -120,7 +120,11 @@ def test_alive_task_resets_counter(sweep_paths):
         "_monitor_cycle": 2,
     })
 
-    state = _drive_cycle(sweep_paths, {"9999_0": "RUNNING"})
+    # Provide both the bare and suffix forms — production query_squeue_states
+    # synthesizes both as aliases. Tests that mock the squeue dict directly
+    # must mirror that or the new heuristic _slurm_task_id (bare for unique
+    # values) misses.
+    state = _drive_cycle(sweep_paths, {"9999": "RUNNING", "9999_0": "RUNNING"})
 
     assert state["runs"]["0"]["consecutive_missing_cycles"] == 0
     assert state["runs"]["0"]["classification"] == "running"
@@ -191,7 +195,8 @@ def test_alive_after_one_miss_resets(sweep_paths):
     })
 
     state = _drive_cycle(
-        sweep_paths, squeue_states={"9999_0": "RUNNING"},
+        sweep_paths,
+        squeue_states={"9999": "RUNNING", "9999_0": "RUNNING"},
         wandb_runs=[_wandb_run("wid_a", state="running")],
     )
 

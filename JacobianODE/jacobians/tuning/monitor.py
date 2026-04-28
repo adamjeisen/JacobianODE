@@ -74,19 +74,32 @@ DEFAULT_MISSING_CYCLES_THRESHOLD = 2
 def _slurm_task_id(slurm_arrays: dict, k: str) -> str | None:
     """Return the SLURM task_id for a run_idx, or None if not recorded.
 
-    Two stored formats are supported (the new format was introduced to fix
-    the EXTEND-path misalignment, where run_idx was offset from the new
-    array's task indices):
-      * legacy: slurm_arrays[k] = "<array_id>"           → task_id = "<array_id>_<k>"
-      * new:    slurm_arrays[k] = "<array_id>_<task_idx>" (already a task_id) → use as-is
+    Three stored formats are supported:
+      * legacy array: slurm_arrays[k] = "<array_id>" with the SAME value for
+        many k → task_id = "<array_id>_<k>"
+      * new array:    slurm_arrays[k] = "<array_id>_<task_idx>" (already a
+        task_id) → use as-is
+      * split-submit standalone: slurm_arrays[k] = "<bare_jobid>" UNIQUE per
+        k (one sbatch per cell, no array) → use bare value as-is, since
+        squeue returns bare jobids for non-array submissions.
 
-    SLURM array_ids from sbatch are pure numeric, so the presence of "_"
-    unambiguously identifies the new format.
+    Distinguishes the legacy-array case from the split-submit case by
+    checking whether the same bare value appears for multiple cells: legacy
+    arrays share an array_id across all cells; split submissions assign
+    distinct jobids per cell.
     """
     val = slurm_arrays.get(k)
     if val is None:
         return None
-    return val if "_" in val else f"{val}_{k}"
+    if "_" in val:
+        return val   # already a task_id
+    # Bare jobid — could be legacy array or split-submit standalone.
+    same_val_count = sum(1 for v in slurm_arrays.values() if v == val)
+    if same_val_count > 1:
+        # Many cells share this bare ID → it's an array_id, append task idx.
+        return f"{val}_{k}"
+    # Unique bare ID for this cell → standalone job, use as-is.
+    return val
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +169,7 @@ def query_squeue_states(user: str = "eisenaj") -> dict[str, str]:
     except (subprocess.CalledProcessError, FileNotFoundError):
         return {}
     result: dict[str, str] = {}
+    suffix_only_seen: dict[str, list[tuple[str, str]]] = {}
     for line in output.strip().split("\n"):
         if "|" not in line:
             continue
@@ -170,6 +184,23 @@ def query_squeue_states(user: str = "eisenaj") -> dict[str, str]:
         # canonical task_id form so per-slot lookups succeed.
         if "_" not in jid:
             result[f"{jid}_0"] = state
+        else:
+            # Track suffix-form jobs by their bare prefix so we can
+            # synthesize bare aliases for single-task arrays that DID
+            # show up in suffixed form (mirror of the bare→suffix alias
+            # above). Necessary so split-submit standalone jobs (whose
+            # _slurm_task_id resolves to the bare form for k>0) and
+            # legacy single-task arrays (whose _slurm_task_id resolves
+            # to suffix _0 form) BOTH work in the same sweep / lookup
+            # path. Multi-task arrays would be ambiguous so we skip them.
+            prefix = jid.rsplit("_", 1)[0]
+            suffix_only_seen.setdefault(prefix, []).append((jid, state))
+    for prefix, entries in suffix_only_seen.items():
+        # Only synthesize bare alias when there's exactly ONE task with
+        # this prefix AND no bare entry already exists (avoids stomping
+        # in either direction).
+        if len(entries) == 1 and prefix not in result:
+            result[prefix] = entries[0][1]
     return result
 
 
