@@ -907,14 +907,21 @@ def _maybe_dispatch_stage_b(group: str) -> None:
         "--cull-fraction", str(spec.get("cull_fraction", 0.5)),
         "--metric", spec.get("metric", "trajectory val_loss"),
     ]
-    # Stage B inherits migrate_to from Stage A's expected.json, so the
-    # full-budget runs also use dynamic mit↔ou_bcs allocation.
+    # Read additional fields from Stage A's expected.json:
+    # - migrate_to: inherit dynamic mit↔ou_bcs allocation into Stage B.
+    # - experiment: pass explicitly to avoid the cull tool's wandb-config
+    #   fallback that constructs "experiment=<group>" (which has the
+    #   __stage_a suffix, doesn't exist as a YAML, makes prepare_sweep crash).
     try:
-        migrate_to = json.loads(expected_path.read_text()).get("migrate_to")
+        ep_doc = json.loads(expected_path.read_text())
     except Exception:
-        migrate_to = None
+        ep_doc = {}
+    migrate_to = ep_doc.get("migrate_to")
     if migrate_to:
         cmd.extend(["--migrate-to-json", json.dumps(migrate_to)])
+    resolved_runs = ep_doc.get("hydra", {}).get("resolved_runs", [])
+    if resolved_runs and resolved_runs[0].get("experiment"):
+        cmd.extend(["--experiment", resolved_runs[0]["experiment"]])
     log(f"[two_stage {group}] auto-dispatching cull: {' '.join(cmd)}")
     try:
         run(cmd, cwd=JACODE_REPO, check=True)

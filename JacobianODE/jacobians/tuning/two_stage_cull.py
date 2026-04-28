@@ -227,6 +227,13 @@ def _experiment_from_run(run) -> str | None:
     ``cfg.metadata.experiment`` (or just ``cfg.experiment``); fall back
     to the wandb group name if neither is present (some Hydra configs
     don't surface the experiment name into the resolved cfg).
+
+    NOTE: The wandb-group fallback is only safe when group name == YAML
+    name. For two-stage groups (e.g. ``..._sweep__stage_a``), the group
+    has a ``__stage_a`` suffix that doesn't exist as a YAML — using the
+    group as experiment name then makes prepare_sweep crash with
+    "No experiment YAML at ...". Prefer ``_experiment_from_local_expected``
+    when running on a host that has access to the SWEEPS_DIR.
     """
     cfg = dict(getattr(run, "config", {}) or {})
     md = cfg.get("metadata") or {}
@@ -235,6 +242,38 @@ def _experiment_from_run(run) -> str | None:
     if cfg.get("experiment"):
         return cfg["experiment"]
     return getattr(run, "group", None)
+
+
+def _experiment_from_local_expected(
+    group: str, sweeps_dir: Path | None = None,
+) -> str | None:
+    """Authoritative experiment-name lookup from Stage A's expected.json.
+
+    expected.json's ``hydra.resolved_runs[i].experiment`` is the actual
+    YAML name that ran (set by prepare_sweep at submission time). This
+    is more reliable than wandb-config heuristics, which can fall back
+    to the wandb group name (which has the ``__stage_a`` suffix and
+    doesn't exist as a YAML).
+    """
+    import os
+    if sweeps_dir is None:
+        sweeps_dir = Path(os.environ.get(
+            "SWEEPS_DIR",
+            "/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps",
+        ))
+    for sub in ("active", "done", "processed"):
+        ep = sweeps_dir / sub / f"{group}.expected.json"
+        if ep.is_file():
+            try:
+                doc = json.loads(ep.read_text())
+                runs = doc.get("hydra", {}).get("resolved_runs", [])
+                if runs:
+                    exp = runs[0].get("experiment")
+                    if exp:
+                        return exp
+            except Exception:
+                pass
+    return None
 
 
 def _resolve_project(api, group: str, project: str | None) -> str | None:
@@ -343,6 +382,13 @@ def main(argv: list[str] | None = None) -> int:
                              "set, bypasses j-submit and writes the "
                              "instruction file directly so the block is "
                              "included.")
+    parser.add_argument("--experiment", default=None,
+                        help="Override experiment name. If unset, looks up "
+                             "from Stage A's expected.json "
+                             "(hydra.resolved_runs[0].experiment), then "
+                             "falls back to wandb-config heuristics. The "
+                             "explicit override is required when running "
+                             "on a host without SWEEPS_DIR access.")
     args = parser.parse_args(argv)
 
     migrate_to_block = None
@@ -433,11 +479,19 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("no survivors with ckpts to dispatch; exiting")
         return 1
 
-    # Dispatch one j-submit per survivor. Each is a regular sweep submission.
-    experiment = _experiment_from_run(survivors[0])
+    # Resolve experiment name. Priority:
+    #   1. --experiment CLI override (explicit, controller passes this)
+    #   2. Stage A's expected.json hydra.resolved_runs[0].experiment
+    #   3. wandb-config heuristic (fallback only — can crash with
+    #      "No experiment YAML at <group>.yaml" for two-stage groups)
+    experiment = (
+        args.experiment
+        or _experiment_from_local_expected(args.group)
+        or _experiment_from_run(survivors[0])
+    )
     if not experiment:
-        logger.error("could not infer experiment name from first survivor; "
-                     "cannot j-submit. Aborting.")
+        logger.error("could not infer experiment name; pass --experiment "
+                     "explicitly. Aborting.")
         return 1
     logger.info(f"  dispatching {len(survivors_meta)} stage-B run(s) "
                 f"under experiment={experiment}"
