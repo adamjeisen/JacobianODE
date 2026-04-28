@@ -243,6 +243,7 @@ class LitBase(L.LightningModule):
                     scheduler_type='teacher_forcing',
                     min_lr=None,
                     k_scale=None,
+                    cosine_T_max=None,
                     jac_penalty=0.0,
                     jac_norm_ord='fro',
                     loop_closure_training=True,
@@ -339,6 +340,11 @@ class LitBase(L.LightningModule):
         self.scheduler_type = scheduler_type
         self.min_lr = min_lr
         self.k_scale = k_scale
+        # Decouples LR-schedule horizon from trainer.max_epochs. With
+        # two-stage training (Stage A short, Stage B long) the cosine should
+        # span the full horizon so Stage B picks up at the same LR Stage A
+        # left at. None falls back to trainer.max_epochs (legacy behavior).
+        self.cosine_T_max = cosine_T_max
         self.jac_penalty = jac_penalty
         self.jac_norm_ord = jac_norm_ord
         self.loop_closure_training = loop_closure_training
@@ -1016,9 +1022,10 @@ class LitBase(L.LightningModule):
 
         if self.use_scheduler:
             if self.scheduler_type == 'cosine':
+                t_max = self.cosine_T_max if self.cosine_T_max is not None else self.trainer.max_epochs
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=self.trainer.max_epochs,
+                    T_max=t_max,
                     eta_min=self.min_lr if self.min_lr is not None else 0,
                 )
                 return {

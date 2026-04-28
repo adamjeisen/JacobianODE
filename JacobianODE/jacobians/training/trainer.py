@@ -14,7 +14,7 @@ import torch
 import lightning as L
 import wandb
 from hydra.utils import instantiate
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
@@ -336,7 +336,7 @@ def train_model(
             mode=cfg.training.early_stopping.mode,
         )
 
-    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback()]
+    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback(), LearningRateMonitor(logging_interval='epoch')]
 
     # Optional: shadow checkpoint that freezes at a simulated smaller-
     # patience ES-trigger. Primary ES still controls when training stops;
