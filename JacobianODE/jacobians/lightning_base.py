@@ -19,6 +19,32 @@ from .metrics import mase, mse, r2_score, smape, normalized_mse, GeneralizedNorm
 from .teacher_forcing import get_alpha_exact, get_alpha_explogapprox, get_alpha_lyap
 
 
+# PyTorch 2.6+ changed the default of torch.load to weights_only=True, which
+# rejects pickles containing numpy scalar types (e.g. np.float64) unless they
+# are explicitly allowlisted. Stage A checkpoints saved by Lightning include
+# the LightningModule state and (historically) the TeacherForcingLRScheduler
+# state, both of which can contain numpy scalars. Allowlist the ones that
+# arise in practice so Stage B can resume from those checkpoints. We control
+# the checkpoints, so the security model that motivates weights_only=True
+# does not apply here.
+try:
+    import numpy._core.multiarray  # type: ignore[import-not-found]
+    torch.serialization.add_safe_globals([
+        np._core.multiarray.scalar,
+        np.dtype,
+        np.dtypes.Float64DType,
+        np.dtypes.Float32DType,
+        np.dtypes.Int64DType,
+        np.dtypes.Int32DType,
+        np.ndarray,
+    ])
+except (ImportError, AttributeError):
+    # Older numpy / older PyTorch — silently skip; weights_only loading
+    # may still fail and require explicit weights_only=False at the call
+    # site.
+    pass
+
+
 METRIC_DICT = {
     'mse': mse,
     'mase': mase,
@@ -65,7 +91,7 @@ class TeacherForcingLRScheduler(torch.optim.lr_scheduler._LRScheduler):
         self.start_lr = optimizer.param_groups[0]['lr']
         self.k = k
         super().__init__(optimizer)
-    
+
     def scale_factor(self, alpha):
         return alpha/(alpha + (1 - alpha)*np.exp(-self.k*alpha))
 
@@ -75,6 +101,28 @@ class TeacherForcingLRScheduler(torch.optim.lr_scheduler._LRScheduler):
         alpha = (alpha - self.lit_model.min_alpha_teacher_forcing)/(1 - self.lit_model.min_alpha_teacher_forcing)
         new_lr = self.min_lr + self.scale_factor(alpha) * (self.start_lr - self.min_lr)
         return [new_lr for _ in self.base_lrs]
+
+    def state_dict(self):
+        # Mirror the base class behaviour (which excludes ``optimizer``) and
+        # additionally exclude ``lit_model``: the LightningModule reference
+        # would otherwise be pickled into the scheduler state via the parent
+        # class's ``{k: v for k, v in self.__dict__.items() if k != 'optimizer'}``
+        # default, ballooning the checkpoint and embedding numpy scalars that
+        # PyTorch 2.6+ ``weights_only=True`` loaders refuse. The scheduler
+        # always re-acquires the LightningModule reference via the constructor
+        # in ``configure_optimizers`` on resume, so it does not need to be
+        # serialized.
+        return {
+            k: v for k, v in self.__dict__.items()
+            if k not in ("optimizer", "lit_model")
+        }
+
+    def load_state_dict(self, state_dict):
+        # Defensive: if a legacy checkpoint contains ``lit_model``, drop it on
+        # load so the in-memory reference set by ``__init__`` is not clobbered
+        # by the (potentially stale and wrong-typed) saved value.
+        clean = {k: v for k, v in state_dict.items() if k != "lit_model"}
+        self.__dict__.update(clean)
 
 def loop_closure(
         batch, 

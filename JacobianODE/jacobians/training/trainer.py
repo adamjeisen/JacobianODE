@@ -443,11 +443,20 @@ def train_model(
     )
 
     logger.info(f"Starting training run: {name}")
+    # weights_only=False: PyTorch 2.6+ defaults torch.load to weights_only=True,
+    # which rejects pickles containing numpy scalars / functions like
+    # numpy._core.multiarray.scalar. Stage A checkpoints in this codebase
+    # legitimately contain such objects (saved by Lightning callback state,
+    # legacy scheduler state, etc.). The checkpoints are produced and consumed
+    # by us on the same trusted infrastructure, so the security model that
+    # motivates weights_only=True does not apply. Pass False explicitly so
+    # ckpt_path resume succeeds; if ckpt_path_resume is None, this is a no-op.
     trainer.fit(
         model=lit_model,
         train_dataloaders=train_dataloaders,
         val_dataloaders=val_dataloaders,
         ckpt_path=ckpt_path_resume,
+        weights_only=False,
     )
 
     # Two-stage protocol: if this is a Stage A run (wandb_group ends in
