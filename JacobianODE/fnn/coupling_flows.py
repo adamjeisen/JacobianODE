@@ -63,6 +63,7 @@ def _build_conditioner(
     hidden_dim: int = 128,
     n_hidden_layers: int = 2,
     zero_init: bool = True,
+    near_identity_std: float = 0.0,
 ) -> nn.Sequential:
     """Build a small MLP used as the conditioner inside a coupling layer.
 
@@ -78,14 +79,25 @@ def _build_conditioner(
         Number of hidden layers (minimum 1).
     zero_init : bool
         If True, zero-initialise the last linear layer so the coupling layer
-        starts as the identity map.
+        starts as the identity map. Ignored when ``near_identity_std > 0``.
+    near_identity_std : float
+        If > 0, initialise the last layer's weight from ``N(0, near_identity_std)``
+        and zero the bias instead of a strict zero-init. The coupling layer is
+        then *approximately* the identity at init (output magnitude scales with
+        near_identity_std × ‖hidden activations‖), which gives the conditioner's
+        hidden weights a non-zero gradient on step 1 — they are stuck for one
+        step under strict zero_init. Default 0.0 preserves the strict zero-init
+        behaviour. Only takes effect when ``zero_init=True``.
     """
     layers: list[nn.Module] = [nn.Linear(input_dim, hidden_dim), nn.GELU()]
     for _ in range(n_hidden_layers - 1):
         layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.GELU()])
     last = nn.Linear(hidden_dim, output_dim)
     if zero_init:
-        nn.init.zeros_(last.weight)
+        if near_identity_std > 0:
+            nn.init.normal_(last.weight, mean=0.0, std=near_identity_std)
+        else:
+            nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
     layers.append(last)
     return nn.Sequential(*layers)
@@ -531,6 +543,7 @@ class AffineCouplingLayer(nn.Module):
         scale_activation: str = "tanh",
         scale_clamp: float = 3.0,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         clamp_type: str = "symmetric",
         alpha_pos: float = 0.1,
         alpha_neg: float = 2.0,
@@ -553,6 +566,7 @@ class AffineCouplingLayer(nn.Module):
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
         )
 
     # ----- helpers -----
@@ -652,6 +666,7 @@ class AdditiveCouplingLayer(nn.Module):
         hidden_dim: int = 128,
         n_hidden_layers: int = 2,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
     ) -> None:
         super().__init__()
         if split_dim is None:
@@ -667,6 +682,7 @@ class AdditiveCouplingLayer(nn.Module):
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
         )
 
     def forward(
@@ -742,6 +758,7 @@ class AdditiveFlow(nn.Module):
         n_hidden_layers: int = 2,
         permutation_seed: int = 0,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
     ) -> None:
         super().__init__()
         self.n_dims = n_dims
@@ -753,6 +770,7 @@ class AdditiveFlow(nn.Module):
                     hidden_dim=hidden_dim,
                     n_hidden_layers=n_hidden_layers,
                     zero_init=zero_init,
+                    near_identity_std=near_identity_std,
                 )
                 for _ in range(n_coupling_layers)
             ]
@@ -838,6 +856,7 @@ class SplineCouplingLayer(nn.Module):
         num_bins: int = 8,
         tail_bound: float = 3.0,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
     ) -> None:
         super().__init__()
         if split_dim is None:
@@ -856,6 +875,7 @@ class SplineCouplingLayer(nn.Module):
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
         )
 
     def _get_spline_params(
@@ -942,6 +962,7 @@ class AnalyticCouplingLayer(nn.Module):
         hidden_dim: int = 128,
         n_hidden_layers: int = 2,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
     ) -> None:
         super().__init__()
         if split_dim is None:
@@ -963,6 +984,7 @@ class AnalyticCouplingLayer(nn.Module):
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
         )
 
     def _get_params(self, x_a: torch.Tensor) -> torch.Tensor:
@@ -1232,6 +1254,7 @@ class AffineCouplingEncoder(nn.Module):
         scale_activation: str = "tanh",
         scale_clamp: float = 3.0,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         permutation_seed: int = 0,
         clamp_type: str = "symmetric",
         alpha_pos: float = 0.1,
@@ -1256,6 +1279,7 @@ class AffineCouplingEncoder(nn.Module):
                     scale_activation=scale_activation,
                     scale_clamp=scale_clamp,
                     zero_init=zero_init,
+                    near_identity_std=near_identity_std,
                     clamp_type=clamp_type,
                     alpha_pos=alpha_pos,
                     alpha_neg=alpha_neg,
@@ -1422,6 +1446,7 @@ class CouplingEncoder(nn.Module):
         hidden_dim: int = 128,
         n_hidden_layers: int = 2,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         permutation_seed: int = 0,
         use_loft: bool = False,
         loft_tau: float = 100.0,
@@ -1461,6 +1486,7 @@ class CouplingEncoder(nn.Module):
                         scale_activation=scale_activation,
                         scale_clamp=scale_clamp,
                         zero_init=zero_init,
+                        near_identity_std=near_identity_std,
                         clamp_type=clamp_type,
                         alpha_pos=alpha_pos,
                         alpha_neg=alpha_neg,
@@ -1474,6 +1500,7 @@ class CouplingEncoder(nn.Module):
                         hidden_dim=hidden_dim,
                         n_hidden_layers=n_hidden_layers,
                         zero_init=zero_init,
+                        near_identity_std=near_identity_std,
                     )
                 )
             elif coupling_type == "spline":
@@ -1486,6 +1513,7 @@ class CouplingEncoder(nn.Module):
                         num_bins=num_bins,
                         tail_bound=tail_bound,
                         zero_init=zero_init,
+                        near_identity_std=near_identity_std,
                     )
                 )
             elif coupling_type in _ANALYTIC_BIJECTIONS:
@@ -1497,6 +1525,7 @@ class CouplingEncoder(nn.Module):
                         hidden_dim=hidden_dim,
                         n_hidden_layers=n_hidden_layers,
                         zero_init=zero_init,
+                        near_identity_std=near_identity_std,
                     )
                 )
             else:
@@ -1751,6 +1780,7 @@ class DirectSumCouplingEncoder(nn.Module):
         hidden_dim: int = 128,
         n_hidden_layers: int = 2,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         use_actnorm: bool = False,
         permutation_seed_base: int = 0,
         use_loft: bool = False,
@@ -1811,6 +1841,7 @@ class DirectSumCouplingEncoder(nn.Module):
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
             use_actnorm=use_actnorm,
             use_loft=use_loft,
             loft_tau=loft_tau,
@@ -1985,6 +2016,7 @@ class MADE(nn.Module):
         n_hidden_layers: int = 2,
         output_dim_per_input: int = 1,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -2031,7 +2063,12 @@ class MADE(nn.Module):
                 mask = (d_in.unsqueeze(0) < d_out.unsqueeze(1)).float()
                 last = MaskedLinear(len(d_in), len(d_out), mask)
                 if zero_init:
-                    nn.init.zeros_(last.linear.weight)
+                    if near_identity_std > 0:
+                        nn.init.normal_(
+                            last.linear.weight, mean=0.0, std=near_identity_std
+                        )
+                    else:
+                        nn.init.zeros_(last.linear.weight)
                     nn.init.zeros_(last.linear.bias)
                 self.layers.append(last)
 
@@ -2095,6 +2132,7 @@ class SplineAutoregressiveLayer(nn.Module):
         num_bins: int = 8,
         tail_bound: float = 3.0,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -2111,6 +2149,7 @@ class SplineAutoregressiveLayer(nn.Module):
             n_hidden_layers=n_hidden_layers,
             output_dim_per_input=self._params_per_dim,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
             seed=seed,
         )
 
@@ -2245,6 +2284,7 @@ class SplineAutoregressiveEncoder(nn.Module):
         tail_bound: float = 3.0,
         use_actnorm: bool = True,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         permutation_seed: int = 0,
         use_loft: bool = False,
         loft_tau: float = 100.0,
@@ -2266,6 +2306,7 @@ class SplineAutoregressiveEncoder(nn.Module):
                     num_bins=num_bins,
                     tail_bound=tail_bound,
                     zero_init=zero_init,
+                    near_identity_std=near_identity_std,
                     seed=permutation_seed + i,
                 )
             )
@@ -2398,6 +2439,7 @@ class AnalyticAutoregressiveLayer(nn.Module):
         hidden_dim: int = 128,
         n_hidden_layers: int = 2,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -2415,6 +2457,7 @@ class AnalyticAutoregressiveLayer(nn.Module):
             n_hidden_layers=n_hidden_layers,
             output_dim_per_input=self._params_per_dim,
             zero_init=zero_init,
+            near_identity_std=near_identity_std,
             seed=seed,
         )
 
@@ -2502,6 +2545,7 @@ class AnalyticAutoregressiveEncoder(nn.Module):
         n_hidden_layers: int = 2,
         use_actnorm: bool = True,
         zero_init: bool = True,
+        near_identity_std: float = 0.0,
         permutation_seed: int = 0,
         use_loft: bool = False,
         loft_tau: float = 100.0,
@@ -2522,6 +2566,7 @@ class AnalyticAutoregressiveEncoder(nn.Module):
                     hidden_dim=hidden_dim,
                     n_hidden_layers=n_hidden_layers,
                     zero_init=zero_init,
+                    near_identity_std=near_identity_std,
                     seed=permutation_seed + i,
                 )
             )
