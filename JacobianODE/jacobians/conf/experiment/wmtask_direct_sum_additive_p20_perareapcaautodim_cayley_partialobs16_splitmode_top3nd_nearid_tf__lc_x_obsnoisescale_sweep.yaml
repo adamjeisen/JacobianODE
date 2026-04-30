@@ -24,7 +24,8 @@ metadata:
     cells, with two-stage Stage A → Stage B culling. Same encoder recipe
     as the full-obs Cayley pca_999 winner (DirectSum + per-area PCA-99
     autodim + Cayley orthogonal mixers + near-identity init + TF-coupled
-    LR + split-mode losses).
+    LR + split-mode losses), with prediction_steps=20 and seq_length=35
+    so n_delays up to 15 fits the 49-frame delay2 window.
   hypothesis: |
     With the top-3 n_delays already identified, this grid is the partial-obs
     analogue of the full-obs Cayley LC × obs_noise sweep that identified
@@ -47,14 +48,14 @@ sweep_grid:
 
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "wmtask_direct_sum_additive_p30_perareapcaautodim_cayley_partialobs16_splitmode_top3nd_nearid_tf__lc_x_obsnoisescale_sweep"
+wandb_group: "wmtask_direct_sum_additive_p20_perareapcaautodim_cayley_partialobs16_splitmode_top3nd_nearid_tf__lc_x_obsnoisescale_sweep"
 
 data:
   postprocessing:
     obs_noise: 0.05
     normalize: false
   train_test_params:
-    seq_length: 45
+    seq_length: 35                        # = 15 traj_init + 20 prediction; max n_delays = 49 - 35 + 1 = 15
     delay_embedding_params:
       observed_indices: 'random'
       n_observed_per_area: [16, 16]
@@ -68,7 +69,7 @@ data:
 model:
   n_target_dims: 32                       # fallback; overridden by per-area PCA-auto
   n_target_var_threshold: 0.99
-  prediction_steps: 30
+  prediction_steps: 20
   encoder_warmup_epochs: 0
   dynamics_warmup_epochs: 0
   use_vae: false
