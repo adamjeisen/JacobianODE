@@ -257,6 +257,89 @@ def resolve_observed_indices(cfg: DictConfig) -> None:
     logger.debug(log_msg)
 
 
+def resolve_partial_obs_area_indices(cfg: DictConfig) -> None:
+    """Auto-compute ``model.encoder.area_indices`` for partial-obs DirectSum sweeps.
+
+    When ``model.encoder.area_indices`` is the sentinel string
+    ``'auto_partial_obs'``, this function computes the area partition over
+    the **delay-embedded** observation vector positions, given:
+
+      - ``data.train_test_params.delay_embedding_params.n_observed_per_area``
+      - ``data.train_test_params.delay_embedding_params.n_delays``
+
+    Layout assumed (matches ``embed_signal_torch`` and the per-area output of
+    ``resolve_observed_indices``): each delay block contains
+    ``sum(n_observed_per_area)`` consecutive obs, with area i occupying the
+    positions ``[sum(n_per[:i]), sum(n_per[:i+1]))`` *within* each block.
+    Across delays, area i's positions are interleaved every
+    ``sum(n_per)`` indices.
+
+    Example for ``n_per=[12, 12]``, ``n_delays=3``:
+      area 0 (visual): ``[0..11, 24..35, 48..59]``
+      area 1 (cognitive): ``[12..23, 36..47, 60..71]``
+
+    Also auto-sets ``model.encoder.n_target_dims_per_block`` to
+    ``[n_per[i] * n_delays for i]`` (full target dim per area = per-area
+    input size, no null subspace) when that field is also the sentinel
+    ``'auto_partial_obs'``.
+
+    No-op if ``area_indices`` is anything other than the sentinel.
+
+    Args:
+        cfg: Configuration object (mutated in-place).
+
+    Raises:
+        ValueError: If the sentinel is set but the required data-side
+            fields (``n_observed_per_area``, ``n_delays``) are missing.
+    """
+    enc = cfg.model.get("encoder", None) if "model" in cfg else None
+    if enc is None or "area_indices" not in enc:
+        return
+    raw = enc.area_indices
+    if not (isinstance(raw, str) and raw == "auto_partial_obs"):
+        return
+
+    delay = cfg.data.train_test_params.delay_embedding_params
+    n_per_raw = delay.get("n_observed_per_area", None)
+    if n_per_raw is None:
+        raise ValueError(
+            "model.encoder.area_indices='auto_partial_obs' requires "
+            "data.train_test_params.delay_embedding_params.n_observed_per_area "
+            "to be set."
+        )
+    n_per = [int(x) for x in OmegaConf.to_container(n_per_raw, resolve=True)]
+    n_delays = int(delay.n_delays)
+    n_obs_per_block = sum(n_per)
+
+    area_indices: list[list[int]] = []
+    for i, k_i in enumerate(n_per):
+        offset_in_block = sum(n_per[:i])
+        idx: list[int] = []
+        for d in range(n_delays):
+            block_start = d * n_obs_per_block + offset_in_block
+            idx.extend(range(block_start, block_start + k_i))
+        area_indices.append(idx)
+
+    OmegaConf.update(
+        cfg, "model.encoder.area_indices", area_indices, force_add=True,
+    )
+
+    # Auto-resolve n_target_dims_per_block too if it carries the same sentinel.
+    raw_target = enc.get("n_target_dims_per_block", None)
+    if isinstance(raw_target, str) and raw_target == "auto_partial_obs":
+        OmegaConf.update(
+            cfg, "model.encoder.n_target_dims_per_block",
+            [k_i * n_delays for k_i in n_per],
+            force_add=True,
+        )
+
+    logger.debug(
+        f"Resolved 'auto_partial_obs' DirectSum area_indices: "
+        f"per_area_size={[len(a) for a in area_indices]} "
+        f"(n_per={n_per}, n_delays={n_delays})"
+    )
+
+
 def initialize_config(
     cfg: DictConfig,
     data_dim: Optional[int] = None,
@@ -299,6 +382,9 @@ def initialize_config(
 
     # Resolve observed_indices='random' into a concrete list before anything else
     resolve_observed_indices(cfg)
+    # Auto-compute DirectSum area_indices for partial-obs sweeps when
+    # the YAML used the 'auto_partial_obs' sentinel.
+    resolve_partial_obs_area_indices(cfg)
 
     # Set the lightning module target based on model
     if "encoder" in cfg.model:

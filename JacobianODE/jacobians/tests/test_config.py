@@ -7,7 +7,11 @@ import copy
 import pytest
 from omegaconf import OmegaConf
 
-from ..core.config import initialize_config, resolve_observed_indices
+from ..core.config import (
+    initialize_config,
+    resolve_observed_indices,
+    resolve_partial_obs_area_indices,
+)
 from ..core.reproducibility import seed_everything
 
 
@@ -325,3 +329,90 @@ class TestResolveObservedIndices:
         resolve_observed_indices(b)
         assert list(a.data.train_test_params.delay_embedding_params.observed_indices) \
             == list(b.data.train_test_params.delay_embedding_params.observed_indices)
+
+
+class TestResolvePartialObsAreaIndices:
+    """Tests for resolve_partial_obs_area_indices auto-resolver."""
+
+    @staticmethod
+    def _ds_cfg(n_per, n_delays, encoder_extras=None):
+        encoder = {"area_indices": "auto_partial_obs"}
+        if encoder_extras:
+            encoder.update(encoder_extras)
+        return OmegaConf.create({
+            "data": {
+                "data_type": "wmtask",
+                "flow": {"dim": 128, "random_state": 42},
+                "train_test_params": {
+                    "delay_embedding_params": {
+                        "observed_indices": [],   # placeholder, not exercised here
+                        "n_observed_per_area": n_per,
+                        "n_delays": n_delays,
+                    },
+                },
+            },
+            "model": {"encoder": encoder},
+        })
+
+    def test_n_delays_1_simple_partition(self):
+        cfg = self._ds_cfg([12, 12], n_delays=1)
+        resolve_partial_obs_area_indices(cfg)
+        ai = list(cfg.model.encoder.area_indices)
+        assert [list(a) for a in ai] == [list(range(0, 12)), list(range(12, 24))]
+
+    def test_n_delays_3_interleaved(self):
+        cfg = self._ds_cfg([12, 12], n_delays=3)
+        resolve_partial_obs_area_indices(cfg)
+        ai = [list(a) for a in cfg.model.encoder.area_indices]
+        # block size = 24; visual occupies positions [0..11], [24..35], [48..59]
+        # cognitive occupies [12..23], [36..47], [60..71]
+        assert ai[0] == [0,1,2,3,4,5,6,7,8,9,10,11,
+                         24,25,26,27,28,29,30,31,32,33,34,35,
+                         48,49,50,51,52,53,54,55,56,57,58,59]
+        assert ai[1] == [12,13,14,15,16,17,18,19,20,21,22,23,
+                         36,37,38,39,40,41,42,43,44,45,46,47,
+                         60,61,62,63,64,65,66,67,68,69,70,71]
+        # disjoint, total length = sum(n_per) * n_delays
+        flat = ai[0] + ai[1]
+        assert len(set(flat)) == len(flat)
+        assert sorted(flat) == list(range(72))
+
+    def test_unequal_per_area(self):
+        cfg = self._ds_cfg([5, 7], n_delays=2)
+        resolve_partial_obs_area_indices(cfg)
+        ai = [list(a) for a in cfg.model.encoder.area_indices]
+        # block size = 12; visual at [0..4], [12..16]; cognitive at [5..11], [17..23]
+        assert ai[0] == [0, 1, 2, 3, 4, 12, 13, 14, 15, 16]
+        assert ai[1] == [5, 6, 7, 8, 9, 10, 11, 17, 18, 19, 20, 21, 22, 23]
+
+    def test_n_target_dims_per_block_auto(self):
+        cfg = self._ds_cfg([12, 12], n_delays=3,
+                           encoder_extras={"n_target_dims_per_block": "auto_partial_obs"})
+        resolve_partial_obs_area_indices(cfg)
+        assert list(cfg.model.encoder.n_target_dims_per_block) == [36, 36]
+
+    def test_n_target_dims_per_block_explicit_preserved(self):
+        cfg = self._ds_cfg([12, 12], n_delays=3,
+                           encoder_extras={"n_target_dims_per_block": [16, 20]})
+        resolve_partial_obs_area_indices(cfg)
+        assert list(cfg.model.encoder.n_target_dims_per_block) == [16, 20]
+
+    def test_no_sentinel_is_noop(self):
+        cfg = self._ds_cfg([12, 12], n_delays=3)
+        cfg.model.encoder.area_indices = [[0, 1, 2], [3, 4, 5]]
+        resolve_partial_obs_area_indices(cfg)
+        assert [list(a) for a in cfg.model.encoder.area_indices] == [[0,1,2],[3,4,5]]
+
+    def test_sentinel_without_n_observed_per_area_errors(self):
+        cfg = OmegaConf.create({
+            "data": {
+                "data_type": "wmtask",
+                "flow": {"dim": 128, "random_state": 42},
+                "train_test_params": {"delay_embedding_params": {
+                    "observed_indices": "all", "n_delays": 1,
+                }},
+            },
+            "model": {"encoder": {"area_indices": "auto_partial_obs"}},
+        })
+        with pytest.raises(ValueError, match="n_observed_per_area"):
+            resolve_partial_obs_area_indices(cfg)

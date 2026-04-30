@@ -1,0 +1,109 @@
+# @package _global_
+#
+# Lorenz partial-obs (x-coordinate only, n_delays=100 → 100-D delay embedding),
+# split-mode loss (uniform reconstruction + trajectory_loss_most_recent),
+# PCA-autodim n_target_dims (threshold=0.99), additive coupling, near-identity
+# init, teacher-forcing-coupled LR scheduler. Two-stage protocol with dual ckpt.
+#
+# Companion to the lorenz_full3_additive_p30_nearid_tf sweep, but on PARTIAL
+# observations (single channel + delay embedding) with PCA autodim. Tests
+# whether the TF-coupled LR recipe transfers to the partial-obs regime.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial-obs, observed_indices=[0] (x only), n_delays=100,
+    delay_spacing=1. Encoder input 100-D. n_target_dims auto-picked
+    by PCA-99% on the delay-embedded training data (typically 3-5 for
+    clean Lorenz). Split-mode loss: reconstruction_mode='uniform' for
+    the round-trip term; trajectory_loss_most_recent=true so the
+    rollout target is the most-recent obs at each step.
+    Additive coupling, 8 layers, hidden_dim=128. near_identity_std=1e-3,
+    final_perm_identity=true. 21-cell sweep over 7 LC x 3 obs_noise_scale.
+    TF-coupled LR (k_scale=1, init 1e-4 -> min 1e-6 following TF alpha).
+    Two-stage with dual-checkpoint (ES patience=5, shadow patience=2).
+  hypothesis: |
+    Two questions in one sweep. (1) Does the TF-coupled LR recipe
+    transfer cleanly to the partial-obs regime? Phase A on the fully-
+    observed Lorenz showed best traj~7e-6 with this recipe; we expect
+    higher on partial-obs but the schedule shape should still produce
+    bounded gradients and good Lyapunov recovery. (2) Is n_delays=100
+    a useful working point — long enough to unfold the attractor cleanly
+    but not so long that the encoder wastes capacity on redundant dims?
+    Companion 25-D sweep tests the short end.
+  success_criteria:
+    - "All 21 cells train without divergence"
+    - "es2-best.ckpt and es5-best.ckpt both saved per cell"
+    - "Best run's leading Lyapunov exponent > 0; spectrum within ~30% of empirical"
+    - "Lyapunov spectrum NOT compressed in Stage B vs Stage A"
+    - "PCA-auto n_target_dims logged per cell (expect ~3-5)"
+
+sweep_grid:
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1"
+  training.lightning.obs_noise_scale: "0,0.01,0.05"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_N100_D1_NormTrue_T3__JacobianODE"
+wandb_group: "lorenz_partial_100d_split_p30_pcaautodim_nearid_tf__lc_x_obsnoisescale_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.0
+    normalize: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 100
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3                       # fallback; overridden by PCA-99% autodim
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    final_perm_identity: true
+    zero_init: true
+    near_identity_std: 1.0e-3
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 1000                     # overridden by two-stage protocol
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    optimizer_kwargs:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    scheduler_type: teacher_forcing
+    k_scale: 1
+    min_lr: 1.0e-6
+    loss_func: mse
+    loop_closure_weight: 1e-5            # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'       # split mode: uniform recon, most-recent rollout
+    obs_noise_scale: 0.0                 # overridden by sweep_grid
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    shadow_patience: 2
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01

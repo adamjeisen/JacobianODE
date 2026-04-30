@@ -94,6 +94,7 @@ from .core import (
     load_config,
     initialize_config,
     resolve_observed_indices,
+    resolve_partial_obs_area_indices,
     seed_everything,
     in_ipython,
 )
@@ -159,6 +160,7 @@ __all__ = [
     "load_config",
     "initialize_config",
     "resolve_observed_indices",
+    "resolve_partial_obs_area_indices",
     "seed_everything",
     "in_ipython",
     # Data
