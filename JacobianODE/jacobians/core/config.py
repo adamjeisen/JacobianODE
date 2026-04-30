@@ -121,9 +121,26 @@ def load_config(
 def resolve_observed_indices(cfg: DictConfig) -> None:
     """Resolve ``observed_indices='random'`` into a concrete list of indices.
 
-    When ``delay_embedding_params.observed_indices`` is ``'random'``, this
-    function randomly selects ``n_observed`` dimension indices and writes
-    them back into the config in-place.  The random seed defaults to
+    Two random-sampling modes are supported:
+
+    1. **Flat (single ``n_observed``).** Set ``n_observed`` to an int.
+       ``n_observed`` indices are chosen uniformly without replacement from
+       ``[0, total_dim)``, then sorted ascending. This is the legacy mode.
+
+    2. **Per-area.** Set ``n_observed_per_area`` (list[int]) and
+       ``obs_area_indices`` (list[list[int]]) to specify a partition of the
+       observation axis into N areas, each with its own count of observed
+       dims. Within each area, indices are sampled without replacement; the
+       per-area samples are concatenated **in the order given by
+       ``obs_area_indices``** and written back without sorting, so the
+       resulting ``observed_indices`` list has area structure
+       ``[area0_obs..., area1_obs..., ...]``. Use this when you need the
+       partial-observation vector to retain a clean per-area block layout
+       (e.g., for ``DirectSumCouplingEncoder.area_indices``, set those to
+       ``[[0..n_observed_per_area[0]-1], [n_observed_per_area[0]..., ...]]``
+       in the model config so each area's sub-encoder sees its own block).
+
+    The two modes are mutually exclusive. The random seed defaults to
     ``flow.random_state`` but can be overridden with ``partial_obs_seed``.
 
     For ``'all'`` or an explicit list, this is a no-op.
@@ -132,21 +149,35 @@ def resolve_observed_indices(cfg: DictConfig) -> None:
         cfg: Configuration object (mutated in-place).
 
     Raises:
-        ValueError: If ``n_observed`` is not set when ``observed_indices='random'``,
-            or if the total data dimensionality cannot be determined.
+        ValueError: If neither ``n_observed`` nor ``n_observed_per_area`` is
+            set when ``observed_indices='random'``, if both are set, if the
+            total data dimensionality cannot be determined, or if the
+            per-area config is malformed.
     """
     delay_params = cfg.data.train_test_params.delay_embedding_params
     if delay_params.observed_indices != "random":
         return
 
     n_observed = delay_params.get("n_observed", None)
-    if n_observed is None:
+    n_observed_per_area = delay_params.get("n_observed_per_area", None)
+    obs_area_indices = delay_params.get("obs_area_indices", None)
+
+    has_flat = n_observed is not None
+    has_per_area = n_observed_per_area is not None or obs_area_indices is not None
+    if has_flat and has_per_area:
         raise ValueError(
-            "observed_indices='random' requires "
-            "data.train_test_params.delay_embedding_params.n_observed to be set."
+            "observed_indices='random' got both `n_observed` and "
+            "`n_observed_per_area`/`obs_area_indices`. Pick one mode."
+        )
+    if not (has_flat or has_per_area):
+        raise ValueError(
+            "observed_indices='random' requires either "
+            "`data.train_test_params.delay_embedding_params.n_observed` "
+            "(flat) or `n_observed_per_area` + `obs_area_indices` (per-area)."
         )
 
-    # Determine total number of dimensions
+    # Determine total number of dimensions (used by the flat path and as a
+    # validation upper bound for the per-area path).
     if cfg.data.data_type == "dysts":
         eq = instantiate(cfg.data.flow)
         total_dim = eq._load_data()["embedding_dimension"]
@@ -166,7 +197,56 @@ def resolve_observed_indices(cfg: DictConfig) -> None:
     if seed is None:
         seed = cfg.data.flow.random_state
     rng = np.random.RandomState(int(seed))
-    indices = sorted(rng.choice(total_dim, int(n_observed), replace=False).tolist())
+
+    if has_flat:
+        indices = sorted(rng.choice(total_dim, int(n_observed), replace=False).tolist())
+        log_msg = (
+            f"Resolved random observed_indices (flat): {len(indices)} of "
+            f"{total_dim} dims (seed={seed})"
+        )
+    else:
+        # Per-area mode. Validate and sample.
+        if n_observed_per_area is None or obs_area_indices is None:
+            raise ValueError(
+                "Per-area mode requires BOTH `n_observed_per_area` and "
+                "`obs_area_indices` to be set."
+            )
+        n_per = list(OmegaConf.to_container(n_observed_per_area, resolve=True))
+        areas = OmegaConf.to_container(obs_area_indices, resolve=True)
+        if len(n_per) != len(areas):
+            raise ValueError(
+                f"len(n_observed_per_area)={len(n_per)} must equal "
+                f"len(obs_area_indices)={len(areas)}."
+            )
+        # Validate area indices: every entry in [0, total_dim), no duplicates.
+        flat_areas = [int(i) for a in areas for i in a]
+        if any(i < 0 or i >= total_dim for i in flat_areas):
+            raise ValueError(
+                f"obs_area_indices contains entries outside [0, {total_dim})."
+            )
+        if len(set(flat_areas)) != len(flat_areas):
+            raise ValueError("obs_area_indices contains duplicate dimension indices.")
+        # Per-area sampling. We do NOT sort the concatenation: the area block
+        # structure is preserved so model.encoder.area_indices can index into
+        # the resulting observation vector with simple contiguous slices.
+        indices: list[int] = []
+        for i, (k, area) in enumerate(zip(n_per, areas)):
+            k = int(k)
+            area_arr = np.asarray(area, dtype=int)
+            if k < 0 or k > len(area_arr):
+                raise ValueError(
+                    f"n_observed_per_area[{i}]={k} must be in "
+                    f"[0, {len(area_arr)}] (size of obs_area_indices[{i}])."
+                )
+            sampled = rng.choice(area_arr, k, replace=False)
+            # Sort within an area so per-area selection is order-stable for
+            # the same seed, but keep area order in the concatenation.
+            indices.extend(sorted(int(x) for x in sampled))
+        log_msg = (
+            f"Resolved random observed_indices (per-area): "
+            f"{[int(k) for k in n_per]} from areas of sizes "
+            f"{[len(a) for a in areas]} (seed={seed}); total={len(indices)}/{total_dim}"
+        )
 
     OmegaConf.update(
         cfg,
@@ -174,10 +254,7 @@ def resolve_observed_indices(cfg: DictConfig) -> None:
         indices,
         force_add=True,
     )
-    logger.debug(
-        f"Resolved random observed_indices: {len(indices)} of {total_dim} dims "
-        f"(seed={seed})"
-    )
+    logger.debug(log_msg)
 
 
 def initialize_config(
