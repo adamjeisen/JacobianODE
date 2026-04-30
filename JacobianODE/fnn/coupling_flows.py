@@ -1151,6 +1151,78 @@ class FixedOrthogonal(nn.Module):
         return y @ self.matrix
 
 
+class CayleyOrthogonal(nn.Module):
+    """Learnable orthogonal mixing layer parameterised by the Cayley transform.
+
+    Drop-in replacement for :class:`FixedPermutation` — same forward/inverse
+    interface, same volume-preservation (``|det Q| = 1``), but the rotation
+    is **learnable** rather than a fixed permutation. This gives the
+    encoder a smooth, gradient-trainable way to discover non-axis-aligned
+    rotations between coupling layers.
+
+    Parameterisation:
+        ``A = U - U^T``  (skew-symmetric, built from the strict
+        upper triangle of the parameter ``U``)
+        ``Q = (I - A) (I + A)^{-1}``  (Cayley transform → orthogonal SO(n))
+
+    Properties:
+        * ``Q^{-1} = Q^T`` exactly (orthogonal),
+        * ``det Q = +1`` (rotation, not reflection),
+        * ``Q = I`` when ``U = 0``: layer is *exactly* the identity at
+          init, so a model trained without Cayley layers is a valid
+          starting point for the Cayley variant (drop-in upgrade).
+
+    Numerical considerations:
+        * The transform has a singularity at ``A = -I`` (rotations of 180°
+          along some axis). For trained encoders that drift smoothly from
+          ``U = 0`` this is not reached in practice.
+        * Implemented via ``torch.linalg.solve`` for stability of the
+          ``(I + A)^{-1}`` term.
+
+    Parameters
+    ----------
+    dim : int
+        Feature dimension.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        # Free upper-triangle parameter; we project to skew-symmetric in
+        # forward by computing (U - U^T) which zeroes the diagonal and
+        # the strict-lower triangle automatically.
+        self.U = nn.Parameter(torch.zeros(dim, dim))
+
+    def _orthogonal(self) -> torch.Tensor:
+        # Build skew-symmetric A from the strict upper triangle of U.
+        U_strict = torch.triu(self.U, diagonal=1)
+        A = U_strict - U_strict.transpose(-1, -2)
+        I = torch.eye(self.dim, device=A.device, dtype=A.dtype)
+        # Cayley: Q = (I - A) @ (I + A)^{-1}.
+        # Use solve to avoid an explicit matrix inverse:
+        #     Q = (I - A) @ X   with   (I + A) X = I   ⇒   X = solve(I+A, I)
+        # but the equivalent one-line form via the system
+        #     (I + A) Y = (I - A)   ⇒   Y = solve(I+A, I-A) = (I+A)^{-1} (I-A)
+        # gives Y, not Q. We want Q = (I-A)(I+A)^{-1} = Y^T (since for
+        # skew A: (I+A)^T = I-A and (I-A)^T = I+A, so Y^T applied to a
+        # symmetric quantity gives... actually it's cleaner to compute
+        # solve and then transpose using A's skew-symmetry:
+        #     Q^T = (I+A)^{-T} (I-A)^T = (I-A)^{-1} (I+A) = solve(I-A, I+A)
+        # so Q = solve(I-A, I+A)^T.
+        Q_T = torch.linalg.solve(I - A, I + A)
+        return Q_T.transpose(-1, -2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        Q = self._orthogonal()
+        # Apply rotation to the last dim of x: y = Q x_last → x @ Q^T.
+        return x @ Q.transpose(-1, -2)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        Q = self._orthogonal()
+        # Q^{-1} = Q^T, so x = Q^T y_last → y @ Q.
+        return y @ Q
+
+
 # ---------------------------------------------------------------------------
 # LOFT — Log Soft Extension  (Andrade 2024, Eq. 10, arXiv:2402.16408)
 # ---------------------------------------------------------------------------
@@ -1434,6 +1506,17 @@ class CouplingEncoder(nn.Module):
         permutations are still fully random (they drive mixing across coupling
         layers); the final permutation only relabels output dimensions by a
         fixed bijection.
+    use_cayley_perms : bool
+        If True, replace the inter-layer ``FixedPermutation`` mixers with
+        learnable :class:`CayleyOrthogonal` layers. These initialise to the
+        identity, so an encoder built with this flag is *exactly* equivalent
+        to one without it at initialisation; gradient is then free to learn
+        non-axis-aligned rotations between coupling layers, helping the
+        encoder discover non-trivial alignments (e.g., aligning data
+        principal axes with z_dyn axes for partial-obs / autodim setups).
+        Mutually exclusive with ``init_pca_basis=True``. When combined with
+        ``final_perm_identity=True`` the final fixed permutation is the
+        identity (since Cayley layers compose to identity at init).
     """
 
     def __init__(
@@ -1463,11 +1546,14 @@ class CouplingEncoder(nn.Module):
         final_perm_identity: bool = False,
         init_pca_basis: bool = False,
         pca_basis: torch.Tensor | None = None,
+        # learnable orthogonal mixing
+        use_cayley_perms: bool = False,
     ) -> None:
         super().__init__()
         self._n_input = n_input
         self._coupling_type = coupling_type
         self._use_actnorm = use_actnorm
+        self._use_cayley_perms = use_cayley_perms
         split_dim = n_input // 2
 
         self.coupling_layers = nn.ModuleList()
@@ -1535,11 +1621,21 @@ class CouplingEncoder(nn.Module):
             if use_actnorm:
                 self.actnorms.append(ActNorm(dim=n_input))
 
-            # --- permutation (between consecutive layers, not after last) ---
+            # --- mixing (between consecutive layers, not after last) ---
+            # When ``use_cayley_perms=True``, use a learnable orthogonal
+            # layer parameterised by the Cayley transform instead of a
+            # fixed random permutation. CayleyOrthogonal initialises to
+            # the identity (U=0), so an encoder built with this flag is
+            # exactly equivalent to one without it at init — gradient
+            # then has the freedom to learn arbitrary inter-layer
+            # rotations during training.
             if i < n_coupling_layers - 1:
-                self.permutations.append(
-                    FixedPermutation(dim=n_input, seed=permutation_seed + i)
-                )
+                if use_cayley_perms:
+                    self.permutations.append(CayleyOrthogonal(dim=n_input))
+                else:
+                    self.permutations.append(
+                        FixedPermutation(dim=n_input, seed=permutation_seed + i)
+                    )
 
         self.loft: LOFTLayer | None = LOFTLayer(tau=loft_tau) if use_loft else None
 
@@ -1555,21 +1651,41 @@ class CouplingEncoder(nn.Module):
                 "they configure two different choices for the encoder's final layer "
                 "(identity init vs PCA-basis init). Pick one."
             )
+        if init_pca_basis and use_cayley_perms:
+            # init_pca_basis composes per-permutation index arrays (`.perm`)
+            # to derive the final fixed orthogonal Q; CayleyOrthogonal layers
+            # are not permutations and don't expose `.perm`.
+            raise ValueError(
+                "init_pca_basis is not compatible with use_cayley_perms=True. "
+                "Use final_perm_identity=True with use_cayley_perms instead."
+            )
 
         self.final_permutation: FixedPermutation | None = None
         self.final_orthogonal: FixedOrthogonal | None = None
 
         if final_perm_identity:
-            # R = composition of inter-layer random perms (applied in forward order).
-            idx = torch.arange(n_input)
-            for p in self.permutations:
-                idx = idx[p.perm]
-            # final_perm = R^{-1}, so at init the full composition is identity.
-            inv = torch.argsort(idx)
-            fp = FixedPermutation(dim=n_input, seed=0)
-            fp.perm.copy_(inv)
-            fp.perm_inv.copy_(torch.argsort(inv))
-            self.final_permutation = fp
+            if use_cayley_perms:
+                # Cayley layers initialise to identity (U=0), so the
+                # composition of inter-layer mixers is identity at init.
+                # The "final perm to make the whole encoder identity"
+                # is therefore the identity permutation itself. Use a
+                # FixedPermutation buffer with arange so the encode/
+                # decode forward path is unchanged structurally.
+                fp = FixedPermutation(dim=n_input, seed=0)
+                fp.perm.copy_(torch.arange(n_input))
+                fp.perm_inv.copy_(torch.arange(n_input))
+                self.final_permutation = fp
+            else:
+                # R = composition of inter-layer random perms (applied in forward order).
+                idx = torch.arange(n_input)
+                for p in self.permutations:
+                    idx = idx[p.perm]
+                # final_perm = R^{-1}, so at init the full composition is identity.
+                inv = torch.argsort(idx)
+                fp = FixedPermutation(dim=n_input, seed=0)
+                fp.perm.copy_(inv)
+                fp.perm_inv.copy_(torch.argsort(inv))
+                self.final_permutation = fp
         elif init_pca_basis:
             # Append a fixed orthogonal Q chosen so that, at init (couplings
             # are identity), the whole encoder applies V to the input — i.e.
@@ -1796,6 +1912,8 @@ class DirectSumCouplingEncoder(nn.Module):
         tail_bound: float = 3.0,
         # routing at init
         final_perm_identity: bool = False,
+        # learnable orthogonal mixing
+        use_cayley_perms: bool = False,
     ) -> None:
         super().__init__()
         if len(area_indices) == 0:
@@ -1853,6 +1971,7 @@ class DirectSumCouplingEncoder(nn.Module):
             num_bins=num_bins,
             tail_bound=tail_bound,
             final_perm_identity=final_perm_identity,
+            use_cayley_perms=use_cayley_perms,
         )
         self.blocks = nn.ModuleList([
             CouplingEncoder(
