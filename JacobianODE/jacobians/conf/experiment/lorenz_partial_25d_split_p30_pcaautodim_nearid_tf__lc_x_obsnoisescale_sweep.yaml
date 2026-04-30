@@ -41,7 +41,7 @@ wandb_group: "lorenz_partial_25d_split_p30_pcaautodim_nearid_tf__lc_x_obsnoisesc
 
 data:
   postprocessing:
-    obs_noise: 0.0
+    obs_noise: 0.05
     normalize: true
   train_test_params:
     seq_length: 45
