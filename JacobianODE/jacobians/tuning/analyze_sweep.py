@@ -84,6 +84,13 @@ _SWEPT_PATH_EXCLUDES_EXACT = {
     # Paths that trivially vary across runs but aren't scientifically swept.
     "training.logger.save_dir",
     "training.logger_save_dirs",
+    # Auto-resolved per-area encoder layouts: deterministic functions of the
+    # actually-swept axes (n_observed_per_area, n_delays) via the
+    # auto_partial_obs sentinel. Including them blows up the per-run table
+    # — each cell renders as a long index list, and the sweep axis
+    # (n_delays) already encodes the variation.
+    "model.encoder.area_indices",
+    "model.encoder.n_target_dims_per_block",
 }
 
 
