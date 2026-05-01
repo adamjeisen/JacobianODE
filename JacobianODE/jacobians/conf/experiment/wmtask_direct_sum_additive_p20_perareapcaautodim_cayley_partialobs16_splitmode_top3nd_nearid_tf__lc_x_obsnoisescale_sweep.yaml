@@ -9,7 +9,7 @@
 # culling via j-submit-two-stage; partial_obs_seed=42 reused so the
 # index set matches sweep 1 exactly.
 #
-# !!! TOP3_NDELAYS placeholder below — REPLACE with the 3 best n_delays
+# !!! 6,9,12 placeholder below — REPLACE with the 3 best n_delays
 # values from sweep 1's report (criteria-aware ranking) before submitting.
 
 defaults:
@@ -42,7 +42,7 @@ metadata:
     - "At least one (LC, obs_noise) cell passes C1/C2/C3 validity at each of the 3 n_delays"
 
 sweep_grid:
-  data.train_test_params.delay_embedding_params.n_delays: "TOP3_NDELAYS"   # REPLACE WITH "n1,n2,n3" FROM SWEEP 1
+  data.train_test_params.delay_embedding_params.n_delays: "6,9,12"   # REPLACE WITH "n1,n2,n3" FROM SWEEP 1
   training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1"
   training.lightning.obs_noise_scale: "0,0.01,0.05"
 
