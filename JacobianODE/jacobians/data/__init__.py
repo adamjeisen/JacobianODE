@@ -5,7 +5,7 @@ from __future__ import annotations
 from .trajectory import make_trajectories, make_dysts_trajectories
 from .processing import postprocess_data, normalize_data, PostprocessResult
 from .dataloaders import create_dataloaders
-from .splitting import generate_train_and_test_sets, TimeSeriesDataset, embed_signal_torch
+from .splitting import generate_train_and_test_sets, TimeSeriesDataset, embed_signal_torch, collate_with_optional_condition
 from .filtering import filter_data
 from .types import TimeSeriesData
 
@@ -19,6 +19,7 @@ __all__ = [
     "generate_train_and_test_sets",
     "TimeSeriesDataset",
     "embed_signal_torch",
+    "collate_with_optional_condition",
     "filter_data",
     "TimeSeriesData",
 ]

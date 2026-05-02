@@ -64,23 +64,25 @@ class MLP(nn.Module):
         activation (str): Name of activation function to use
     """
     def __init__(
-            self, 
-            input_dim, 
-            hidden_dim, 
-            num_layers, 
-            output_dim, 
-            residuals=False, 
-            dropout=0.0, 
-            activation='relu', 
+            self,
+            input_dim,
+            hidden_dim,
+            num_layers,
+            output_dim,
+            residuals=False,
+            dropout=0.0,
+            activation='relu',
+            condition_dim=0,
         ):
         super(MLP, self).__init__()
 
         self.residuals = residuals
         self.dropout = dropout
         self.activation = activation
+        self.condition_dim = condition_dim
 
         self.layers = nn.ModuleList()
-        
+
         # Check if hidden_dim is a list; if not, create a list with repeated hidden_dim
         if isinstance(hidden_dim, Iterable) and not isinstance(hidden_dim, (str, bytes)):
             self.hidden_dims = hidden_dim
@@ -91,10 +93,13 @@ class MLP(nn.Module):
         if len(self.hidden_dims) != num_layers:
             raise ValueError("Length of hidden_dim list must match num_layers.")
 
+        # When conditioned, the first layer takes [x; c]; size it accordingly.
+        first_in = input_dim + condition_dim
+
         if residuals:
             # Add input layer
-            self.layers.extend(self._create_layer(input_dim, self.hidden_dims[0], layer_idx=0, dropout=0.0))
-            
+            self.layers.extend(self._create_layer(first_in, self.hidden_dims[0], layer_idx=0, dropout=0.0))
+
             # Add hidden layers
             for i in range(1, num_layers):
                 self.layers.extend(self._create_layer_with_residuals(self.hidden_dims[i-1], self.hidden_dims[i], layer_idx=i))
@@ -103,9 +108,8 @@ class MLP(nn.Module):
             self.layers.extend(self._create_layer(self.hidden_dims[-1], output_dim, activation=None, dropout=0.0, no_activation=True, layer_idx=num_layers))
         else:
             # Add input layer
+            self.layers.extend(self._create_layer(first_in, self.hidden_dims[0], layer_idx=0, dropout=0.0))
 
-            self.layers.extend(self._create_layer(input_dim, self.hidden_dims[0], layer_idx=0, dropout=0.0))
-            
             # Add hidden layers
             for i in range(1, num_layers):
                 self.layers.extend(self._create_layer(self.hidden_dims[i-1], self.hidden_dims[i], layer_idx=i))
@@ -114,7 +118,7 @@ class MLP(nn.Module):
             self.layers.extend(self._create_layer(self.hidden_dims[-1], output_dim, activation=None, dropout=0.0, no_activation=True, layer_idx=num_layers))
 
         self.MODEL_TYPE = 'MLP'
-        
+
         self.input_dim = input_dim
 
     def _create_layer_with_residuals(self, in_dim, out_dim, activation=None, dropout=None, no_activation=False, layer_idx=None):
@@ -177,15 +181,39 @@ class MLP(nn.Module):
         # return nn.Sequential(*layers)
         return layers
 
-    def forward(self, x):
+    def forward(self, x, c=None):
         """Forward pass through the network.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (..., input_dim)
+            x (torch.Tensor): Input tensor of shape (..., input_dim).
+            c (torch.Tensor or None): Optional per-sample condition of
+                shape (B, condition_dim). When ``condition_dim > 0``, ``c``
+                is concatenated to ``x`` along the last dim (broadcast over
+                intermediate dims). Required if ``condition_dim > 0``;
+                ignored otherwise.
 
         Returns:
             torch.Tensor: Output tensor of shape (..., output_dim)
         """
+        if self.condition_dim > 0:
+            if c is None:
+                raise ValueError(
+                    f"MLP was built with condition_dim={self.condition_dim} "
+                    f"but forward was called with c=None. Pass the per-sample "
+                    f"condition tensor of shape (B, {self.condition_dim})."
+                )
+            if c.shape[-1] != self.condition_dim:
+                raise ValueError(
+                    f"MLP condition_dim={self.condition_dim} but got c with "
+                    f"last-dim={c.shape[-1]}."
+                )
+            # Broadcast c over the intermediate dims of x (typically time).
+            if c.ndim == x.ndim:
+                c_bcast = c
+            else:
+                view_shape = (c.shape[0],) + (1,) * (x.ndim - 2) + (c.shape[-1],)
+                c_bcast = c.view(view_shape).expand(*x.shape[:-1], c.shape[-1])
+            x = torch.cat([x, c_bcast], dim=-1)
         for layer in self.layers:
             x = layer(x)
         return x

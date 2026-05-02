@@ -618,6 +618,7 @@ class LitBase(L.LightningModule):
             n_loop_pts=None,
             loop_path=None,
             loop_closure_interp_pts=None,
+            c=None,
         ):
         """Perform a single training step for loop closure.
 
@@ -645,7 +646,17 @@ class LitBase(L.LightningModule):
         if loop_closure_interp_pts is None:
             loop_closure_interp_pts = self.loop_closure_interp_pts
 
-        loop_int = loop_closure(batch, self.compute_jacobians, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method='Trapezoid')
+        # Bind c into compute_jacobians. For unconditioned models (c=None,
+        # condition_dim=0) this is a no-op. For conditioned models with
+        # mix_trajectories=True, loop_closure synthesises loops by mixing
+        # points across batch elements — the per-sample c then doesn't
+        # broadcast cleanly to the synthesised loop points; that path is
+        # not yet supported and will surface a shape error at jac_func call
+        # time. Use mix_trajectories=False (one loop per batch element) to
+        # preserve a clean per-sample c assignment.
+        # Variadic so the integrator can pass extra positional args (e.g. time t).
+        jac_fn = (lambda z, *_a, **_k: self.compute_jacobians(z, c))
+        loop_int = loop_closure(batch, jac_fn, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method='Trapezoid')
 
 
         loop_zeros = torch.zeros_like(loop_int)

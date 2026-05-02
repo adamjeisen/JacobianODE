@@ -79,12 +79,12 @@ class AdditiveCouplingLayer(nn.Module):
     are kept fixed and fed into a conditioner MLP that predicts a translation
     ``t`` for the remaining features.
 
-    Forward:  ``y_a = x_a``,  ``y_b = x_b + t(x_a)``
-    Inverse:  ``x_a = y_a``,  ``x_b = y_b - t(y_a)``
+    Forward:  ``y_a = x_a``,  ``y_b = x_b + t(x_a, c)``
+    Inverse:  ``x_a = y_a``,  ``x_b = y_b - t(y_a, c)``
 
-    The Jacobian is lower-triangular with ones on the diagonal, so
-    ``det(J) = 1`` always.  This makes the layer volume-preserving regardless
-    of the conditioner complexity.
+    For each fixed conditioning vector ``c``, the Jacobian in ``x`` is
+    lower-triangular with ones on the diagonal, so ``det J = 1`` and the
+    layer is volume-preserving regardless of how ``c`` enters the conditioner.
 
     Parameters
     ----------
@@ -99,6 +99,11 @@ class AdditiveCouplingLayer(nn.Module):
     zero_init : bool
         Zero-initialise the last conditioner layer so the coupling starts as
         the identity map.
+    condition_dim : int
+        Dimension of the optional conditioning vector ``c``. When > 0, the
+        conditioner MLP's input becomes ``[x_a; c]`` (concat). When 0
+        (default), the layer is unconditioned and ``forward/inverse`` ignore
+        any ``c`` passed.
     """
 
     def __init__(
@@ -109,6 +114,7 @@ class AdditiveCouplingLayer(nn.Module):
         n_hidden_layers: int = 2,
         zero_init: bool = True,
         near_identity_std: float = 0.0,
+        condition_dim: int = 0,
     ) -> None:
         super().__init__()
         if split_dim is None:
@@ -116,10 +122,12 @@ class AdditiveCouplingLayer(nn.Module):
         self.dim = dim
         self.split_dim = split_dim
         self.transform_dim = dim - split_dim
+        self.condition_dim = condition_dim
 
-        # Translation-only conditioner: output_dim = transform_dim (not 2x)
+        # Translation-only conditioner: output_dim = transform_dim (not 2x).
+        # When condition_dim > 0, the conditioner takes [x_a; c] as input.
         self.conditioner = _build_conditioner(
-            input_dim=split_dim,
+            input_dim=split_dim + condition_dim,
             output_dim=self.transform_dim,
             hidden_dim=hidden_dim,
             n_hidden_layers=n_hidden_layers,
@@ -127,14 +135,49 @@ class AdditiveCouplingLayer(nn.Module):
             near_identity_std=near_identity_std,
         )
 
+    def _conditioner_input(
+        self, x_a: torch.Tensor, c: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Build the conditioner input — ``[x_a; c_broadcast]`` when conditioned.
+
+        ``c`` has shape ``(B, condition_dim)``; ``x_a`` has shape
+        ``(B, ..., split_dim)``. We broadcast ``c`` over the intermediate
+        dims of ``x_a`` (typically the time axis) so each entry of x_a
+        sees the same per-sample condition vector.
+        """
+        if self.condition_dim == 0:
+            return x_a
+        if c is None:
+            raise ValueError(
+                f"Coupling layer was built with condition_dim={self.condition_dim} "
+                f"but forward/inverse was called with c=None. Pass the per-sample "
+                f"condition tensor of shape (B, {self.condition_dim})."
+            )
+        if c.shape[-1] != self.condition_dim:
+            raise ValueError(
+                f"Coupling layer condition_dim={self.condition_dim} but "
+                f"got c with last-dim={c.shape[-1]}."
+            )
+        # x_a: (B, *mid, split_dim). c: (B, condition_dim) → broadcast over *mid.
+        if c.ndim == x_a.ndim:
+            # already aligned (e.g. caller passed a pre-broadcast c)
+            c_bcast = c
+        else:
+            view_shape = (c.shape[0],) + (1,) * (x_a.ndim - 2) + (c.shape[-1],)
+            c_bcast = c.view(view_shape).expand(*x_a.shape[:-1], c.shape[-1])
+        return torch.cat([x_a, c_bcast], dim=-1)
+
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, c: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Parameters
         ----------
         x : Tensor (..., D)
+        c : Tensor (B, condition_dim) or None
+            Optional per-sample condition. Required if ``condition_dim > 0``;
+            ignored when ``condition_dim == 0``.
 
         Returns
         -------
@@ -143,18 +186,20 @@ class AdditiveCouplingLayer(nn.Module):
         """
         x_a = x[..., : self.split_dim]
         x_b = x[..., self.split_dim :]
-        t = self.conditioner(x_a)
+        t = self.conditioner(self._conditioner_input(x_a, c))
         y_b = x_b + t
         y = torch.cat([x_a, y_b], dim=-1)
         log_det = torch.zeros(x.shape[:-1], device=x.device, dtype=x.dtype)
         return y, log_det
 
-    def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        """Exact analytical inverse.
+    def inverse(self, y: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        """Exact analytical inverse for fixed ``c``.
 
         Parameters
         ----------
         y : Tensor (..., D)
+        c : Tensor (B, condition_dim) or None
+            Must match the ``c`` used in the forward pass for exact inversion.
 
         Returns
         -------
@@ -162,7 +207,7 @@ class AdditiveCouplingLayer(nn.Module):
         """
         y_a = y[..., : self.split_dim]
         y_b = y[..., self.split_dim :]
-        t = self.conditioner(y_a)  # y_a == x_a
+        t = self.conditioner(self._conditioner_input(y_a, c))  # y_a == x_a
         x_b = y_b - t
         return torch.cat([y_a, x_b], dim=-1)
 
@@ -371,11 +416,13 @@ class CouplingEncoder(nn.Module):
         permutation_seed: int = 0,
         final_perm_identity: bool = False,
         use_cayley_perms: bool = False,
+        condition_dim: int = 0,
         **unused_kwargs,
     ) -> None:
         super().__init__()
         self._n_input = n_input
         self._use_cayley_perms = use_cayley_perms
+        self.condition_dim = condition_dim
         split_dim = n_input // 2
 
         self.coupling_layers = nn.ModuleList()
@@ -390,6 +437,7 @@ class CouplingEncoder(nn.Module):
                     n_hidden_layers=n_hidden_layers,
                     zero_init=zero_init,
                     near_identity_std=near_identity_std,
+                    condition_dim=condition_dim,
                 )
             )
             if i < n_coupling_layers - 1:
@@ -430,12 +478,15 @@ class CouplingEncoder(nn.Module):
 
     # ----- forward / inverse -----
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Encode: coupling → permutation, repeated.
 
         Parameters
         ----------
         x : Tensor (B, T, D) or (B, D)
+        c : Tensor (B, condition_dim) or None
+            Optional per-sample condition. Required if ``condition_dim > 0``;
+            ignored otherwise.
 
         Returns
         -------
@@ -443,19 +494,21 @@ class CouplingEncoder(nn.Module):
         """
         z = x
         for i, layer in enumerate(self.coupling_layers):
-            z, _ = layer(z)
+            z, _ = layer(z, c)
             if i < len(self.permutations):
                 z = self.permutations[i](z)
         if self.final_permutation is not None:
             z = self.final_permutation(z)
         return z
 
-    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+    def inverse(self, z: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Decode: undo all layers in reverse order.
 
         Parameters
         ----------
         z : Tensor (B, T, D) or (B, D)
+        c : Tensor (B, condition_dim) or None
+            Must match the ``c`` used at encode time for exact inversion.
 
         Returns
         -------
@@ -467,34 +520,27 @@ class CouplingEncoder(nn.Module):
         for i in reversed(range(len(self.coupling_layers))):
             if i < len(self.permutations):
                 y = self.permutations[i].inverse(y)
-            y = self.coupling_layers[i].inverse(y)
+            y = self.coupling_layers[i].inverse(y, c)
         return y
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Alias for :meth:`forward`."""
-        return self.forward(x)
+        return self.forward(x, c)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Alias for :meth:`inverse`."""
-        return self.inverse(z)
+        return self.inverse(z, c)
 
-    def log_det_jacobian(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute total log |det J| of the forward map (for diagnostics).
-
-        Parameters
-        ----------
-        x : Tensor (B, T, D) or (B, D)
-
-        Returns
-        -------
-        log_det : Tensor (B, T) or (B,)
+    def log_det_jacobian(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
+        """Compute total log |det J| of the forward map at fixed ``c`` (always 0
+        for additive coupling; kept for API symmetry).
         """
         z = x
         total_log_det = torch.zeros(
             x.shape[:-1], device=x.device, dtype=x.dtype
         )
         for i, layer in enumerate(self.coupling_layers):
-            z, ld = layer(z)
+            z, ld = layer(z, c)
             total_log_det = total_log_det + ld
             if i < len(self.permutations):
                 z = self.permutations[i](z)
@@ -573,6 +619,8 @@ class DirectSumCouplingEncoder(nn.Module):
         final_perm_identity: bool = False,
         # learnable orthogonal mixing
         use_cayley_perms: bool = False,
+        # optional conditioning (shared c across all sub-encoders)
+        condition_dim: int = 0,
         **unused_kwargs,
     ) -> None:
         super().__init__()
@@ -603,6 +651,7 @@ class DirectSumCouplingEncoder(nn.Module):
         self._k_per_block = tuple(int(k) for k in n_target_dims_per_block)
         self._block_sizes = tuple(block_sizes)
         self._n_areas = len(area_indices)
+        self.condition_dim = condition_dim
 
         # Store per-area index lists as LongTensor buffers so gather/scatter
         # runs on the model's device and survives state_dict save/load.
@@ -613,6 +662,7 @@ class DirectSumCouplingEncoder(nn.Module):
 
         # Shared hyperparameters — identical across sub-encoders except for
         # (n_input, permutation_seed). The "same MLP" invariant lives here.
+        # condition_dim is shared too: all sub-encoders see the same c.
         shared = dict(
             n_coupling_layers=n_coupling_layers,
             hidden_dim=hidden_dim,
@@ -621,6 +671,7 @@ class DirectSumCouplingEncoder(nn.Module):
             near_identity_std=near_identity_std,
             final_perm_identity=final_perm_identity,
             use_cayley_perms=use_cayley_perms,
+            condition_dim=condition_dim,
         )
         self.blocks = nn.ModuleList([
             CouplingEncoder(
@@ -648,38 +699,32 @@ class DirectSumCouplingEncoder(nn.Module):
 
     # ----- forward / inverse -----
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Encode: gather per-area → per-area encode → reorder dyn-first.
 
         Parameters
         ----------
         x : Tensor (..., n_input)
-
-        Returns
-        -------
-        z : Tensor, same shape as x, with layout
-            ``[dyn_0, dyn_1, ..., dyn_{N-1}, null_0, null_1, ..., null_{N-1}]``.
+        c : Tensor (B, condition_dim) or None
+            Optional per-sample condition shared across all sub-encoders.
         """
         # Per-area gather along last dim.
         xs = [x.index_select(-1, self._area_idx(i)) for i in range(self._n_areas)]
-        # Per-area encode.
-        zs = [blk(xi) for blk, xi in zip(self.blocks, xs)]
+        # Per-area encode (each sub-encoder sees the same c).
+        zs = [blk(xi, c) for blk, xi in zip(self.blocks, xs)]
         # Group dyn parts, then null parts.
         dyn_parts = [z[..., :k] for z, k in zip(zs, self._k_per_block)]
         null_parts = [z[..., k:] for z, k in zip(zs, self._k_per_block)]
         return torch.cat(dyn_parts + null_parts, dim=-1)
 
-    def inverse(self, z: torch.Tensor) -> torch.Tensor:
+    def inverse(self, z: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Decode: un-group z → per-area decode → scatter to original indices.
 
         Parameters
         ----------
         z : Tensor (..., n_input) in the dyn-first layout produced by :meth:`forward`.
-
-        Returns
-        -------
-        x : Tensor, same shape as z, with each area's reconstructed values
-            placed at the input indices they came from.
+        c : Tensor (B, condition_dim) or None
+            Must match the ``c`` used at encode time for exact inversion.
         """
         # 1) Un-group back to per-area [dyn || null] layout (exactly what each
         #    sub-encoder produced at forward time — the decoder must see the
@@ -698,7 +743,7 @@ class DirectSumCouplingEncoder(nn.Module):
             torch.cat([dp, np_], dim=-1) for dp, np_ in zip(dyn_parts, null_parts)
         ]
         # 2) Per-area inverse.
-        xs = [blk.inverse(bz) for blk, bz in zip(self.blocks, blocks_z)]
+        xs = [blk.inverse(bz, c) for blk, bz in zip(self.blocks, blocks_z)]
         # 3) Scatter back to the original input layout — each area's reconstructed
         #    values land at exactly the indices they were gathered from.
         shape = list(z.shape)
@@ -708,13 +753,13 @@ class DirectSumCouplingEncoder(nn.Module):
             x_out.index_copy_(-1, self._area_idx(i), xi)
         return x_out
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Alias for :meth:`forward`."""
-        return self.forward(x)
+        return self.forward(x, c)
 
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
         """Alias for :meth:`inverse`."""
-        return self.inverse(z)
+        return self.inverse(z, c)
 
 
 # ---------------------------------------------------------------------------

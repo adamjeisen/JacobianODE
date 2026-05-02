@@ -335,21 +335,47 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
 # Dataset class for time series prediction
 class TimeSeriesDataset(torch.utils.data.Dataset):
     """
-    Dataset class for time series data.
-
-    This class provides a PyTorch Dataset interface for time series data,
-    where each item is a sequence of observations.
+    Dataset class for time series data with optional per-sample condition.
 
     Parameters
     ----------
     sequence : torch.Tensor
-        Input time series data of shape (n_sequences, seq_length, n_dims)
+        Input time series data of shape ``(n_sequences, seq_length, n_dims)``.
+    condition : torch.Tensor or None, optional
+        Per-sample condition of shape ``(n_sequences, condition_dim)``. When
+        provided, ``__getitem__`` returns a ``(traj, c)`` tuple; when None
+        (default) it returns the trajectory tensor alone (back-compat).
     """
-    def __init__(self, sequence):
+
+    def __init__(self, sequence, condition=None):
         self.sequence = sequence
+        if condition is not None and len(condition) != len(sequence):
+            raise ValueError(
+                f"condition length ({len(condition)}) must match sequence "
+                f"length ({len(sequence)})."
+            )
+        self.condition = condition
 
     def __len__(self):
         return len(self.sequence)
 
     def __getitem__(self, index):
-        return self.sequence[index]
+        if self.condition is None:
+            return self.sequence[index]
+        return self.sequence[index], self.condition[index]
+
+
+def collate_with_optional_condition(samples):
+    """Collate that handles both ``Tensor`` and ``(Tensor, c)`` items.
+
+    - If items are plain tensors → return a single stacked batch tensor
+      (identical to PyTorch's default collate for tensor-only datasets).
+    - If items are ``(traj, c)`` tuples → return ``(batch, c)`` where both
+      sides are stacked. Use this collate on a DataLoader whose dataset
+      may or may not carry per-sample conditions.
+    """
+    first = samples[0]
+    if isinstance(first, (tuple, list)) and len(first) == 2:
+        trajs, conds = zip(*samples)
+        return torch.stack(trajs, dim=0), torch.stack(conds, dim=0)
+    return torch.stack(samples, dim=0)
