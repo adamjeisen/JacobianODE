@@ -333,13 +333,22 @@ def _run_training(cfg: DictConfig) -> Optional[float]:
     # ----------------------------------------
     # SET UP WANDB
     # ----------------------------------------
-    prompt_entity = cfg.wandb_entity is None
-    name, project, entity = setup_wandb(
-        cfg,
-        trajs,
-        raw_values_to_use_for_noise=raw_values_noise,
-        prompt_entity=prompt_entity,
-    )
+    wandb_disabled = bool(OmegaConf.select(cfg, "wandb.disabled", default=False))
+    if wandb_disabled:
+        log.info("wandb.disabled=true; skipping setup_wandb (no W&B Api / init).")
+        from .training.logging import make_run_info
+        name, project = make_run_info(cfg)
+        if cfg.get("wandb_project"):
+            project = cfg.wandb_project
+        entity = None
+    else:
+        prompt_entity = cfg.wandb_entity is None
+        name, project, entity = setup_wandb(
+            cfg,
+            trajs,
+            raw_values_to_use_for_noise=raw_values_noise,
+            prompt_entity=prompt_entity,
+        )
 
     # ----------------------------------------
     # MAKE MODEL

@@ -250,42 +250,51 @@ def train_model(
         ckpt_path_resume = str(ep)
         logger.info(f"[two-stage] initializing from explicit ckpt {ep}")
 
-    logger_kwargs = {
-        "name": name,
-        "project": project,
-        "entity": entity,
-        "group": group,
-    }
-    if wandb_resume_id:
-        # Continue the same wandb run so the step counter stays monotonic.
-        logger_kwargs["id"] = wandb_resume_id
-        logger_kwargs["resume"] = "allow"
+    wandb_disabled = bool(OmegaConf.select(cfg, "wandb.disabled", default=False))
 
-    experiment_logger = instantiate(cfg.training.logger, **logger_kwargs)
-
-    # Persist the wandb run id on first start so future requeues continue
-    # the same run rather than creating a new one each cycle.
-    if resume_dir is not None:
-        try:
-            run_id = experiment_logger.experiment.id
-            if run_id:
-                (resume_dir / "wandb_run_id.txt").write_text(str(run_id))
-        except Exception as e:
-            logger.warning(f"[resume] Could not persist wandb run id: {e}")
-
-    # Only update the logger config in the main process (rank 0).
-    # allow_val_change=True is required when resuming a wandb run because
-    # config.update() otherwise rejects any diff between the existing config
-    # (from the original start) and the re-serialized config — including
-    # spurious float-precision differences like sigma=13.26897638365872 vs
-    # 13.268976383658721 that arise from OmegaConf re-resolution. Without
-    # this, preempt→requeue crashed the training script on restart and
-    # killed the entire sweep's ability to benefit from REQUEUE.
-    if os.getenv("LOCAL_RANK") == "0" or os.getenv("LOCAL_RANK") is None:
-        experiment_logger.experiment.config.update(
-            OmegaConf.to_container(cfg, resolve=True),
-            allow_val_change=True,
+    if wandb_disabled:
+        logger.info(
+            "wandb.disabled=true; skipping WandbLogger construction "
+            "(Lightning will run without an experiment logger)."
         )
+        experiment_logger = False  # Lightning Trainer accepts False -> no logger
+    else:
+        logger_kwargs = {
+            "name": name,
+            "project": project,
+            "entity": entity,
+            "group": group,
+        }
+        if wandb_resume_id:
+            # Continue the same wandb run so the step counter stays monotonic.
+            logger_kwargs["id"] = wandb_resume_id
+            logger_kwargs["resume"] = "allow"
+
+        experiment_logger = instantiate(cfg.training.logger, **logger_kwargs)
+
+        # Persist the wandb run id on first start so future requeues continue
+        # the same run rather than creating a new one each cycle.
+        if resume_dir is not None:
+            try:
+                run_id = experiment_logger.experiment.id
+                if run_id:
+                    (resume_dir / "wandb_run_id.txt").write_text(str(run_id))
+            except Exception as e:
+                logger.warning(f"[resume] Could not persist wandb run id: {e}")
+
+        # Only update the logger config in the main process (rank 0).
+        # allow_val_change=True is required when resuming a wandb run because
+        # config.update() otherwise rejects any diff between the existing config
+        # (from the original start) and the re-serialized config — including
+        # spurious float-precision differences like sigma=13.26897638365872 vs
+        # 13.268976383658721 that arise from OmegaConf re-resolution. Without
+        # this, preempt→requeue crashed the training script on restart and
+        # killed the entire sweep's ability to benefit from REQUEUE.
+        if os.getenv("LOCAL_RANK") == "0" or os.getenv("LOCAL_RANK") is None:
+            experiment_logger.experiment.config.update(
+                OmegaConf.to_container(cfg, resolve=True),
+                allow_val_change=True,
+            )
 
     # Set up callbacks — "best" checkpoints track top-k by metric as before;
     # the new "last" checkpoint enables preempt-safe resume (see resume_dir).
@@ -513,7 +522,8 @@ def train_model(
                 logger.warning(f"[resume] Could not clean up {p}: {e}")
         _write_done_marker(resume_dir, finished_run_id)
 
-    wandb.finish()
+    if not wandb_disabled:
+        wandb.finish()
     logger.info(f"Training complete for run: {name}")
 
     return trainer
