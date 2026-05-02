@@ -235,18 +235,15 @@ class LitBase(L.LightningModule):
         jacobianODEint_kwargs (dict): Keyword arguments for JacobianODE integration (default: {})
         min_traj_init_steps (int): Minimum initial steps for trajectories (default: 2)
         max_traj_init_steps (Optional[int]): Maximum initial steps for trajectories (default: None)
-        use_scheduler (bool): Whether to use learning rate scheduler (default: False)
-        scheduler_type (str): LR scheduler to use — 'cosine' (CosineAnnealingLR, decays over
-            trainer.max_epochs to min_lr) or 'teacher_forcing' (legacy, ties LR to teacher
-            forcing coefficient) (default: 'teacher_forcing')
-        min_lr (Optional[float]): Minimum learning rate / eta_min for scheduler (default: None)
+        use_scheduler (bool): Whether to use learning rate scheduler (default: False).
+            When True, always uses TeacherForcingLRScheduler (LR coupled to teacher-forcing α).
+        min_lr (Optional[float]): Minimum learning rate for scheduler (default: None)
         k_scale (Optional[float]): Scaling factor for teacher_forcing scheduler (default: None)
         jac_penalty (float): Weight for Jacobian regularization (default: 0.0)
         jac_norm_ord (str): Order of norm for Jacobian regularization (default: 'fro')
         loop_closure_training (bool): Whether to use loop closure training (default: True)
         mix_trajectories (bool): Whether to mix trajectories during training (default: True)
         loop_closure_interp_pts (int): Number of interpolation points for loop closure (default: 20)
-        loop_closure_int_method (str): Integration method for loop closure (default: 'Trapezoid')
         n_loops (Optional[int]): Number of loops for loop closure (default: None)
         n_loop_pts (Optional[int]): Number of points per loop (default: None)
         loop_path (str): Path type for loop closure ('line' or 'spline') (default: 'line')
@@ -288,16 +285,13 @@ class LitBase(L.LightningModule):
                     gradient_clip_algorithm='norm',
                     jacobianODEint_kwargs={},
                     use_scheduler=False,
-                    scheduler_type='teacher_forcing',
                     min_lr=None,
                     k_scale=None,
-                    cosine_T_max=None,
                     jac_penalty=0.0,
                     jac_norm_ord='fro',
                     loop_closure_training=True,
-                    mix_trajectories=True,  
+                    mix_trajectories=True,
                     loop_closure_interp_pts=20,
-                    loop_closure_int_method='Trapezoid',
                     n_loops=None,
                     n_loop_pts=None,
                     loop_path='line',
@@ -385,19 +379,12 @@ class LitBase(L.LightningModule):
 
         self.jacobianODEint_kwargs = jacobianODEint_kwargs
         self.use_scheduler = use_scheduler
-        self.scheduler_type = scheduler_type
         self.min_lr = min_lr
         self.k_scale = k_scale
-        # Decouples LR-schedule horizon from trainer.max_epochs. With
-        # two-stage training (Stage A short, Stage B long) the cosine should
-        # span the full horizon so Stage B picks up at the same LR Stage A
-        # left at. None falls back to trainer.max_epochs (legacy behavior).
-        self.cosine_T_max = cosine_T_max
         self.jac_penalty = jac_penalty
         self.jac_norm_ord = jac_norm_ord
         self.loop_closure_training = loop_closure_training
         self.loop_closure_interp_pts = loop_closure_interp_pts
-        self.loop_closure_int_method = loop_closure_int_method
         self.n_loops = n_loops
         self.n_loop_pts = n_loop_pts
         self.loop_path = loop_path
@@ -622,16 +609,15 @@ class LitBase(L.LightningModule):
         return {'loss': loss, 'metric_vals': metric_vals, 'outputs': outputs}
     
     def loop_closure_model_step(
-            self, 
-            batch, 
-            batch_idx=0, 
+            self,
+            batch,
+            batch_idx=0,
             dataloader_idx=0,
             mix_trajectories=None,
             n_loops=None,
             n_loop_pts=None,
             loop_path=None,
             loop_closure_interp_pts=None,
-            loop_closure_int_method=None,
         ):
         """Perform a single training step for loop closure.
 
@@ -644,7 +630,6 @@ class LitBase(L.LightningModule):
             n_loop_pts (Optional[int]): Points per loop
             loop_path (str): Path type for loop closure
             loop_closure_interp_pts (Optional[int]): Interpolation points
-            loop_closure_int_method (Optional[str]): Integration method
 
         Returns:
             dict: Dictionary containing loss values and metrics
@@ -657,13 +642,10 @@ class LitBase(L.LightningModule):
             n_loop_pts = self.n_loop_pts
         if loop_path is None:
             loop_path = self.loop_path
-        if loop_closure_int_method is None:
-            loop_closure_int_method = self.loop_closure_int_method
         if loop_closure_interp_pts is None:
             loop_closure_interp_pts = self.loop_closure_interp_pts
 
-        loop_int = loop_closure(batch, self.compute_jacobians, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method=loop_closure_int_method)
-        # loop_int, err_bound = loop_closure_with_est_error(batch, self.compute_jacobians, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method=loop_closure_int_method, return_err_bound=True)
+        loop_int = loop_closure(batch, self.compute_jacobians, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method='Trapezoid')
 
 
         loop_zeros = torch.zeros_like(loop_int)
@@ -1069,34 +1051,19 @@ class LitBase(L.LightningModule):
             raise ValueError(f'Optimizer {self.optimizer} not recognized')
 
         if self.use_scheduler:
-            if self.scheduler_type == 'cosine':
-                t_max = self.cosine_T_max if self.cosine_T_max is not None else self.trainer.max_epochs
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer,
-                    T_max=t_max,
-                    eta_min=self.min_lr if self.min_lr is not None else 0,
-                )
-                return {
-                    "optimizer": optimizer,
-                    "lr_scheduler": {
-                        "scheduler": scheduler,
-                        "interval": "epoch",
-                    },
-                }
-            else:  # 'teacher_forcing' (original behaviour)
-                scheduler = TeacherForcingLRScheduler(
-                    optimizer,
-                    lit_model=self,
-                    min_lr=self.min_lr,
-                    k=self.k_scale
-                )
-                return {
-                    "optimizer": optimizer,
-                    "lr_scheduler": {
-                        "scheduler": scheduler,
-                        "interval": "step",
-                    },
-                }
+            scheduler = TeacherForcingLRScheduler(
+                optimizer,
+                lit_model=self,
+                min_lr=self.min_lr,
+                k=self.k_scale,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
         else:
             return {
                 "optimizer": optimizer,

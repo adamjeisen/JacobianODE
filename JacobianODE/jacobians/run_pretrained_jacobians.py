@@ -174,26 +174,6 @@ def train_pretrained_jacobians(cfg: DictConfig) -> None:
 
     lit_model.eq = eq
 
-    # ----------------------------------------
-    # PRECOMPUTE LATENT NOISE SCALE FACTOR
-    # ----------------------------------------
-    latent_noise_scale = cfg.training.lightning.get('latent_noise_scale', 0)
-    precompute = cfg.training.lightning.get('precompute_latent_noise_factor', True)
-    if latent_noise_scale > 0 and precompute:
-        import math
-        norms = []
-        with torch.no_grad():
-            for i, batch in enumerate(train_dataloader):
-                if i >= 10:
-                    break
-                batch = batch.type(lit_model.dtype)
-                z = lit_model.encode_trajectory(batch)
-                norms.append(z.norm(dim=-1).mean().item())
-                d_latent = z.shape[-1]
-        factor = sum(norms) / len(norms) / math.sqrt(d_latent)
-        lit_model._latent_noise_scale_factor = factor
-        log.info(f"Precomputed latent noise scale factor: {factor:.6f}")
-
     log_training_info(train_dataloader, trajs, lit_model, log=log)
 
     # ----------------------------------------

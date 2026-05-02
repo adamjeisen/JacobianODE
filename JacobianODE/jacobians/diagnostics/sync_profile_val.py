@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             kw = dict(
                 alpha_teacher_forcing=getattr(lit_model, "alpha_validation", 1),
                 obs_noise_scale=0,
-                latent_noise_scale=0,
+
                 reconstruction_mode="most_recent",
             )
             with synced("val/1.trajectory_step", sink, device):
@@ -109,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
                 with torch.no_grad():
                     _ = lit_model.trajectory_model_step(
                         batch, 0, 0, alpha_teacher_forcing=1,
-                        obs_noise_scale=0, latent_noise_scale=0,
+                        obs_noise_scale=0,
                     )
             with synced("val/6.eigvals", sink, device):
                 with torch.no_grad():

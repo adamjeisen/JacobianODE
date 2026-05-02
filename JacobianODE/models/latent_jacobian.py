@@ -69,9 +69,6 @@ class LitLatentJacobianODE(LitBase):
         fnn_elementwise_regularization=False,
         fnn_use_pca=False,
         fnn_n_samples=None,
-        latent_noise_scale=0.0,
-        latent_noise_per_step=False,
-        precompute_latent_noise_factor=True,
         decode_only_recent=False,
         # Subspace splitting (for dimension-preserving encoders)
         n_target_dims=None,
@@ -126,10 +123,6 @@ class LitLatentJacobianODE(LitBase):
         self.fnn_elementwise_regularization = fnn_elementwise_regularization
         self.fnn_use_pca = fnn_use_pca
         self.fnn_n_samples = fnn_n_samples
-        self.latent_noise_scale = latent_noise_scale
-        self.latent_noise_per_step = latent_noise_per_step
-        self.precompute_latent_noise_factor = precompute_latent_noise_factor
-        self._latent_noise_scale_factor = None
         # Stride for JacobianODE sub-windows within each encoded batch.
         # Defaults to prediction_steps (non-overlapping).
         self.jac_window_stride = jac_window_stride if jac_window_stride is not None else prediction_steps
@@ -758,8 +751,6 @@ class LitLatentJacobianODE(LitBase):
         all_metrics=False,
         direct=None,
         obs_noise_scale=None,
-        latent_noise_scale=None,
-        latent_noise_per_step=None,
         alpha_teacher_forcing=None,
         teacher_forcing_steps=None,
         jacobianODEint_kwargs=None,
@@ -781,10 +772,6 @@ class LitLatentJacobianODE(LitBase):
         """
         if obs_noise_scale is None:
             obs_noise_scale = self.obs_noise_scale
-        if latent_noise_scale is None:
-            latent_noise_scale = self.latent_noise_scale
-        if latent_noise_per_step is None:
-            latent_noise_per_step = self.latent_noise_per_step
         if alpha_teacher_forcing is None:
             alpha_teacher_forcing = self.alpha_teacher_forcing
         if teacher_forcing_steps is None:
@@ -823,21 +810,6 @@ class LitLatentJacobianODE(LitBase):
                 z_dyn_clean = mu_dyn_clean
             else:
                 z_dyn_clean = mu_dyn  # target is always the mean, not the sample
-
-            # Add isotropic noise in latent space before propagation.
-            if latent_noise_scale > 0:
-                if self._latent_noise_scale_factor is not None:
-                    factor = self._latent_noise_scale_factor
-                else:
-                    factor = z_dyn.detach().norm(dim=-1).mean() / math.sqrt(z_dyn.shape[-1])
-                if latent_noise_per_step:
-                    noise = torch.randn_like(z_dyn) * latent_noise_scale * factor
-                else:
-                    noise = torch.randn(
-                        z_dyn.shape[0], 1, z_dyn.shape[-1],
-                        device=z_dyn.device, dtype=z_dyn.dtype,
-                    ) * latent_noise_scale * factor
-                z_dyn = z_dyn + noise
 
         # 2. Determine sub-window parameters and gather windows
         with self._timed("traj/2.window_gather"):
@@ -1513,7 +1485,6 @@ class LitLatentJacobianODE(LitBase):
         model_step_kwargs = {
             'alpha_teacher_forcing': self.alpha_validation,
             'obs_noise_scale': 0,
-            'latent_noise_scale': 0,
             'reconstruction_mode': 'most_recent',
         }
 
@@ -1565,7 +1536,6 @@ class LitLatentJacobianODE(LitBase):
                     batch, batch_idx, dataloader_idx,
                     alpha_teacher_forcing=1,
                     obs_noise_scale=0,
-                    latent_noise_scale=0,
                 )
         # Accumulate raw MAE components for ratio-of-means aggregation
         if not hasattr(self, '_val_one_step_model_maes'):

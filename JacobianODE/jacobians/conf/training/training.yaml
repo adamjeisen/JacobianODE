@@ -22,21 +22,9 @@ lightning:
     weight_decay: 1e-4
   use_scheduler: True
   # use_scheduler: False
-  scheduler_type: cosine  # 'cosine' (CosineAnnealingLR) or 'teacher_forcing' (legacy)
-  min_lr: 1e-6 # minimum learning rate (eta_min for cosine, floor for teacher_forcing)
-  # T_max for cosine schedule. Decoupled from trainer.max_epochs so that
-  # (a) two-stage training (Stage A short, Stage B long) shares one
-  # coherent cosine across both stages — Stage B's ckpt resume picks up
-  # at exactly the LR Stage A left at, no re-warm — and (b) we don't
-  # accidentally set max_epochs huge (e.g. 1000) and end up with cosine
-  # that never meaningfully decays in the actual training range. 100 was
-  # chosen from historical wandb stop-epoch distributions: WMTask runs
-  # hit early stopping at p95~43 epochs, so T_max=100 means LR is at
-  # ~30% of initial by the time models converge — a real schedule.
-  # null falls back to trainer.max_epochs (legacy behavior).
-  cosine_T_max: 100
+  min_lr: 1e-6 # minimum learning rate floor for teacher_forcing scheduler
   # ADVANCED HYPERPARAMETERS
-  k_scale: 1 # controls the slope of the learning rate scheduler (teacher_forcing only)
+  k_scale: 1 # controls the slope of the teacher_forcing learning rate scheduler
   gradient_clip_val: 1.0
   gradient_clip_algorithm: 'norm'
 
@@ -57,10 +45,7 @@ lightning:
   # -----------------
   # obs_noise_scale: 5e-2
   obs_noise_scale: 0
-  latent_noise_scale: 0  # isotropic noise added to latent embeddings before JacobianODE propagation (latent model only)
-  latent_noise_per_step: false  # false = same offset for all timesteps (manifold displacement); true = independent noise each step
-  precompute_latent_noise_factor: true  # true = precompute scale factor from training data; false = compute per-batch on-the-fly
-  
+
   # -----------------
   # JACOBIAN REGULARIZATION
   # -----------------
@@ -100,7 +85,6 @@ lightning:
   # ADVANCED HYPERPARAMETERS
   mix_trajectories: True # whether to mix trajectories during training
   loop_closure_interp_pts: 20 # number of interpolation points in between end points for each line segment
-  loop_closure_int_method: 'Trapezoid'
   n_loops: null # set default to traj batches
 
   # -----------------

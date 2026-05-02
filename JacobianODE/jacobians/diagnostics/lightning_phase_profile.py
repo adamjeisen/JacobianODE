@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
             kw = dict(
                 alpha_teacher_forcing=getattr(self, "alpha_validation", 1),
                 obs_noise_scale=0,
-                latent_noise_scale=0,
+
                 reconstruction_mode="most_recent",
             )
             val_rets = {}
@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             with torch.no_grad():
                 one_step_ret = self.trajectory_model_step(
                     batch, batch_idx, dataloader_idx,
-                    alpha_teacher_forcing=1, obs_noise_scale=0, latent_noise_scale=0,
+                    alpha_teacher_forcing=1, obs_noise_scale=0,
                 )
             _sync(); t5 = time.perf_counter()
             sink["5.one_step_traj"].append(t5 - t4)
