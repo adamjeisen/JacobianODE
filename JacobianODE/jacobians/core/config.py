@@ -466,7 +466,7 @@ def initialize_config(
                 )
         OmegaConf.update(cfg, "model.n_recent_dims", n_recent_dims, force_add=True)
         # n_latent: explicit in config for standard encoders, equals n_input
-        # for dimension-preserving encoders (e.g. AffineCouplingEncoder).
+        # for dimension-preserving encoders (e.g. CouplingEncoder).
         # null → dimension-preserving (resolve to n_input).
         if "n_latent" in cfg.model.encoder and cfg.model.encoder.n_latent is None:
             cfg.model.encoder.n_latent = dim

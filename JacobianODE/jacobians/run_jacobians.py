@@ -173,23 +173,13 @@ def _run_training(cfg: DictConfig) -> float:
     # ----------------------------------------
     # PCA on noisy training delay embeddings
     # ----------------------------------------
-    # Two opt-in features share the same PCA decomposition:
-    #   (1) model.n_target_var_threshold → auto-pick n_target_dims as the
-    #       smallest k such that cum_var[k-1] >= threshold.
-    #   (2) model.encoder.init_pca_basis → initialize the encoder's final
-    #       layer so that, at init, z = V @ x where V is the full PCA basis
-    #       (top-k PCs become z_dyn; lower PCs become z_null).
-    # If either is set, run the eigh once and use the results for both.
+    # PCA / FNN auto-dim of the dynamic subspace.
+    #   model.n_target_var_threshold (PCA): pick smallest k with cum_var[k-1] >= threshold.
+    #   model.n_target_dim_method='fnn'   : use whitened-PCA-FNN k=1 stop-at-min instead.
+    # ----------------------------------------
     _n_target_var_thresh = OmegaConf.select(
         cfg, "model.n_target_var_threshold", default=None
     )
-    _init_pca_basis = OmegaConf.select(
-        cfg, "model.encoder.init_pca_basis", default=False
-    )
-    # FNN-based autodim opt-in. When set to "fnn", n_target_dims is chosen by
-    # whitened-PCA-FNN k=1 stop-at-min on the training delay embeddings; the
-    # PCA-99% branches below are skipped. Default ("pca") preserves existing
-    # behavior. n_target_fnn_threshold is the Kennel false-neighbor cutoff.
     _n_target_dim_method = OmegaConf.select(
         cfg, "model.n_target_dim_method", default="pca"
     )
@@ -201,12 +191,6 @@ def _run_training(cfg: DictConfig) -> float:
             f"model.n_target_dim_method must be 'pca' or 'fnn', got "
             f"{_n_target_dim_method!r}"
         )
-    if _n_target_dim_method == "fnn" and _init_pca_basis:
-        raise ValueError(
-            "model.n_target_dim_method='fnn' is not compatible with "
-            "model.encoder.init_pca_basis=true (would require running both "
-            "FNN and PCA at autodim time). Set one or the other."
-        )
     # DirectSumCouplingEncoder partitions the input axis into N subsystems via
     # area_indices. With n_target_var_threshold set, we do PCA *per area* (each
     # area's input data is decomposed independently) and pick n_target_dims for
@@ -217,7 +201,6 @@ def _run_training(cfg: DictConfig) -> float:
         str(OmegaConf.select(cfg, "model.encoder._target_", default=""))
         .endswith("DirectSumCouplingEncoder")
     )
-    pca_basis_tensor = None
     if _n_target_dim_method == "fnn":
         from JacobianODE.fnn.dim_estimator import fnn_dim_estimate
         train_seq = trajs["train_trajs"].sequence
@@ -266,12 +249,6 @@ def _run_training(cfg: DictConfig) -> float:
                 cfg, "model.n_target_dims_fnn_auto", n_target, force_add=True,
             )
     elif _is_direct_sum and _n_target_var_thresh is not None:
-        if _init_pca_basis:
-            raise ValueError(
-                "init_pca_basis is not supported for DirectSumCouplingEncoder "
-                "(would need per-area PCA bases threaded through model_factory). "
-                "Set encoder.init_pca_basis=false."
-            )
         train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
         flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
         area_indices = OmegaConf.to_container(
@@ -310,18 +287,14 @@ def _run_training(cfg: DictConfig) -> float:
             cfg, "model.n_target_dims_per_block_pca_cum_var",
             list(cum_at_pick), force_add=True,
         )
-    elif _n_target_var_thresh is not None or _init_pca_basis:
+    elif _n_target_var_thresh is not None:
         train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
         flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
         flat -= flat.mean(dim=0, keepdim=True)
         cov = (flat.T @ flat) / (flat.shape[0] - 1)
         # eigh returns ascending eigvals + matching eigvecs as columns.
-        eigvals_asc, eigvecs_asc = torch.linalg.eigh(cov)
+        eigvals_asc, _ = torch.linalg.eigh(cov)
         eigvals = eigvals_asc.flip(0).clamp_min(0.0)
-        # PCA basis V: rows = PCs in variance-descending order.
-        # eigvecs_asc[:, i] is the i-th eigvec; transpose puts PCs as rows,
-        # then flip so descending.
-        V = eigvecs_asc.T.flip(0).contiguous()  # (D, D)
         explained = eigvals / eigvals.sum()
         cum_var = explained.cumsum(0)
         _cum = [f"{v:.4f}" for v in cum_var[: min(10, len(cum_var))].tolist()]
@@ -333,29 +306,20 @@ def _run_training(cfg: DictConfig) -> float:
         log.info(f"  explained variance (first 10): {_exp}")
         log.info(f"  cumulative variance (first 10): {_cum}")
 
-        if _n_target_var_thresh is not None:
-            n_target = int((cum_var >= _n_target_var_thresh).float().argmax().item()) + 1
-            log.info(
-                f"PCA-auto n_target_dims: threshold={_n_target_var_thresh}, "
-                f"chose n_target_dims={n_target}"
-            )
-            cfg.model.n_target_dims = n_target
-            cfg.model.params.input_dim = n_target
-            cfg.model.params.output_dim = n_target ** 2
-            OmegaConf.update(cfg, "model.n_target_dims_pca_auto", n_target, force_add=True)
-            OmegaConf.update(
-                cfg, "model.n_target_dims_pca_cum_var",
-                float(cum_var[n_target - 1].item()),
-                force_add=True,
-            )
-
-        if _init_pca_basis:
-            pca_basis_tensor = V.float()
-            log.info(
-                f"PCA-basis encoder init enabled: V shape={tuple(pca_basis_tensor.shape)}, "
-                f"orthogonality residual ||V V^T - I||_F = "
-                f"{torch.linalg.norm(V @ V.T - torch.eye(V.shape[0], dtype=torch.float64)).item():.3g}"
-            )
+        n_target = int((cum_var >= _n_target_var_thresh).float().argmax().item()) + 1
+        log.info(
+            f"PCA-auto n_target_dims: threshold={_n_target_var_thresh}, "
+            f"chose n_target_dims={n_target}"
+        )
+        cfg.model.n_target_dims = n_target
+        cfg.model.params.input_dim = n_target
+        cfg.model.params.output_dim = n_target ** 2
+        OmegaConf.update(cfg, "model.n_target_dims_pca_auto", n_target, force_add=True)
+        OmegaConf.update(
+            cfg, "model.n_target_dims_pca_cum_var",
+            float(cum_var[n_target - 1].item()),
+            force_add=True,
+        )
 
     # ----------------------------------------
     # SET UP WANDB
@@ -383,9 +347,9 @@ def _run_training(cfg: DictConfig) -> float:
         x0 = None
 
     if cfg.data.train_test_params.delay_embedding_params.n_delays > 1:
-        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True, pca_basis=pca_basis_tensor)
+        lit_model = make_model(cfg, dt, eq=None, project=project, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True)
     else:
-        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True, pca_basis=pca_basis_tensor)
+        lit_model = make_model(cfg, dt, eq=eq, project=project, x0=x0, mu=mu, sigma=sigma, noise_scale_factor=noise_scale_factor, generalized_variance=generalized_variance, verbose=True)
 
     # Store SLURM timeout in the app config so it gets logged to W&B.
     # This allows downstream tools (run_analytics, discover_sweep_runs) to

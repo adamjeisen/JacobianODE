@@ -29,21 +29,17 @@ from .models import (
 )
 from .coupling_flows import (
     AdditiveCouplingLayer,
-    AdditiveFlow,
-    AffineCouplingEncoder,
-    AffineCouplingLayer,
-    ActNorm,
     AnalyticAutoregressiveEncoder,
     AnalyticAutoregressiveLayer,
-    AnalyticCouplingLayer,
+    CayleyOrthogonal,
     CouplingEncoder,
+    DirectSumCouplingEncoder,
+    FixedOrthogonal,
     FixedPermutation,
-    LOFTLayer,
     MADE,
     MaskedLinear,
     SplineAutoregressiveEncoder,
     SplineAutoregressiveLayer,
-    SplineCouplingLayer,
 )
 from .sequence_networks import (
     SequenceAutoencoder,

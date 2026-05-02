@@ -33,7 +33,7 @@ class LitCouplingFlow(L.LightningModule):
     Parameters
     ----------
     encoder : nn.Module
-        An :class:`AffineCouplingEncoder` (or any invertible module with
+        A :class:`CouplingEncoder` (or any invertible module with
         ``forward``, ``inverse``, and ``n_latent`` attribute).
     n_obs : int
         Input / output dimension D.

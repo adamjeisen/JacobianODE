@@ -25,7 +25,6 @@ def make_model(
     noise_scale_factor: float = 1.0,
     generalized_variance: Optional[float] = None,
     verbose: bool = False,
-    pca_basis: Optional[torch.Tensor] = None,
 ) -> Any:
     """Create and initialize the model for training.
 
@@ -59,34 +58,8 @@ def make_model(
     extra_kwargs = {}
 
     # If the config has an encoder section, instantiate it.
-    # When init_pca_basis is enabled, inject the precomputed basis as an
-    # extra kwarg (it can't live in the YAML since it's a runtime tensor).
-    # At training time run_jacobians passes the real PCA basis. At
-    # checkpoint-load time (analytics / re-runs / anywhere load_run is
-    # called), the FixedOrthogonal buffer is about to be restored by
-    # load_checkpoint anyway, so we fall back to an identity placeholder
-    # of the right shape — the buffer values get overwritten by the
-    # state-dict load downstream.
     if "encoder" in cfg.model:
-        encoder_extra_kwargs = {}
-        if OmegaConf.select(cfg, "model.encoder.init_pca_basis", default=False):
-            if pca_basis is None:
-                import logging as _logging
-                _n_input = OmegaConf.select(cfg, "model.encoder.n_input")
-                if _n_input is None:
-                    raise ValueError(
-                        "model.encoder.init_pca_basis=True but neither pca_basis "
-                        "nor model.encoder.n_input is available — cannot construct "
-                        "a placeholder."
-                    )
-                _logging.getLogger(__name__).info(
-                    f"init_pca_basis=True with no pca_basis kwarg — constructing an "
-                    f"identity ({_n_input}x{_n_input}) placeholder; load_checkpoint "
-                    f"will restore the trained orthogonal buffer."
-                )
-                pca_basis = torch.eye(int(_n_input))
-            encoder_extra_kwargs["pca_basis"] = pca_basis
-        encoder = instantiate(cfg.model.encoder, **encoder_extra_kwargs)
+        encoder = instantiate(cfg.model.encoder)
         # DirectSumCouplingEncoder exposes n_target_dims (sum of per-area k's).
         # Downstream _split_latent slices z[..., :cfg.model.n_target_dims], so
         # the encoder's total dyn-dim must match the model-level setting —
