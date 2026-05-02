@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from ..jacobians.lightning_base import LitBase, loop_closure
 from ..jacobians.jacobianODE import JacobianODEint
 from ..jacobians.metrics import mase, mse, r2_score, normalized_mse
-from ..fnn.regularizers import loss_false, tangent_space_entropy
+from ..fnn.regularizers import loss_false
 
 
 class LitLatentJacobianODE(LitBase):
@@ -72,12 +72,6 @@ class LitLatentJacobianODE(LitBase):
         latent_noise_scale=0.0,
         latent_noise_per_step=False,
         precompute_latent_noise_factor=True,
-        learn_r2_weight=False,
-        learn_loop_closure_weight=False,
-        learn_fnn_weight=False,
-        learn_jac_cons_weight=False,
-        learn_jac_norm_weight=False,
-        log_var_init='naive',
         decode_only_recent=False,
         # Subspace splitting (for dimension-preserving encoders)
         n_target_dims=None,
@@ -110,12 +104,6 @@ class LitLatentJacobianODE(LitBase):
         # encoder/decoder is trained as a standalone autoencoder. Default
         # False — does not affect existing experiment configs.
         encoder_only_mode=False,
-        # Tangent space entropy
-        tangent_entropy_weight=0.0,
-        tangent_entropy_mode='quadratic',
-        tangent_entropy_n_samples=256,
-        # Soft diffeomorphism cycle-consistency
-        diffeomorphism_weight=0.0,
         # Eigenvalue diagnostics
         n_eigval_jacobians=None,
         # Step profiling.  profile_output=None disables entirely.
@@ -225,14 +213,6 @@ class LitLatentJacobianODE(LitBase):
             w_norm = w_raw * (obs_dim / w_raw.sum())
             self.register_buffer('recon_weights', w_norm)
 
-        # Tangent space entropy
-        self.tangent_entropy_weight = tangent_entropy_weight
-        self.tangent_entropy_mode = tangent_entropy_mode
-        self.tangent_entropy_n_samples = tangent_entropy_n_samples
-
-        # Soft diffeomorphism cycle-consistency
-        self.diffeomorphism_weight = diffeomorphism_weight
-
         # Number of B×T Jacobian matrices to randomly sample for eigenvalue
         # computation during validation. None means use all.
         self.n_eigval_jacobians = n_eigval_jacobians
@@ -254,28 +234,6 @@ class LitLatentJacobianODE(LitBase):
             )
         else:
             self.true_lyapunov_exponents = None
-
-        # Homoscedastic uncertainty weighting (Kendall et al. 2018).
-        # For each enabled group a learnable log-variance s_i is registered.
-        # The weighted contribution becomes: 0.5 * exp(-s_i) * L_i + 0.5 * s_i
-        self.learn_r2_weight = learn_r2_weight
-        self.learn_loop_closure_weight = learn_loop_closure_weight
-        self.learn_fnn_weight = learn_fnn_weight
-        self.learn_jac_cons_weight = learn_jac_cons_weight
-        self.learn_jac_norm_weight = learn_jac_norm_weight
-        self.log_var_init = log_var_init
-        self._log_var_auto_initialized = False
-
-        if learn_r2_weight:
-            self.log_var_r2 = nn.Parameter(torch.zeros(1))
-        if learn_loop_closure_weight:
-            self.log_var_loop_closure = nn.Parameter(torch.zeros(1))
-        if learn_fnn_weight:
-            self.log_var_fnn = nn.Parameter(torch.zeros(1))
-        if learn_jac_cons_weight:
-            self.log_var_jac_cons = nn.Parameter(torch.zeros(1))
-        if learn_jac_norm_weight:
-            self.log_var_jac_norm = nn.Parameter(torch.zeros(1))
 
     # ------------------------------------------------------------------
     # Step profiling helpers
@@ -666,38 +624,6 @@ class LitLatentJacobianODE(LitBase):
                 self.encoder.train()
         return J_all
 
-    def _tangent_space_entropy_loss(self, batch, z_full):
-        """Tangent space entropy using **encoder** Jacobians (dz/dx).
-
-        Projects latent velocity ``dz = z_{t+1} - z_t`` onto the encoder
-        Jacobian's left singular vectors U (computed at x_t, **detached**),
-        then minimises the entropy of the per-dimension energy distribution.
-
-        For coupling encoders (``n_target_dims is not None``), only the
-        dynamic subspace ``z_dyn`` is used for ``dz`` and only the
-        corresponding Jacobian rows are computed.
-
-        Parameters
-        ----------
-        batch : torch.Tensor
-            Raw observations ``(B, T, D_obs)``.
-        z_full : torch.Tensor
-            Full encoded latent ``(B, T', D_latent)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Scalar loss (zero if T' < 2).
-        """
-        dz_sample, x_sample, n_dyn, n_obs = self._build_tangent_pairs(
-            batch, z_full, n_samples=self.tangent_entropy_n_samples,
-        )
-        if dz_sample is None:
-            z_dyn, _ = self._split_latent(z_full)
-            return z_dyn.new_zeros(1).squeeze()
-        J_all = self._encoder_jacobian_at(x_sample, n_dyn, n_obs)
-        return tangent_space_entropy(dz_sample, J_all, mode=self.tangent_entropy_mode)
-
     def compute_tangent_spectrum(
         self,
         batch: torch.Tensor,
@@ -713,9 +639,9 @@ class LitLatentJacobianODE(LitBase):
         concentrate on the top ~3 components (the true intrinsic dim of the
         attractor's tangent bundle).
 
-        Same math as :meth:`_tangent_space_entropy_loss` up to the SVD +
-        projection step; this method skips the entropy reduction and returns
-        the raw ranked spectrum so it can be plotted / averaged across runs.
+        Projects ``dz`` onto the encoder Jacobian's left singular vectors
+        and returns the raw ranked per-direction spectrum (no entropy
+        reduction) so it can be plotted / averaged across runs.
 
         Parameters
         ----------
@@ -1220,49 +1146,6 @@ class LitLatentJacobianODE(LitBase):
 
         return self._weighted_obs_loss(recon_targets, recon_decoded)
 
-    def _diffeomorphism_loss(self, batch, z_full):
-        """Soft diffeomorphism penalty: encourage E and D to be approximate inverses.
-
-        Forward cycle: normalized_mse(x, D(E(x))) — full reconstruction through
-        the ENTIRE latent space (no subspace splitting or zero-padding).
-        Backward cycle: normalized_mse(z, E(D(z))) — re-encoding consistency.
-
-        Unlike ``_reconstruction_loss``, this operates on the full z (not
-        split/padded) so that it penalizes information loss in ALL latent
-        dimensions.
-
-        Parameters
-        ----------
-        batch : torch.Tensor
-            Raw observations ``(B, T, D_obs)``.
-        z_full : torch.Tensor
-            Full latent trajectory ``(B, T', D_latent)`` from
-            ``encode_trajectory``.
-
-        Returns
-        -------
-        torch.Tensor
-            Scalar loss (average of forward and backward cycle losses).
-        """
-        if hasattr(self.encoder, 'time_window'):
-            raise NotImplementedError(
-                "Diffeomorphism loss is not supported for window-based encoders"
-            )
-
-        # Forward cycle: D(E(x)) should reconstruct x
-        x_recon = self.decode_trajectory(z_full)  # (B, T', D_obs)
-
-        margin = getattr(self.encoder, 'context_margin', 0)
-        x_target = batch[:, margin:, :] if margin > 0 else batch
-
-        forward_loss = normalized_mse(x_target, x_recon)
-
-        # Backward cycle: E(D(z)) should recover z
-        z_reencoded = self.encoder.encode(x_recon)  # (B, T', D_latent)
-        backward_loss = normalized_mse(z_full, z_reencoded)
-
-        return 0.5 * (forward_loss + backward_loss)
-
     def _jac_consistency_loss(self, z, jacs):
         """Jacobian-consistency loss in latent space.
 
@@ -1289,57 +1172,6 @@ class LitLatentJacobianODE(LitBase):
         vel = z[:, 1:] - z[:, :-1]                                 # (B, T-1, D)
         vel_t1_pred = (J_exp @ vel[:, :-1].unsqueeze(-1)).squeeze(-1)  # (B, T-2, D)
         return (vel[:, 1:] - vel_t1_pred).pow(2).mean() / z.var()
-
-    # ------------------------------------------------------------------
-    # Homoscedastic uncertainty weighting helpers
-    # ------------------------------------------------------------------
-
-    def _homoscedastic_loss(self, loss, log_var):
-        """Apply homoscedastic uncertainty weighting to a loss term.
-
-        Computes ``0.5 * exp(-log_var) * loss + 0.5 * log_var``.
-        The first term down-weights large losses; the second acts as a
-        learned-regularisation penalty that prevents log_var from growing
-        without bound.
-
-        Parameters
-        ----------
-        loss : torch.Tensor
-            Scalar (or broadcastable) raw loss value.
-        log_var : nn.Parameter
-            Learnable log-variance scalar ``s_i``.
-        """
-        return 0.5 * torch.exp(-log_var) * loss + 0.5 * log_var
-
-    def _auto_init_log_vars(self, r2_loss=None, loop_loss=None, fnn_loss=None,
-                             jac_cons_loss=None, jac_norm=None):
-        """Initialise log_var parameters to log of initial loss magnitudes.
-
-        Sets each active ``log_var`` parameter to ``log(raw_loss)`` so that
-        the first-step gradient contribution is normalised and no extreme
-        spikes occur.  Called once, on the first training batch.
-
-        Parameters
-        ----------
-        r2_loss, loop_loss, fnn_loss, jac_cons_loss, jac_norm : Tensor or None
-            Raw (unweighted) loss values for each group.  Groups whose
-            corresponding flag is False are ignored.
-        """
-        eps = 1e-8
-        pairs = [
-            (self.learn_r2_weight,           getattr(self, 'log_var_r2', None),           r2_loss),
-            (self.learn_loop_closure_weight, getattr(self, 'log_var_loop_closure', None), loop_loss),
-            (self.learn_fnn_weight,          getattr(self, 'log_var_fnn', None),          fnn_loss),
-            (self.learn_jac_cons_weight,     getattr(self, 'log_var_jac_cons', None),     jac_cons_loss),
-            (self.learn_jac_norm_weight,     getattr(self, 'log_var_jac_norm', None),     jac_norm),
-        ]
-        with torch.no_grad():
-            for enabled, param, raw in pairs:
-                if enabled and param is not None and raw is not None:
-                    val = float(raw.detach()) if isinstance(raw, torch.Tensor) else float(raw)
-                    if val > eps:
-                        param.data.fill_(torch.tensor(val).log().item())
-        self._log_var_auto_initialized = True
 
     # ------------------------------------------------------------------
     # Training step
@@ -1396,28 +1228,12 @@ class LitLatentJacobianODE(LitBase):
             if eff_dyn_w > 0 and kl_dyn_loss is not None:
                 loss = loss + eff_dyn_w * kl_dyn_loss
 
-        # Tangent space entropy (encoder Jacobians via autograd)
-        tangent_entropy_loss = None
-        if self.tangent_entropy_weight > 0:
-            tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
-            loss = loss + self.tangent_entropy_weight * tangent_entropy_loss
-
-        # Diffeomorphism cycle-consistency (uses sampled z when VAE is active)
-        diffeo_loss = None
-        if self.diffeomorphism_weight > 0:
-            diffeo_loss = self._diffeomorphism_loss(batch, z_full_for_recon)
-            loss = loss + self.diffeomorphism_weight * diffeo_loss
-
         log_kwargs = dict(on_step=False, on_epoch=True, sync_dist=True, prog_bar=True)
         self.log("warmup recon_loss", recon_loss, **log_kwargs)
         if kl_null_loss is not None:
             self.log("warmup kl_null_loss", kl_null_loss, **log_kwargs)
         if kl_dyn_loss is not None:
             self.log("warmup kl_dyn_loss", kl_dyn_loss, **log_kwargs)
-        if tangent_entropy_loss is not None:
-            self.log("warmup tangent_entropy_loss", tangent_entropy_loss, **log_kwargs)
-        if diffeo_loss is not None:
-            self.log("warmup diffeo_loss", diffeo_loss, **log_kwargs)
         return loss
 
     def _dynamics_warmup_step(self, batch):
@@ -1627,7 +1443,7 @@ class LitLatentJacobianODE(LitBase):
         # --- Group 3: FNN regularization (on z_dyn) ---
         fnn_loss = None
         with self._timed("train/6.fnn_loss"):
-            if self.fnn_weight > 0 or self.learn_fnn_weight:
+            if self.fnn_weight > 0:
                 z_flat = z_dyn.reshape(-1, z_dyn.shape[-1])
                 fnn_loss = loss_false(
                     z_flat,
@@ -1641,7 +1457,7 @@ class LitLatentJacobianODE(LitBase):
         jac_cons_loss = None
         jacs_for_cons = None
         with self._timed("train/7.jac_consistency"):
-            if self.jac_consistency_weight > 0 or self.learn_jac_cons_weight:
+            if self.jac_consistency_weight > 0:
                 jacs_for_cons = self.compute_jacobians(z_dyn)
                 jac_cons_loss = self._jac_consistency_loss(z_dyn, jacs_for_cons)
 
@@ -1662,81 +1478,35 @@ class LitLatentJacobianODE(LitBase):
             else:
                 kl_dyn_loss = torch.tensor(0.0, device=batch.device)
 
-        # --- Group 7: Tangent space entropy (encoder Jacobians via autograd) ---
-        tangent_entropy_loss = None
-        with self._timed("train/8.tangent_entropy"):
-            if self.tangent_entropy_weight > 0:
-                tangent_entropy_loss = self._tangent_space_entropy_loss(batch, z_full)
-
-        # --- Group 8: Soft diffeomorphism cycle-consistency ---
-        diffeo_loss = None
-        with self._timed("train/9.diffeomorphism"):
-            if self.diffeomorphism_weight > 0:
-                diffeo_loss = self._diffeomorphism_loss(batch, z_full_for_recon)
-
         # ----------------------------------------------------------------
-        # Auto-initialise log_var parameters on the very first batch
-        # ----------------------------------------------------------------
-        if self.log_var_init == 'auto' and not self._log_var_auto_initialized:
-            self._auto_init_log_vars(
-                r2_loss=r2_loss,
-                loop_loss=loop_loss,
-                fnn_loss=fnn_loss,
-                jac_cons_loss=jac_cons_loss,
-                jac_norm=jac_norm,
-            )
-
-        # ----------------------------------------------------------------
-        # Combine into total_loss, applying homoscedastic or fixed weights
+        # Combine into total_loss with fixed weights
         # ----------------------------------------------------------------
         total_loss = torch.zeros(1, device=batch.device, dtype=batch.dtype).squeeze()
 
         # R²-like group
-        if self.learn_r2_weight:
-            total_loss = total_loss + self._homoscedastic_loss(r2_loss, self.log_var_r2)
-        else:
-            total_loss = total_loss + r2_loss
+        total_loss = total_loss + r2_loss
 
         # Loop closure group
         if loop_loss is not None:
-            if self.learn_loop_closure_weight:
-                total_loss = total_loss + self._homoscedastic_loss(loop_loss, self.log_var_loop_closure)
-            else:
-                total_loss = total_loss + self.loop_closure_weight * loop_loss
+            total_loss = total_loss + self.loop_closure_weight * loop_loss
 
         # Jac norm group
-        if self.learn_jac_norm_weight:
-            total_loss = total_loss + self._homoscedastic_loss(jac_norm, self.log_var_jac_norm)
-        elif self.jac_penalty > 0:
+        if self.jac_penalty > 0:
             total_loss = total_loss + self.jac_penalty * jac_norm
 
         # Jac consistency group
         if jac_cons_loss is not None:
-            if self.learn_jac_cons_weight:
-                total_loss = total_loss + self._homoscedastic_loss(jac_cons_loss, self.log_var_jac_cons)
-            else:
-                total_loss = total_loss + self.jac_consistency_weight * jac_cons_loss
+            total_loss = total_loss + self.jac_consistency_weight * jac_cons_loss
 
         # FNN group
-        if fnn_loss is not None:
-            if self.learn_fnn_weight:
-                total_loss = total_loss + self._homoscedastic_loss(fnn_loss, self.log_var_fnn)
-            elif self.fnn_weight > 0:
-                total_loss = total_loss + self.fnn_weight * fnn_loss
+        if fnn_loss is not None and self.fnn_weight > 0:
+            total_loss = total_loss + self.fnn_weight * fnn_loss
 
         # KL divergence (null + dyn, separate weights)
         if kl_null_loss is not None and eff_null_w > 0:
             total_loss = total_loss + eff_null_w * kl_null_loss
         if kl_dyn_loss is not None and eff_dyn_w > 0:
             total_loss = total_loss + eff_dyn_w * kl_dyn_loss
-
-        # Tangent space entropy
-        if tangent_entropy_loss is not None:
-            total_loss = total_loss + self.tangent_entropy_weight * tangent_entropy_loss
-
-        # Diffeomorphism cycle-consistency
-        if diffeo_loss is not None:
-            total_loss = total_loss + self.diffeomorphism_weight * diffeo_loss
 
         l1_loss = torch.sum(torch.abs(
             torch.cat([p.view(-1) for p in self.get_main_params()], dim=0)
@@ -1757,8 +1527,6 @@ class LitLatentJacobianODE(LitBase):
                 fnn_loss=fnn_loss,
                 kl_null_loss=kl_null_loss,
                 kl_dyn_loss=kl_dyn_loss,
-                tangent_entropy_loss=tangent_entropy_loss,
-                diffeo_loss=diffeo_loss,
                 on_step=False,
                 on_epoch=True,
                 sync_dist=True,
@@ -1905,12 +1673,6 @@ class LitLatentJacobianODE(LitBase):
                 else:
                     val_kl_dyn_loss = torch.tensor(0.0, device=batch.device)
 
-        # Diffeomorphism cycle-consistency
-        val_diffeo_loss = None
-        if self.diffeomorphism_weight > 0:
-            with torch.no_grad():
-                val_diffeo_loss = self._diffeomorphism_loss(batch, z_full)
-
         # Latent prediction loss (already computed inside trajectory_model_step)
         val_latent_pred_loss = val_rets['trajectory']['metric_vals'].get('latent_pred_loss')
 
@@ -1979,7 +1741,6 @@ class LitLatentJacobianODE(LitBase):
                     val_kl_null_loss=val_kl_null_loss,
                     val_kl_dyn_loss=val_kl_dyn_loss,
                     val_one_step_loss=one_step_ret['loss'],
-                    val_diffeo_loss=val_diffeo_loss,
                 )
 
         total_loss = sum(
@@ -2081,8 +1842,6 @@ class LitLatentJacobianODE(LitBase):
                               latent_pred_loss=None, jac_cons_loss=None,
                               fnn_loss=None,
                               kl_null_loss=None, kl_dyn_loss=None,
-                              tangent_entropy_loss=None,
-                              diffeo_loss=None,
                               on_step=False, on_epoch=True, sync_dist=True,
                               prog_bar=True):
         """Log training metrics.
@@ -2120,21 +1879,6 @@ class LitLatentJacobianODE(LitBase):
             self.log("train/kl_null_loss", kl_null_loss, **log_kwargs)
         if kl_dyn_loss is not None:
             self.log("train/kl_dyn_loss", kl_dyn_loss, **log_kwargs)
-        if tangent_entropy_loss is not None:
-            self.log("train/tangent_entropy_loss", tangent_entropy_loss, **log_kwargs)
-        if diffeo_loss is not None:
-            self.log("train/diffeo_loss", diffeo_loss, **log_kwargs)
-
-        if self.learn_r2_weight:
-            self.log("train/log_var_r2", self.log_var_r2.squeeze(), **log_kwargs)
-        if self.learn_loop_closure_weight:
-            self.log("train/log_var_loop_closure", self.log_var_loop_closure.squeeze(), **log_kwargs)
-        if self.learn_fnn_weight:
-            self.log("train/log_var_fnn", self.log_var_fnn.squeeze(), **log_kwargs)
-        if self.learn_jac_cons_weight:
-            self.log("train/log_var_jac_cons", self.log_var_jac_cons.squeeze(), **log_kwargs)
-        if self.learn_jac_norm_weight:
-            self.log("train/log_var_jac_norm", self.log_var_jac_norm.squeeze(), **log_kwargs)
 
         if self.teacher_forcing_annealing:
             self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs)
@@ -2145,8 +1889,7 @@ class LitLatentJacobianODE(LitBase):
     def log_validation_metrics(self, val_rets, batch, sync_dist=True,
                                val_loop_closure=None, val_recon_loss=None,
                                val_latent_pred_loss=None, val_kl_null_loss=None,
-                               val_kl_dyn_loss=None, val_one_step_loss=None,
-                               val_diffeo_loss=None):
+                               val_kl_dyn_loss=None, val_one_step_loss=None):
         """Log validation metrics.
 
         Overrides the base class to skip true-Jacobian comparison and
@@ -2194,9 +1937,6 @@ class LitLatentJacobianODE(LitBase):
                      add_dataloader_idx=False)
         if val_one_step_loss is not None:
             self.log("val/one_step_loss", val_one_step_loss, sync_dist=sync_dist,
-                     add_dataloader_idx=False)
-        if val_diffeo_loss is not None:
-            self.log("val/diffeo_loss", val_diffeo_loss, sync_dist=sync_dist,
                      add_dataloader_idx=False)
 
         self._log_lyapunov_comparison(batch, "val", sync_dist=sync_dist)

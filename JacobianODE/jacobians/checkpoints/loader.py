@@ -604,7 +604,7 @@ def load_checkpoint(
         checkpoint_data = torch.load(
             checkpoint_path, weights_only=False, map_location="cpu", mmap=True,
         )
-        lit_model.load_state_dict(checkpoint_data["state_dict"])
+        lit_model.load_state_dict(checkpoint_data["state_dict"], strict=False)
         return
 
     if verbose:
@@ -706,7 +706,7 @@ def load_checkpoint(
     ):
         loaded_state["latent_criterion.denom"] = loaded_state["criterion.denom"].clone()
 
-    lit_model.load_state_dict(loaded_state)
+    lit_model.load_state_dict(loaded_state, strict=False)
     lit_model.eval()
 
     # Cleanup
