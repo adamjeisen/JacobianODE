@@ -302,15 +302,21 @@ def _write_and_push_instruction(
     overrides: list[str],
     run_id: str,
     migrate_to: dict | None = None,
+    two_stage: dict | None = None,
+    kind: str = "stage-b",
     repo_dir: Path | None = None,
 ) -> None:
     """Write a sweep instruction file directly to jacobian-reports/instructions/pending
     and push. Mirrors what ~/bin/j-submit does, but lets us include
-    arbitrary block-level fields like ``migrate_to:`` that the bash
-    script doesn't support.
+    arbitrary block-level fields like ``migrate_to:`` and ``two_stage:``
+    that the bash script doesn't support.
 
-    Used by the two_stage cull tool when Stage A had ``migrate_to:`` so
-    Stage B inherits it.
+    Callers:
+      - two_stage_cull (kind="stage-b"): Stage B per-survivor instructions
+        (with migrate_to inherited from Stage A).
+      - axis_select_dispatch (kind="chain"): one combined instruction
+        for the next sweep after a scout, optionally carrying a
+        two_stage block so the next sweep itself runs as Stage A.
     """
     import datetime
     repo = repo_dir or (Path.home() / "Documents" / "jacobian-analyses"
@@ -320,13 +326,17 @@ def _write_and_push_instruction(
     pending.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    fname = f"{ts}-{experiment}-stage-b-{run_id}.yaml"
+    fname = f"{ts}-{experiment}-{kind}-{run_id}.yaml"
     target = pending / fname
 
     lines = [f"experiment: {experiment}", "overrides:"]
     for ov in overrides:
         # Quote each override to preserve = and special chars.
         lines.append(f'  - "{ov}"')
+    if two_stage is not None:
+        lines.append("two_stage:")
+        for k, v in two_stage.items():
+            lines.append(f"  {k}: {json.dumps(v)}")
     if migrate_to is not None:
         lines.append("migrate_to:")
         for k, v in migrate_to.items():
@@ -341,7 +351,7 @@ def _write_and_push_instruction(
                    cwd=repo, check=False, capture_output=True)
     subprocess.run(["git", "add", str(target)], cwd=repo, check=True)
     subprocess.run(
-        ["git", "commit", "-m", f"submit (stage-b): {experiment} run={run_id}"],
+        ["git", "commit", "-m", f"submit ({kind}): {experiment} run={run_id}"],
         cwd=repo, check=True, capture_output=True,
     )
     subprocess.run(["git", "push"], cwd=repo, check=True, capture_output=True)

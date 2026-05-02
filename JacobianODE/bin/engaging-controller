@@ -213,6 +213,7 @@ def _submit_one(
     overrides: list[str],
     two_stage: dict | None = None,
     migrate_to: dict | None = None,
+    chain: list | None = None,
 ) -> dict:
     """Run prepare_sweep + jsweep for one experiment. Returns dict of metadata
     including the SLURM array id (or raises on failure).
@@ -229,7 +230,7 @@ def _submit_one(
     ``process_migrations`` finds it next cycle.
     """
     if migrate_to and migrate_to.get("partition") == "mit_normal_gpu":
-        return _submit_one_split(exp, overrides, two_stage, migrate_to)
+        return _submit_one_split(exp, overrides, two_stage, migrate_to, chain=chain)
     branch, commit = _git_head_info()
     expected_path = STATE_DIR / "expected_tmp.json"
     expected_path.parent.mkdir(parents=True, exist_ok=True)
@@ -444,20 +445,24 @@ def _submit_one(
         shutil.move(str(expected_path), str(final_expected))
         expected_run_count = batch_count
 
-    # Two-stage protocol: persist the instruction's `two_stage:` block into
-    # expected.json so the post-publish hook can find it. Done after both
-    # the fresh-write and extend-write branches above so the patch lands
-    # regardless of which path created the file.
-    if (two_stage or migrate_to) and final_expected.is_file():
+    # Two-stage protocol: persist the instruction's `two_stage:` /
+    # `migrate_to:` / `chain:` blocks into expected.json so the
+    # post-publish hooks (_maybe_dispatch_stage_b, _maybe_dispatch_chain)
+    # can find them. Done after both the fresh-write and extend-write
+    # branches above so the patch lands regardless of which path
+    # created the file.
+    if (two_stage or migrate_to or chain) and final_expected.is_file():
         try:
             doc = json.loads(final_expected.read_text())
             if two_stage:
                 doc["two_stage"] = two_stage
             if migrate_to:
                 doc["migrate_to"] = migrate_to
+            if chain:
+                doc["chain"] = chain
             final_expected.write_text(json.dumps(doc, indent=2) + "\n")
         except Exception as e:
-            log(f"[{exp}] WARN failed to persist two_stage/migrate_to block: {e}")
+            log(f"[{exp}] WARN failed to persist two_stage/migrate_to/chain block: {e}")
 
     return {
         "wandb_group": group,
@@ -472,6 +477,7 @@ def _submit_one_split(
     overrides: list[str],
     two_stage: dict | None,
     migrate_to: dict,
+    chain: list | None = None,
 ) -> dict:
     """Migration-eligible variant of ``_submit_one``.
 
@@ -585,11 +591,14 @@ def _submit_one_split(
         merged["slurm_arrays"] = merged_slurm_arrays
         merged["partition_per_cell"] = merged_partition_per_cell
         merged["expected_run_count"] = len(merged_runs)
-        # Carry through latest two_stage / migrate_to values (in case the
-        # submitter intends to update them; for Stage B they're identical).
+        # Carry through latest two_stage / migrate_to / chain values (in
+        # case the submitter intends to update them; for Stage B they're
+        # identical).
         if two_stage:
             merged["two_stage"] = two_stage
         merged["migrate_to"] = migrate_to
+        if chain:
+            merged["chain"] = chain
         # Keep top-level slurm as ou_bcs for retry-safety (see comment below).
         merged["slurm"] = {
             "partition": OU_BCS_NORMAL.partition,
@@ -637,6 +646,8 @@ def _submit_one_split(
     if two_stage:
         expected["two_stage"] = two_stage
     expected["migrate_to"] = migrate_to
+    if chain:
+        expected["chain"] = chain
 
     final_expected.write_text(json.dumps(expected, indent=2) + "\n")
     expected_path.unlink(missing_ok=True)
@@ -761,14 +772,20 @@ def process_pending_instructions(dry_run: bool) -> int:
             log(f"[{f.name}] WARN ignoring non-dict migrate_to block: "
                 f"{type(migrate_to).__name__}")
             migrate_to = None
+        chain = data.get("chain")
+        if chain is not None and not isinstance(chain, list):
+            log(f"[{f.name}] WARN ignoring non-list chain block: "
+                f"{type(chain).__name__}")
+            chain = None
         log(f"[{f.name}] submitting experiment={exp} overrides={overrides}"
             + (f" two_stage={two_stage}" if two_stage else "")
-            + (f" migrate_to={migrate_to}" if migrate_to else ""))
+            + (f" migrate_to={migrate_to}" if migrate_to else "")
+            + (f" chain={chain}" if chain else ""))
 
         try:
             meta = _submit_one(
                 exp, [str(o) for o in overrides],
-                two_stage=two_stage, migrate_to=migrate_to,
+                two_stage=two_stage, migrate_to=migrate_to, chain=chain,
             )
         except subprocess.CalledProcessError as e:
             err = (e.stderr or e.stdout or "")[-2000:]
@@ -999,6 +1016,83 @@ def _maybe_dispatch_stage_b(group: str) -> None:
             f"{(e.stderr or e.stdout or '').strip()[:500]}")
 
 
+def _maybe_dispatch_chain(group: str) -> None:
+    """Scout → grid auto-dispatch hook (axis_select chain step).
+
+    Called after ANY sweep's analysis report publishes. If the group's
+    expected.json has a ``chain:`` block (set by the instruction YAML),
+    shells out to ``axis_select_dispatch`` for the chain[0] step. The
+    dispatch tool buckets the scout's runs by axis value, picks top-K
+    by metric, and writes the follow-up grid sweep instruction with
+    optional ``two_stage:`` and ``migrate_to:`` blocks. Idempotency
+    sentinel prevents double-dispatch.
+
+    v1: only ``type: axis_select`` is supported and only chain[0]; longer
+    chains will be added when needed (see plan).
+
+    Failures are logged and swallowed — the user can re-run
+    axis_select_dispatch by hand to debug. The scout's report is
+    already published so no data is lost.
+    """
+    expected_path = SWEEPS_DIR / "active" / f"{group}.expected.json"
+    if not expected_path.is_file():
+        return
+    try:
+        chain = json.loads(expected_path.read_text()).get("chain")
+    except Exception as e:
+        log(f"[chain {group}] could not read expected.json: {e}")
+        return
+    if not chain:
+        return  # opt-in only
+
+    if not isinstance(chain, list) or len(chain) == 0:
+        log(f"[chain {group}] malformed chain block (must be non-empty list); skipping")
+        return
+    step = chain[0]
+    if not isinstance(step, dict) or step.get("type") != "axis_select":
+        log(f"[chain {group}] unsupported chain step type "
+            f"{step.get('type') if isinstance(step, dict) else type(step).__name__}; "
+            "only 'axis_select' is supported in v1")
+        return
+    if len(chain) > 1:
+        log(f"[chain {group}] WARN: chain has {len(chain)} steps; "
+            "only chain[0] (axis_select) will run in v1")
+
+    sentinel = SWEEPS_DIR / "active" / f"{group}.chain_dispatched"
+    if sentinel.is_file():
+        log(f"[chain {group}] already dispatched (sentinel exists), skipping")
+        return
+
+    # Required step fields
+    for k in ("axis", "top_k", "next_experiment"):
+        if k not in step:
+            log(f"[chain {group}] axis_select missing required field '{k}'; skipping")
+            return
+
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "JacobianODE.jacobians.tuning.axis_select_dispatch",
+        "--group", group,
+        "--axis", str(step["axis"]),
+        "--top-k", str(int(step["top_k"])),
+        "--metric", str(step.get("metric", "trajectory val_loss")),
+        "--next-experiment", str(step["next_experiment"]),
+    ]
+    next_two_stage = step.get("next_two_stage")
+    if next_two_stage:
+        cmd.extend(["--next-two-stage-json", json.dumps(next_two_stage)])
+    next_migrate_to = step.get("next_migrate_to")
+    if next_migrate_to:
+        cmd.extend(["--next-migrate-to-json", json.dumps(next_migrate_to)])
+    log(f"[chain {group}] auto-dispatching axis_select: {' '.join(cmd)}")
+    try:
+        run(cmd, cwd=JACODE_REPO, check=True)
+        log(f"[chain {group}] axis_select OK")
+    except subprocess.CalledProcessError as e:
+        log(f"[chain {group}] axis_select FAILED ({e.returncode}): "
+            f"{(e.stderr or e.stdout or '').strip()[:500]}")
+
+
 def reap_completed_analyses(inflight: dict) -> int:
     n_reaped = 0
     for group in list(inflight.keys()):
@@ -1044,6 +1138,11 @@ def reap_completed_analyses(inflight: dict) -> int:
             except Exception as e:
                 # Defensive: never let two-stage dispatch crash the cycle.
                 log(f"[reap {group}] two_stage dispatch hook raised: {e}")
+            try:
+                _maybe_dispatch_chain(group)
+            except Exception as e:
+                # Defensive: never let chain dispatch crash the cycle.
+                log(f"[reap {group}] chain dispatch hook raised: {e}")
         else:
             log(f"[reap {group}] FAILED (publish error)")
         del inflight[group]
