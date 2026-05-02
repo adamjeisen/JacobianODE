@@ -10,7 +10,6 @@ import faulthandler
 import logging
 import os
 import random
-import sys
 import time
 import traceback
 from typing import Optional
@@ -30,6 +29,11 @@ log = logging.getLogger("JacobianLogger")
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def train_jacobians(cfg: DictConfig) -> Optional[float]:
+    """Hydra-decorated CLI shim for :func:`train`."""
+    return train(cfg)
+
+
+def train(cfg: DictConfig) -> Optional[float]:
     """Train a JacobianODE model.
 
     This function orchestrates the complete training pipeline:
@@ -46,6 +50,7 @@ def train_jacobians(cfg: DictConfig) -> Optional[float]:
     Returns:
         The best trajectory validation loss (used as the Optuna objective when
         running with ``hydra/sweeper=optuna``).  Ignored by other sweepers.
+        Returns ``None`` if the run short-circuits on a done-marker.
     """
     # ----------------------------------------
     # DIAGNOSTIC: Capture crashes and exceptions
@@ -68,8 +73,12 @@ def train_jacobians(cfg: DictConfig) -> Optional[float]:
         raise
 
 
-def _run_training(cfg: DictConfig) -> float:
-    """Inner training logic (separated for diagnostic try/except)."""
+def _run_training(cfg: DictConfig) -> Optional[float]:
+    """Inner training logic (separated for diagnostic try/except).
+
+    Library consumers should call :func:`train` instead — it adds the
+    faulthandler / error-traceback diagnostics around this function.
+    """
     # ----------------------------------------
     # INITIAL SETUP
     # ----------------------------------------
@@ -89,7 +98,7 @@ def _run_training(cfg: DictConfig) -> float:
             f"[resume] {_resume_dir / DONE_MARKER_NAME} present (prior wandb "
             f"run id={_prior_id!r}); slot already finished. Exiting."
         )
-        sys.exit(0)
+        return None
 
     torch.set_float32_matmul_precision("high")
     num_gpus = torch.cuda.device_count()
