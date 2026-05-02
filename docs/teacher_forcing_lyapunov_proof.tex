@@ -1,0 +1,237 @@
+% =====================================================================
+% Adaptive teacher-forcing rate as a Lyapunov-driven curriculum
+%
+% Standalone derivation linking get_alpha_lyap (used in this codebase
+% to set the teacher-forcing rate online) to Hess et al.'s stability
+% bound for generalized teacher forcing.
+%
+% Drop into a paper as a subsection of Methods or as an Appendix.
+% Required packages: amsmath, amssymb. Optional: amsthm for proof env.
+% =====================================================================
+
+\subsection{Adaptive teacher-forcing rate as a Lyapunov-driven curriculum}
+\label{sec:tf-lyap}
+
+We show that the teacher-forcing rate $\alpha$ used during training,
+computed online from the leading discrete-time Lyapunov exponent of the
+\emph{learned} Jacobian field, equals the critical rate derived by
+\citet{HessEtAl2023} for bounded error propagation under generalized
+teacher forcing. The substitution of the true Jacobian by the learned
+one yields an adaptive curriculum: $\alpha$ is maximal early in
+training, when predictions are unstable, and contracts toward the
+intrinsic critical rate of the underlying dynamics as the model
+converges.
+
+\paragraph{Setup.}
+Let the (unknown) ground-truth dynamics be $x_{t+1}^\star = F_\star(x_t^\star)$
+and the learned model dynamics be $z_{t+1} = F(z_t)$, with $F$ the
+one-step flow induced by integrating the learned continuous-time
+Jacobian field $A_\theta(z)$ over a step $\Delta t$. We do not assume
+$F = F_\star$; the residual $\delta_t := F(x_t^\star) - F_\star(x_t^\star)$
+is the irreducible one-step model error at the true state and shrinks
+as $\theta$ trains.
+The corresponding one-step Jacobian along a trajectory is
+%
+\begin{equation}
+  J_t \;:=\; \left.\partial F/\partial z\right|_{z_t}
+  \;=\; \exp\!\bigl(A(z_t)\,\Delta t\bigr).
+  \label{eq:Jt}
+\end{equation}
+%
+The matrix exponential in \eqref{eq:Jt} is exactly the operation
+applied to predicted Jacobians inside the training loop before passing
+them to the Lyapunov estimator (see Sec.~\ref{sec:implementation}).
+
+The discrete-time Lyapunov spectrum along a trajectory is
+%
+\begin{equation}
+  \lambda_i \;:=\; \lim_{T \to \infty}
+  \frac{1}{T}\,\log\sigma_i\!\Bigl(\prod_{t=0}^{T-1} J_t\Bigr),
+  \quad i=1,\dots,d,
+  \label{eq:lyap-spec}
+\end{equation}
+%
+with $\sigma_i$ singular values sorted in descending order, so that
+$\lambda_1 \equiv \lambda_{\max}$ governs the asymptotic growth of
+generic perturbations: $\|\delta z_T\| \sim \|\delta z_0\|\,e^{T\lambda_{\max}}$.
+
+\paragraph{Generalized teacher forcing.}
+In rollout training, the model produces a sequence $\hat{x}_t$ to be
+matched against ground truth $x_t^\star$. Generalized teacher forcing
+\citep{HessEtAl2023} feeds the network a convex blend of prediction
+and ground truth at each step:
+%
+\begin{equation}
+  \hat{x}_{t+1} \;=\; F\!\bigl((1-\alpha)\,\hat{x}_t + \alpha\, x_t^\star\bigr),
+  \qquad \alpha \in [0,1].
+  \label{eq:gtf}
+\end{equation}
+%
+$\alpha = 1$ recovers hard teacher forcing; $\alpha = 0$ recovers
+free-running rollout.
+
+\paragraph{Linearized error recursion.}
+Define the prediction error $e_t := \hat{x}_t - x_t^\star$.
+Substituting $\hat{x}_t = x_t^\star + e_t$ into the convex blend
+inside $F$ in \eqref{eq:gtf} rewrites the argument as a perturbation
+of the true state:
+%
+\begin{equation}
+  (1-\alpha)\,\hat{x}_t + \alpha\,x_t^\star
+  \;=\; (1-\alpha)(x_t^\star + e_t) + \alpha\,x_t^\star
+  \;=\; x_t^\star + (1-\alpha)\,e_t,
+  \label{eq:blend-rewrite}
+\end{equation}
+%
+so $\hat{x}_{t+1} = F\bigl(x_t^\star + (1-\alpha)\,e_t\bigr)$.
+Bridging through $F(x_t^\star)$ and using
+$x_{t+1}^\star = F_\star(x_t^\star)$,
+%
+\begin{align}
+  e_{t+1}
+  &= F\!\bigl(x_t^\star + (1-\alpha)\,e_t\bigr) - F_\star(x_t^\star)
+    \nonumber \\
+  &= \underbrace{\bigl[F\!\bigl(x_t^\star + (1-\alpha)\,e_t\bigr)
+    - F(x_t^\star)\bigr]}_{\text{GTF perturbation, linearizable}}
+    \;+\;
+    \underbrace{\bigl[F(x_t^\star) - F_\star(x_t^\star)\bigr]}_{=\,\delta_t}
+    \nonumber \\
+  &= (1-\alpha)\,J_t\,e_t \;+\; \delta_t \;+\; \mathcal{O}\!\bigl(\|e_t\|^2\bigr).
+  \label{eq:error-recursion}
+\end{align}
+%
+Here $J_t = \partial F/\partial z|_{x_t^\star}$ is the \emph{learned}
+Jacobian at the \emph{true} state, and $\delta_t$ is the one-step
+model residual at $x_t^\star$.
+%
+Writing the linearized propagator as
+$\Phi_{s\to T} := \prod_{t=s}^{T-1} (1-\alpha)\,J_t$ and unrolling
+\eqref{eq:error-recursion} from $e_0 = 0$ (rollout matched to truth at
+the start),
+%
+\begin{equation}
+  e_T \;\approx\; \Phi_{0\to T}\,e_0
+  \;+\; \sum_{s=0}^{T-1} \Phi_{s+1\to T}\,\delta_s.
+  \label{eq:error-product}
+\end{equation}
+%
+The first term is initial-condition transport; the second is an
+integral of model residual driven through the same propagator. Both
+contributions decay/grow at the same rate.
+
+\paragraph{Stability bound.}
+By \eqref{eq:lyap-spec}, the operator norm of the linearized
+propagator satisfies
+$\|\Phi_{s\to T}\|^{1/(T-s)} \to (1-\alpha)\,e^{\lambda_{\max}}$ as
+$T-s \to \infty$. Three regimes for $e_T$ emerge depending on
+$\rho := (1-\alpha)\,e^{\lambda_{\max}}$:
+%
+\begin{itemize}
+  \item $\rho < 1$: \eqref{eq:error-product} is a geometric series in
+  $\delta_s$. The transient $\Phi_{0\to T}\,e_0$ decays exponentially,
+  and the residual-driven sum is bounded by
+  $\sup_s\|\delta_s\|/(1-\rho)$. Trajectory remains bounded for all
+  $T$, with steady-state error proportional to model residual.
+  \item $\rho = 1$: the transient is constant; the driven sum grows
+  like $\sqrt{T}\,\sigma_\delta$ (random-walk regime). Marginal.
+  \item $\rho > 1$: both terms grow exponentially; catastrophic
+  blow-up.
+\end{itemize}
+%
+Bounded error propagation in the linear regime therefore requires
+%
+\begin{equation}
+  (1 - \alpha)\,e^{\lambda_{\max}} \;\le\; 1
+  \quad\Longleftrightarrow\quad
+  \alpha \;\ge\; 1 - e^{-\lambda_{\max}}.
+  \label{eq:critical-bound}
+\end{equation}
+%
+Define the \emph{critical teacher-forcing rate}
+%
+\begin{equation}
+  \boxed{\;\alpha^\star \;:=\; \max\!\bigl(0,\;1 - e^{-\lambda_{\max}}\bigr).\;}
+  \label{eq:alpha-star}
+\end{equation}
+%
+For chaotic dynamics ($\lambda_{\max} > 0$) one needs strictly
+positive teacher forcing; for contracting dynamics
+($\lambda_{\max} \le 0$) the error decays on its own and $\alpha^\star = 0$.
+This recovers \citet[Theorem~1]{HessEtAl2023}.
+
+\paragraph{Adaptive evaluation on the learned Jacobians.}
+Hess et al.'s bound is a statement about the \emph{true}
+$\lambda_{\max}$, which is unknown a priori. We replace it by the
+leading Lyapunov exponent of the \emph{learned} dynamics, evaluated
+online during training using the predicted Jacobians along the current
+trajectory:
+%
+\begin{equation}
+  \widehat{\lambda}_{\max}^{\,(\theta)}
+  \;:=\;
+  \frac{1}{T}\sum_{t=0}^{T-1} \log r_t^{(1)},
+  \quad
+  r_t^{(1)} := R_{tt}\bigl(\mathrm{QR}\!\bigl(J_t\,Q_{t-1}\bigr)\bigr)_{1,1},
+  \label{eq:lyap-online}
+\end{equation}
+%
+where $J_t = \exp(A_\theta(z_t)\Delta t)$ and the $Q_t$ are the
+QR-orthogonalized basis updates from the standard Bennetin-style
+estimator. The online teacher-forcing rate is then
+%
+\begin{equation}
+  \alpha^{(\theta)} \;:=\; \max\!\bigl(0,\;1 - e^{-\widehat{\lambda}_{\max}^{\,(\theta)}}\bigr),
+  \label{eq:alpha-theta}
+\end{equation}
+%
+which is the \emph{exact} substitution of $\alpha^\star$ in
+\eqref{eq:alpha-star} with the learned Jacobian field. There is no
+approximation: \eqref{eq:alpha-theta} would equal Hess et al.'s
+$\alpha^\star$ if the learned dynamics matched the truth.
+
+\paragraph{Curriculum interpretation.}
+Equation~\eqref{eq:alpha-theta} defines an adaptive curriculum, with
+three regimes:
+\begin{itemize}
+  \item \emph{Early training.} $A_\theta$ is near random
+  initialization; predicted trajectories are unstable and
+  $\widehat{\lambda}_{\max}^{\,(\theta)}$ is large, driving
+  $\alpha^{(\theta)} \to 1$. The error recursion
+  \eqref{eq:error-recursion} contracts to
+  $e_{t+1} \approx 0$, so training is dominated by hard teacher
+  forcing and the error does not propagate even though the model
+  is far from accurate.
+  \item \emph{Mid training.} As $A_\theta$ approaches the true
+  Jacobian field, $\widehat{\lambda}_{\max}^{\,(\theta)} \to
+  \lambda_{\max}^{\,(\text{true})}$ and $\alpha^{(\theta)}$
+  decreases monotonically (in expectation) to the system's
+  intrinsic critical rate.
+  \item \emph{Convergence.} $\alpha^{(\theta)} \to \alpha^\star$,
+  the smallest value of $\alpha$ for which trajectory generation
+  is provably bounded under the true dynamics. The model is now
+  rolled out almost free-running, with teacher forcing applied
+  only to the extent dictated by the true Lyapunov spectrum.
+\end{itemize}
+
+\paragraph{Coupling to the learning-rate schedule.}
+The learning rate is set in this work by
+%
+\begin{equation}
+  \eta_t \;=\; \eta_{\min} + s\!\bigl(\alpha_t\bigr)\,(\eta_{\max} - \eta_{\min}),
+  \quad
+  s(\alpha) := \frac{\alpha}{\alpha + (1-\alpha)\,e^{-k\alpha}},
+  \label{eq:lr-schedule}
+\end{equation}
+%
+with sharpness $k=1$ matching the schedule used in the original
+\textsc{JacobianODE} work \citep{TODOOriginalJacobianODE}. By
+\eqref{eq:alpha-theta} and \eqref{eq:lr-schedule}, both the
+teacher-forcing rate and the learning rate are governed by the same
+Lyapunov-derived clock $\widehat{\lambda}_{\max}^{\,(\theta)}$: when
+the predictor is unstable ($\alpha$ large), $\eta$ is large and
+training takes aggressive steps under strong teacher correction; once
+the predictor stabilizes ($\alpha \to \alpha^\star$), $\eta$
+contracts to $\eta_{\min}$ and training enters a fine-tuning regime.
+This eliminates the need for a separate, epoch-indexed schedule (e.g.,
+$T_{\max}$ in cosine annealing) and yields a curriculum whose pace is
+determined by the data rather than by wall-clock training duration.
