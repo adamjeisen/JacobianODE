@@ -202,18 +202,29 @@ class TestPickSurvivors:
         r3_audit = next(a for a in audit if a["run_id"] == "r3")
         assert r3_audit["best_metric"] == pytest.approx(0.3)
 
-    def test_skips_non_finished(self):
-        """Crashed/running runs are skipped with a recorded reason."""
+    def test_crashed_with_valid_loss_is_kept(self):
+        """Crashed runs with a recorded best_loss are eligible (typical
+        SLURM-timeout-killed cells have hours of training behind them).
+        Only ``state == "running"`` gets blanket-skipped."""
         runs = [
             _MockRun("r1", "finished", [{DEFAULT_METRIC: 1.0}]),
             _MockRun("r2", "crashed", [{DEFAULT_METRIC: 0.1}]),
             _MockRun("r3", "running", [{DEFAULT_METRIC: 0.05}]),
         ]
         survivors, audit = pick_survivors(runs, DEFAULT_METRIC, 0.5)
-        assert {r.id for r in survivors} == {"r1"}
-        crashed = next(a for a in audit if a["run_id"] == "r2")
-        assert crashed["kept"] is False
-        assert "state=crashed" in crashed["skip_reason"]
+        # Top half of {r1: 1.0, r2: 0.1} (r3 skipped, no terminal loss yet)
+        # → 2 eligible, keep 1 → r2 (lower loss, even though crashed).
+        assert {r.id for r in survivors} == {"r2"}
+        # Crashed run made it into the scored audit with its loss.
+        r2 = next(a for a in audit if a["run_id"] == "r2"
+                  and a["best_metric"] is not None)
+        assert r2["best_metric"] == pytest.approx(0.1)
+        assert r2["state"] == "crashed"
+        assert r2["kept"] is True
+        # Running run is the only one skipped.
+        running = next(a for a in audit if a["run_id"] == "r3")
+        assert running["kept"] is False
+        assert "state=running" in running["skip_reason"]
 
     def test_skips_runs_with_no_metric_value(self):
         """Runs that finished but never logged the cull metric (e.g. died

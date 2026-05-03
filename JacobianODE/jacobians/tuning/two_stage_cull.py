@@ -146,8 +146,15 @@ def pick_survivors(
     runs: list, metric: str, cull_fraction: float
 ) -> tuple[list, list[dict]]:
     """Rank runs by best-so-far ``metric`` (lower is better) and return
-    the top ``(1 - cull_fraction)`` of them. Skips runs whose state is
-    not 'finished' and runs without any value for the metric.
+    the top ``(1 - cull_fraction)`` of them.
+
+    Skip only ``state == "running"`` (training not done — best value isn't
+    final). All other states (``finished``, ``crashed``, ``failed``,
+    ``killed``, …) are scanned for the metric. SLURM-timeout-killed cells
+    typically have meaningful best loss; the metric-validity check below
+    excludes ones with no recorded data. Excluding crashed runs blanket-
+    style biases the cull against larger-model cells, which are most likely
+    to time out AND most likely to be best.
 
     Returns (survivors, audit) where audit is a list of dicts
     ``{run_id, state, best_metric, kept}`` for ALL ranked runs (including
@@ -158,7 +165,7 @@ def pick_survivors(
     for r in runs:
         rid = getattr(r, "id", None) or "?"
         state = getattr(r, "state", None) or "?"
-        if state != "finished":
+        if state == "running":
             audit.append({"run_id": rid, "state": state,
                           "best_metric": None, "kept": False,
                           "skip_reason": f"state={state}"})
@@ -194,7 +201,7 @@ def pick_survivors(
 
     for best, r in scored:
         rid = getattr(r, "id", None) or "?"
-        audit.append({"run_id": rid, "state": "finished",
+        audit.append({"run_id": rid, "state": getattr(r, "state", None) or "?",
                       "best_metric": float(best),
                       "kept": rid in survivor_ids,
                       "skip_reason": None})
@@ -433,9 +440,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     survivors, audit = pick_survivors(runs, args.metric, args.cull_fraction)
-    n_finished = sum(1 for a in audit if a["state"] == "finished")
+    n_eligible = sum(1 for a in audit if a.get("skip_reason") is None)
     n_kept = sum(1 for a in audit if a.get("kept"))
-    logger.info(f"  finished: {n_finished}/{len(audit)}  kept: {n_kept}")
+    by_state: dict[str, int] = {}
+    for a in audit:
+        if a.get("skip_reason") is None:
+            by_state[a["state"]] = by_state.get(a["state"], 0) + 1
+    state_breakdown = ", ".join(f"{k}={v}" for k, v in sorted(by_state.items()))
+    logger.info(f"  eligible: {n_eligible}/{len(audit)}  ({state_breakdown})  kept: {n_kept}")
 
     # Build Stage-B per-survivor instructions
     two_stage_root = Path(args.two_stage_root)
