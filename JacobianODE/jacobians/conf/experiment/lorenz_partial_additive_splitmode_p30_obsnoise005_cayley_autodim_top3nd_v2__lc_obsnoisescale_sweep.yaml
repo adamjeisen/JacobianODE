@@ -1,0 +1,120 @@
+# @package _global_
+#
+# Cayley follow-up grid (LC × obs_noise_scale at the top-3 n_delays from
+# the matching Cayley scout) — v2 fork.
+#
+# v2 supersedes the original after a dispatch bug was found:
+# axis_select_dispatch silently excluded ``state == "crashed"`` wandb
+# runs, biasing the top-K against larger-n_delays cells (most likely to
+# time out in SLURM AND most likely to be best). Corrected dispatch now
+# includes crashed runs with a recorded best_traj_loss; chosen top-3
+# shifted from the v1 [75, 45, 50] to the actual top [85, 65, 75].
+# wandb_group renamed to escape contamination from the cancelled v1
+# grid (108 cancelled cells under the original group name).
+#
+# Recipe matches the scout end-to-end so the n_delays selected on Cayley
+# training is evaluated under the same recipe:
+#   - PCA-99 autodim (n_target_var_threshold = 0.99)
+#   - split-mode loss (trajectory_loss_most_recent + reconstruction_mode='uniform')
+#   - Cayley orthogonal mixers + near-identity init + final_perm_identity + zero_init
+#   - TF-coupled LR scheduler + percent_thresh early stopping
+#
+# Auto-dispatched by the scout's chain block. axis_select pins n_delays to
+# the top-3 values via instruction-level Hydra overrides; the sweep_grid's
+# n_delays values below are a fallback for stand-alone launches.
+#
+# 3 n_delays × 9 LC × 4 obs_noise_scale = 108 cells (Stage A); ~54 after
+# 50%-cull Stage B at full_max_epochs=200.
+
+defaults:
+  - override /data: dysts
+  - override /model: latent_additive_coupling
+  - _self_
+
+metadata:
+  description: |
+    Lorenz partial additive coupling, Cayley + autodim + split-mode +
+    TF-coupled LR. Single observed channel (idx 0), obs_noise=0.05,
+    prediction_steps=30, traj_init_steps=15. 108-run grid: 3 n_delays
+    (chain-pinned) × 9 LC weights × 4 obs_noise_scale values.
+  hypothesis: |
+    Same noise-injection / LC ramp hypothesis as the prior splitmode
+    obsnoise005 grid, now run under the standard Cayley + autodim recipe
+    end-to-end so the n_delays choice from the scout transfers cleanly.
+  success_criteria:
+    - "All 108 Stage A runs train without divergence"
+    - "Per-cell autodim n_target_dims logged"
+    - "two_stage_cull keeps top ~54 (cull_fraction=0.5)"
+    - "Best obs_noise_scale > 0 cell strictly improves vs obs_noise_scale=0
+       baseline at the same (n_delays, LC) cell on val/trajectory_loss"
+
+sweep_grid:
+  data.train_test_params.delay_embedding_params.n_delays: "85,65,75"
+  training.lightning.loop_closure_weight: "0,1e-6,1e-5,1e-4,1e-3,1e-2,1e-1,1,10"
+  training.lightning.obs_noise_scale: "0,3e-3,1e-2,3e-2"
+
+wandb_entity: JacobianODE
+wandb_project: "Lorenz_INDpartial_NDsweep_cayley_autodim_D1_NormTrue__JacobianODE"
+wandb_group: "lorenz_partial_additive_splitmode_p30_obsnoise005_cayley_autodim_top3nd_v2__lc_obsnoisescale_sweep"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: true
+  train_test_params:
+    seq_length: 45                        # = 15 traj_init + 30 prediction
+    delay_embedding_params:
+      observed_indices: [0]
+      n_delays: 80                        # overridden by sweep_grid (and chain)
+      delay_spacing: 1
+
+model:
+  n_target_dims: 3                        # fallback; overridden by PCA-auto
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: 0.0
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    final_perm_identity: true
+    zero_init: true
+    near_identity_std: 1.0e-3
+    use_cayley_perms: true
+    init_pca_basis: false
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 32
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 200
+    limit_val_batches: 50
+    accumulate_grad_batches: 1
+  lightning:
+    optimizer_kwargs:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    scheduler_type: teacher_forcing
+    k_scale: 1
+    min_lr: 1.0e-6
+    loss_func: mse
+    loop_closure_weight: 1e-4             # overridden by sweep_grid
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0.0                  # overridden by sweep_grid
+    n_eigval_jacobians: 8
+    jacobianODEint_kwargs:
+      traj_init_steps: 15
+  early_stopping:
+    early_stopping_patience: 5
+    shadow_patience: 2
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01

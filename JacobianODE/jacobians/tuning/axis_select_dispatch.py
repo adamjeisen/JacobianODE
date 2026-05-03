@@ -74,10 +74,19 @@ def _dotted_lookup(d: Any, dotted: str):
 
 
 def _best_metric_for_run(run, metric: str) -> tuple[float | None, str | None]:
-    """Return (best_value, skip_reason). Mirrors pick_survivors's per-run
-    scoring: finished only, scan_history for the metric, take the min."""
+    """Return (best_value, skip_reason).
+
+    Skip only ``state == "running"`` (training not done — best value isn't
+    final). All other states (``finished``, ``crashed``, ``failed``,
+    ``killed``, …) are scanned for the metric. SLURM-timeout-killed cells
+    typically have hours of training behind them and a meaningful best
+    loss; the metric-validity check below excludes ones with no recorded
+    data. Excluding crashed runs blanket-style biases the selection
+    against larger-model cells, which are the most likely to time out
+    AND the most likely to be best.
+    """
     state = getattr(run, "state", None) or "?"
-    if state != "finished":
+    if state == "running":
         return None, f"state={state}"
     best = math.inf
     try:

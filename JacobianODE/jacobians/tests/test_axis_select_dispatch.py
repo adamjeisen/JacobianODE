@@ -37,12 +37,17 @@ class _MockRun:
 
 
 def _make_runs():
-    """6 finished runs across 3 distinct n_delays values, with varying loss.
+    """7 runs across 4 distinct n_delays values, with varying loss + states.
 
-    n_delays=2: one run, best=0.50  → bucket best 0.50
-    n_delays=4: two runs, best=0.10 → bucket best 0.10  ← winner
-    n_delays=6: two runs, best=0.30 → bucket best 0.30
-    n_delays=8: one CRASHED run    → skipped
+    n_delays=2: one finished run, best=0.50 → bucket best 0.50
+    n_delays=4: two finished runs, best=0.10 → bucket best 0.10  ← winner
+    n_delays=6: two finished runs, best=0.30 → bucket best 0.30
+    n_delays=8: one CRASHED run with valid loss=0.01 → INCLUDED, bucket best 0.01
+    n_delays=9: one RUNNING run (no terminal loss yet) → skipped
+
+    Exercises the policy: any non-``running`` state is eligible if it has
+    a recorded metric. Crashed cells (typically SLURM-timeout-killed)
+    contribute their best-recorded loss; in-flight cells are skipped.
     """
     cfg = lambda nd: {
         "data": {"train_test_params": {
@@ -55,6 +60,7 @@ def _make_runs():
         _MockRun("d", "finished", [{DEFAULT_METRIC: 0.30}], cfg(6)),
         _MockRun("e", "finished", [{DEFAULT_METRIC: 0.45}], cfg(6)),
         _MockRun("crashed", "crashed", [{DEFAULT_METRIC: 0.01}], cfg(8)),
+        _MockRun("running", "running", [{DEFAULT_METRIC: 0.05}], cfg(9)),
     ]
 
 
@@ -70,8 +76,9 @@ class TestBucketAndRank:
             axis="data.train_test_params.delay_embedding_params.n_delays",
             metric=DEFAULT_METRIC,
         )
-        # Three live buckets (n_delays = 2, 4, 6); the crashed=8 is skipped.
-        assert set(buckets) == {"2", "4", "6"}
+        # Four live buckets (2, 4, 6, 8 — crashed n_delays=8 is included);
+        # only the running n_delays=9 is skipped.
+        assert set(buckets) == {"2", "4", "6", "8"}
 
     def test_per_bucket_best_metric(self):
         runs = _make_runs()
@@ -83,12 +90,15 @@ class TestBucketAndRank:
         assert buckets["2"]["best_metric"] == pytest.approx(0.50)
         assert buckets["4"]["best_metric"] == pytest.approx(0.10)
         assert buckets["6"]["best_metric"] == pytest.approx(0.30)
+        # Crashed run with valid loss is included — bucket reflects it.
+        assert buckets["8"]["best_metric"] == pytest.approx(0.01)
         # n_runs counts all live (non-skipped) runs in each bucket.
         assert buckets["4"]["n_runs"] == 2
         assert buckets["6"]["n_runs"] == 2
         assert buckets["2"]["n_runs"] == 1
+        assert buckets["8"]["n_runs"] == 1
 
-    def test_skipped_runs_appear_in_audit(self):
+    def test_crashed_run_with_valid_loss_is_kept(self):
         runs = _make_runs()
         _, audit = bucket_and_rank(
             runs,
@@ -96,8 +106,19 @@ class TestBucketAndRank:
             metric=DEFAULT_METRIC,
         )
         crashed = next(a for a in audit if a["run_id"] == "crashed")
-        assert crashed["best_metric"] is None
-        assert crashed["skip_reason"] == "state=crashed"
+        assert crashed["best_metric"] == pytest.approx(0.01)
+        assert crashed["skip_reason"] is None
+
+    def test_running_run_is_skipped(self):
+        runs = _make_runs()
+        _, audit = bucket_and_rank(
+            runs,
+            axis="data.train_test_params.delay_embedding_params.n_delays",
+            metric=DEFAULT_METRIC,
+        )
+        running = next(a for a in audit if a["run_id"] == "running")
+        assert running["best_metric"] is None
+        assert running["skip_reason"] == "state=running"
 
     def test_run_with_missing_axis_is_skipped(self):
         runs = [_MockRun("noaxis", "finished",
@@ -226,8 +247,9 @@ class TestDryRun:
         assert rc == 0
 
         doc = json.loads(audit_out.read_text())
-        # Top-2 of {2: 0.50, 4: 0.10, 6: 0.30} = [4, 6]
-        assert doc["chosen_axis_values"] == ["4", "6"]
+        # Top-2 of {2: 0.50, 4: 0.10, 6: 0.30, 8: 0.01 (crashed)} = [8, 4].
+        # Crashed run with valid loss outranks the finished n_delays=4 cell.
+        assert doc["chosen_axis_values"] == ["8", "4"]
         assert doc["next_experiment"] == "next_grid_yaml"
         # No sentinel because dry-run
         assert not chain_dispatched_marker("scout_group", sweeps_dir).exists()
