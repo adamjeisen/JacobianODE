@@ -289,86 +289,75 @@ def select_from_wandb_runs(
             continue
 
         # --- Priority 3: Full model loading + compute_all_diagnostics ---
-        # Wrapped in try/except RuntimeError so a single broken checkpoint
-        # (e.g., diverged training run with NaN-laden Jacobians, or
-        # state_dict / config mismatch from cross-version sweeps) doesn't
-        # take down the whole sweep diagnostic. Such runs are skipped
-        # from all_diagnostics; downstream select_best_model still gets
-        # the healthy runs and can pick the chosen run from those.
         if verbose:
             msg = f"Loading run {run_id} ({i+1}/{len(run_ids)})"
             logger.info(msg)
             print(msg, flush=True)
 
-        try:
-            generate_data = not data_generated
-            run_obj, run_cfg, eq, run_dt, values, train_dl, val_dl, test_dl, trajs, lit_model = load_run(
-                project,
-                run_id=run_id,
-                run=api_run,
-                save_dir=save_dir,
-                generate_data=generate_data,
-                dt=dt,
-                verbose=verbose,
-            )
-            if val_dataloader is None:
-                val_dataloader = val_dl
-            if generate_data:
-                data_generated = True
+        generate_data = not data_generated
+        run_obj, run_cfg, eq, run_dt, values, train_dl, val_dl, test_dl, trajs, lit_model = load_run(
+            project,
+            run_id=run_id,
+            run=api_run,
+            save_dir=save_dir,
+            generate_data=generate_data,
+            dt=dt,
+            verbose=verbose,
+        )
+        # Always use THIS run's val_dl, not a cached one from an earlier
+        # run. Sweeps with multiple n_delays / observed_indices values
+        # produce per-cell val dataloaders with different last-dim shapes;
+        # reusing a stale val_dataloader from an earlier cache-miss run
+        # feeds the encoder a wrong-shape input and crashes the per-run
+        # iteration. (Underlying trajectories are still cached via
+        # data_generated — only the per-run delay-embedding view varies.)
+        val_dataloader = val_dl
+        if generate_data:
+            data_generated = True
 
-            load_checkpoint(
-                run_obj, run_cfg, lit_model, save_dir=save_dir, verbose=verbose
-            )
+        load_checkpoint(
+            run_obj, run_cfg, lit_model, save_dir=save_dir, verbose=verbose
+        )
 
-            lit_model.eval()
-            lit_model = lit_model.to(device)
+        lit_model.eval()
+        lit_model = lit_model.to(device)
 
+        if verbose:
+            print(f"  Computing diagnostics ({n_batches} batches)...", flush=True)
+        metrics = compute_all_diagnostics(
+            lit_model, val_dataloader, dt,
+            n_batches=n_batches, use_loop_closure=use_loop_closure,
+            verbose=verbose,
+        )
+        all_diagnostics.append(metrics)
+
+        if save_dir:
+            cache_path = _diagnostics_cache_path(save_dir, run_id, n_batches)
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump(
+                    {
+                        "run_id": run_id,
+                        "n_batches": n_batches,
+                        "source": "compute_all_diagnostics",
+                        "one_step_mase": metrics.one_step_mase,
+                        "loop_closure_loss": metrics.loop_closure_loss,
+                        "fast_eigenvalue_fraction": metrics.fast_eigenvalue_fraction,
+                        "trajectory_val_loss": metrics.trajectory_val_loss,
+                    },
+                    f,
+                    indent=2,
+                )
             if verbose:
-                print(f"  Computing diagnostics ({n_batches} batches)...", flush=True)
-            metrics = compute_all_diagnostics(
-                lit_model, val_dataloader, dt,
-                n_batches=n_batches, use_loop_closure=use_loop_closure,
-                verbose=verbose,
-            )
-            all_diagnostics.append(metrics)
+                print(f"  Cached to {cache_path}", flush=True)
 
-            if save_dir:
-                cache_path = _diagnostics_cache_path(save_dir, run_id, n_batches)
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                with open(cache_path, "w") as f:
-                    json.dump(
-                        {
-                            "run_id": run_id,
-                            "n_batches": n_batches,
-                            "source": "compute_all_diagnostics",
-                            "one_step_mase": metrics.one_step_mase,
-                            "loop_closure_loss": metrics.loop_closure_loss,
-                            "fast_eigenvalue_fraction": metrics.fast_eigenvalue_fraction,
-                            "trajectory_val_loss": metrics.trajectory_val_loss,
-                        },
-                        f,
-                        indent=2,
-                    )
-                if verbose:
-                    print(f"  Cached to {cache_path}", flush=True)
-
-            if verbose:
-                msg = f"  run={run_id}: {metrics}"
-                logger.info(msg)
-                print(msg, flush=True)
-
-            lit_model.cpu()
-            torch.cuda.empty_cache()
-        except RuntimeError as e:
-            msg = f"  run={run_id}: SKIPPED — {type(e).__name__}: {e}"
-            logger.warning(msg)
+        if verbose:
+            msg = f"  run={run_id}: {metrics}"
+            logger.info(msg)
             print(msg, flush=True)
-            try:
-                lit_model.cpu()
-            except Exception:
-                pass
-            torch.cuda.empty_cache()
-            continue
+
+        lit_model.cpu()
+        torch.cuda.empty_cache()
 
     selection = select_best_model(
         all_diagnostics,

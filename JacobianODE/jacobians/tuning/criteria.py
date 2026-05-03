@@ -19,6 +19,17 @@ from tqdm.auto import tqdm
 import torch
 from torch.utils.data import DataLoader, RandomSampler
 
+# Use magma for CUDA linear-algebra ops where available. cuSolver's Xgeev
+# (the default) returns CUSOLVER_STATUS_INTERNAL_ERROR on Jacobians from
+# diverged training runs whose matrix-balance step fails (very disparate
+# row/column scales). magma's eigenvalue routines are much more
+# tolerant of ill-conditioned matrices. Setting this is a no-op when
+# magma isn't available — torch then falls back to cuSolver.
+try:
+    torch.backends.cuda.preferred_linalg_library("magma")
+except Exception:  # pragma: no cover — older torch / no CUDA
+    pass
+
 
 @dataclass
 class DiagnosticMetrics:
@@ -147,28 +158,22 @@ def compute_all_diagnostics(
             else:
                 z_for_eval = batch
 
-            # Eigenvalue fraction. cuSolver's Xgeev returns
-            # CUSOLVER_STATUS_INTERNAL_ERROR on near-singular / NaN-laden
-            # Jacobians (e.g., diverged training runs). Catch + skip the
-            # batch so a single pathological run doesn't take down the
-            # whole sweep diagnostic. NaN-input first-pass via finite_mask
-            # avoids most of these; the try/except is the backstop.
+            # Eigenvalue fraction. Filter NaN/inf Jacobians first so a
+            # diverged training run doesn't poison the whole batch's
+            # eigvals call (the GPU/CPU eigenvalue routines return
+            # garbage or throw on non-finite input). Surviving Jacobians
+            # are passed to eigvals; the magma backend (set at module
+            # load) handles ill-conditioned matrices gracefully where
+            # cuSolver's Xgeev would error out.
             pred_jacs = lit_model.compute_jacobians(z_for_eval)
             B, T, D, _ = pred_jacs.shape
             jacs_flat = pred_jacs.reshape(B * T, D, D)
             finite_mask = torch.isfinite(jacs_flat).all(dim=-1).all(dim=-1)
             jacs_finite = jacs_flat[finite_mask]
             if jacs_finite.numel() > 0:
-                try:
-                    eigs_real = torch.linalg.eigvals(jacs_finite).real.flatten()
-                    num_eigs_too_fast += torch.sum(eigs_real <= threshold).float().item()
-                    total_eigs += len(eigs_real)
-                except RuntimeError as e:
-                    # cuSolver / LAPACK linear-algebra failure — log once
-                    # per call and move on. fast_eigenvalue_fraction is a
-                    # coarse diagnostic, not load-bearing for selection.
-                    if verbose:
-                        print(f"    eigvals failed (skipping batch): {type(e).__name__}: {e}")
+                eigs_real = torch.linalg.eigvals(jacs_finite).real.flatten()
+                num_eigs_too_fast += torch.sum(eigs_real <= threshold).float().item()
+                total_eigs += len(eigs_real)
 
             # Loop closure
             if use_loop_closure:
