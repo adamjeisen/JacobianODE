@@ -236,7 +236,6 @@ def select_from_wandb_runs(
     all_diagnostics: List[DiagnosticMetrics] = []
     device = "cuda" if torch.cuda.is_available() else "cpu"
     val_dataloader = None
-    data_generated = False
     api = _wandb.Api(timeout=90)
 
     for i, run_id in enumerate(run_ids):
@@ -294,26 +293,27 @@ def select_from_wandb_runs(
             logger.info(msg)
             print(msg, flush=True)
 
-        generate_data = not data_generated
+        # generate_data=True for every run so val_dl actually gets
+        # constructed for THIS run's config (n_delays, observed_indices,
+        # etc.). The earlier "share once" optimization (generate_data
+        # only on the first cache-miss, then reuse val_dl) is wrong
+        # whenever a sweep varies a shape-determining axis: subsequent
+        # runs would see val_dataloader from the FIRST cache-miss's
+        # config, which mismatches the per-run encoder shape and crashes
+        # the encoder forward pass. The underlying trajectories are
+        # still pickle-cached on disk, so the only repeated work is
+        # delay-embedding the cached values into per-run dataloaders —
+        # cheap relative to the model load + diagnostic computation.
         run_obj, run_cfg, eq, run_dt, values, train_dl, val_dl, test_dl, trajs, lit_model = load_run(
             project,
             run_id=run_id,
             run=api_run,
             save_dir=save_dir,
-            generate_data=generate_data,
+            generate_data=True,
             dt=dt,
             verbose=verbose,
         )
-        # Always use THIS run's val_dl, not a cached one from an earlier
-        # run. Sweeps with multiple n_delays / observed_indices values
-        # produce per-cell val dataloaders with different last-dim shapes;
-        # reusing a stale val_dataloader from an earlier cache-miss run
-        # feeds the encoder a wrong-shape input and crashes the per-run
-        # iteration. (Underlying trajectories are still cached via
-        # data_generated — only the per-run delay-embedding view varies.)
         val_dataloader = val_dl
-        if generate_data:
-            data_generated = True
 
         load_checkpoint(
             run_obj, run_cfg, lit_model, save_dir=save_dir, verbose=verbose
