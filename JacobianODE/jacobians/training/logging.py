@@ -222,10 +222,10 @@ def _deduplicate_run_name(
             logger.info(msg)
         return name
 
-    api = wandb.Api()
     project_path = f"{entity}/{project}" if entity else project
 
     try:
+        api = wandb.Api()
         runs = api.runs(project_path)
         found_run = True
         version = 1
@@ -247,6 +247,17 @@ def _deduplicate_run_name(
                 name = f"{base_name}_v{version}"
     except ValueError:
         msg = f"Project {project_path} does not exist!"
+        if log is not None:
+            log.warning(msg)
+        else:
+            logger.warning(msg)
+    except Exception as e:
+        # Network / auth / quota failures must not crash training.
+        # Wandb assigns globally-unique run IDs anyway; name dedup is cosmetic.
+        msg = (
+            f"[wandb-dedup] skipping name-dedup; wandb.Api() unavailable "
+            f"({type(e).__name__}: {e})"
+        )
         if log is not None:
             log.warning(msg)
         else:

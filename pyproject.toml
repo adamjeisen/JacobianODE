@@ -40,12 +40,27 @@ dependencies = [
     "sdeint",
     "torchcubicspline @ git+https://github.com/patrick-kidger/torchcubicspline.git",
     "nbconvert",
-    "wmtask @ git+ssh://git@github.com/adamjeisen/wmtask.git",
     "marimo>=0.22.4",
 ]
 
 [project.optional-dependencies]
 marimo = ["marimo>=0.20.0"]
+# Optional WMTask data path. Maintainer pulls this in via [dependency-groups]
+# dev below; downstream consumers without SSH access to the wmtask repo can
+# install JacobianODE without it.
+wmtask = ["wmtask @ git+ssh://git@github.com/adamjeisen/wmtask.git"]
+
+[tool.hatch.build.targets.wheel]
+# Ship JacobianODE plus the top-level hydra_plugins/ namespace package so
+# Hydra's plugin auto-discovery (which scans the `hydra_plugins` namespace)
+# can find the in-repo SearchPathPlugin and ListSweeperPlugin in installed
+# wheels. Hydra has no entry-point-based plugin registration mechanism;
+# the namespace-package layout is the only supported plumbing.
+packages = ["JacobianODE", "hydra_plugins"]
+include = [
+    "JacobianODE/**/*.yaml",
+    "JacobianODE/**/*.yml",
+]
 
 [tool.marimo.runtime]
 auto_reload = "lazy"
@@ -56,6 +71,9 @@ dev = [
     "ipykernel>=7.1.0",
     "jupytext>=1.19.1",
     "pytest>=9.0.2",
+    # Maintainer keeps wmtask installed locally; consumers must opt in via
+    # the [project.optional-dependencies] wmtask extra.
+    "wmtask @ git+ssh://git@github.com/adamjeisen/wmtask.git",
 ]
 cu128 = [
     "torch>=2.0.0",

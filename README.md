@@ -148,6 +148,55 @@ load_checkpoint(run, cfg, lit_model, save_dir="/path/to/checkpoints")
 lit_model.eval()
 ```
 
+## Use as a library
+
+JacobianODE can be installed as a dependency in another project (e.g. via
+`pip install JacobianODE @ git+https://github.com/adamjeisen/JacobianODE`).
+Consumers bring their own dataset and experiment YAMLs and call
+`JacobianODE.train` from a thin Hydra entry script:
+
+```python
+# consumer_repo/train.py
+import hydra
+from JacobianODE import train
+
+@hydra.main(config_path="conf", config_name="train", version_base=None)
+def main(cfg):
+    train(cfg)
+
+if __name__ == "__main__":
+    main()
+```
+
+The consumer's `conf/train.yaml` extends JacobianODE-side templates via
+`defaults:`. The shipped Hydra `SearchPathPlugin` makes JacobianODE's
+config groups discoverable automatically — no `hydra.searchpath` setup
+needed:
+
+```yaml
+# consumer_repo/conf/train.yaml
+defaults:
+  - /model: latent_additive_coupling     # JacobianODE-side template
+  - /training: training                  # JacobianODE-side template
+  - _self_
+
+wandb:
+  disabled: true   # opt out of W&B when running locally without a login
+```
+
+To override an entry that's already in the JacobianODE base config (e.g.
+when extending it via `defaults: [/config, ...]`), use Hydra's `override`
+keyword — `override /model: latent_additive_coupling`. When the consumer
+config doesn't itself extend the JacobianODE base config, list the
+JacobianODE-side defaults directly (without `override`).
+
+The `wmtask` data path is gated behind an optional extra:
+`pip install "JacobianODE[wmtask]"`. Consumers that don't use WMTask data
+do not need SSH access to the wmtask repo. Sweep automation (`jsweep`,
+engaging-controller, jacobian-reports) is intentionally personal infra and
+not part of the library surface — consumers run sweeps with Submitit /
+sbatch directly.
+
 ## Demo Notebooks
 
 The `_jupyter/` directory contains three demo notebooks:
