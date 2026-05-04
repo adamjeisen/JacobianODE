@@ -2428,7 +2428,20 @@ def run_analytics(
         # ============================================================
         if "encoder_decoder_jacobians" in active_sections and not is_latent:
             print("Skipping 'encoder_decoder_jacobians': requires a latent encoder/decoder model.")
-        if "encoder_decoder_jacobians" in active_sections and is_latent:
+        if "encoder_decoder_jacobians" in active_sections and is_latent and _is_conditioned_model:
+            # vmap+jacrev/jacfwd on a conditioned DirectSum encoder OOMs even
+            # at small chunk sizes — per-area index_copy_ inside the vmap path
+            # uses the no-batching-rule fallback, which inflates memory beyond
+            # what 24G (the controller's analyze partition) can hold. Same
+            # TODO as tangent_spectrum-conditioned; skip cleanly until either
+            # a vmap-friendly DirectSum path is added or the encoder Jacobian
+            # is computed by hand (no vmap).
+            print(
+                "Skipping 'encoder_decoder_jacobians' for conditioned model: "
+                "vmap+jacrev OOMs on DirectSum + condition (TODO: rewrite "
+                "without vmap or wait for index_copy_ batching rule)."
+            )
+        elif "encoder_decoder_jacobians" in active_sections and is_latent:
             print("Computing encoder/decoder Jacobians ...")
             from torch.func import vmap, jacrev, jacfwd
 
