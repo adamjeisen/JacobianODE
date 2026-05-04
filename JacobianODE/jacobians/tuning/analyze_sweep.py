@@ -674,6 +674,7 @@ def compute_per_run_lyapunov(
     # the full-state trajectories (see run_analytics.py for the canonical path).
     empirical_mean: np.ndarray | None = None
     empirical_per_traj: np.ndarray | None = None
+    empirical_per_condition: dict[str, np.ndarray] = {}
 
     for i, run in enumerate(all_runs):
         run_id = run.id
@@ -697,7 +698,10 @@ def compute_per_run_lyapunov(
             if i == 0:
                 dt_cached = dt
                 if trajs is not None and "test_trajs" in trajs:
-                    # Compute empirical spectrum ONCE (same data/eq across runs).
+                    # Compute empirical spectrum (same data/eq across runs).
+                    # For combined-loader (conditioned) runs, compute it
+                    # PER SOURCE — each condition has its own ground-truth
+                    # eq object and its own subset of trajectories.
                     mu_val = cfg.data.postprocessing.get("mu", 0.0)
                     sigma_val = cfg.data.postprocessing.get("sigma", 1.0)
                     # Empirical needs the raw full-dim state (for eq.jac).
@@ -713,12 +717,46 @@ def compute_per_run_lyapunov(
                             else trajs["test_trajs"].sequence
                         )
                     logger.info("Computing empirical ground-truth Lyapunov spectrum...")
-                    empirical_mean, empirical_per_traj = _compute_empirical_lyapunov(
-                        eq, traj_for_emp, dt, mu_val, sigma_val, device,
-                    )
+                    src_by_c = trajs.get("source_eqs_by_condition")
+                    train_cond = trajs.get("train_condition")
+                    if src_by_c and train_cond is not None and len(src_by_c) > 1:
+                        # Per-condition empirical: for each (cond_row, src_eq),
+                        # restrict to that source's trajectory subset and
+                        # compute lyap with the matching ground-truth eq.
+                        train_cond_arr = np.asarray(train_cond)
+                        traj_for_emp_arr = traj_for_emp.detach().cpu().numpy() if hasattr(traj_for_emp, 'cpu') else np.asarray(traj_for_emp)
+                        empirical_per_condition: dict[str, np.ndarray] = {}
+                        chunks_for_overall: list[np.ndarray] = []
+                        for cond_row, src_eq in src_by_c:
+                            mask = np.all(train_cond_arr == cond_row, axis=1)
+                            if not mask.any():
+                                continue
+                            sub_traj = traj_for_emp_arr[mask]
+                            label = f"c={cond_row.tolist()}"
+                            sub_mean, sub_per_traj = _compute_empirical_lyapunov(
+                                src_eq, sub_traj, dt, mu_val, sigma_val, device,
+                            )
+                            if sub_mean is not None:
+                                empirical_per_condition[label] = sub_mean
+                                chunks_for_overall.append(sub_per_traj)
+                                logger.info(
+                                    f"  empirical {label}: λ_max={sub_mean[0]:+.4f}, "
+                                    f"λ_min={sub_mean[-1]:+.4f}, Σλ={sub_mean.sum():.3f}"
+                                )
+                        # Overall mean = simple mean across conditions for back-compat.
+                        if empirical_per_condition:
+                            empirical_mean = np.mean(
+                                np.stack(list(empirical_per_condition.values())), axis=0
+                            )
+                            empirical_per_traj = np.concatenate(chunks_for_overall, axis=0)
+                    else:
+                        empirical_per_condition = {}
+                        empirical_mean, empirical_per_traj = _compute_empirical_lyapunov(
+                            eq, traj_for_emp, dt, mu_val, sigma_val, device,
+                        )
                     if empirical_mean is not None:
                         logger.info(
-                            f"Empirical λ₁={empirical_mean[0]:.4f}, "
+                            f"Empirical (overall) λ₁={empirical_mean[0]:.4f}, "
                             f"λ_min={empirical_mean[-1]:.4f}, "
                             f"Σλ={empirical_mean.sum():.3f}"
                         )
@@ -994,17 +1032,35 @@ def compute_per_run_lyapunov(
                     color=color,
                     alpha=0.6, lw=1.0,
                 )
-        if true_arr is not None:
+        # Per-condition empirical: when present, draw one black curve per
+        # condition using the SAME linestyle convention as the predicted
+        # spectra above. The two pairs visually align (pred c=-1 with emp
+        # c=-1, both solid; pred c=+1 with emp c=+1, both dashed) so the
+        # reader can see "for this condition, how close is pred to emp".
+        if empirical_per_condition:
+            for cond_label, emp_spec in empirical_per_condition.items():
+                ls = cond_label_to_style.get(cond_label, "-")
+                ax[0].plot(emp_spec, color="black", linestyle=ls, lw=2.5,
+                           label=f"empirical {cond_label}", zorder=10)
+        elif true_arr is not None:
             ax[0].plot(true_arr, color="black", lw=2.5, label=true_label, zorder=10)
         # Add a linestyle legend for conditions when present (separate from
         # the LC colorbar — colors carry LC weight, linestyles carry condition).
         if cond_label_to_style:
             from matplotlib.lines import Line2D
             cond_handles = [
-                Line2D([0], [0], color="k", linestyle=ls, label=lbl)
+                Line2D([0], [0], color="k", linestyle=ls, lw=1.0, label=f"pred {lbl}")
                 for lbl, ls in cond_label_to_style.items()
             ]
-            if true_arr is not None:
+            if empirical_per_condition:
+                for cond_label in cond_label_to_style:
+                    if cond_label in empirical_per_condition:
+                        cond_handles.append(Line2D(
+                            [0], [0], color="black", lw=2.5,
+                            linestyle=cond_label_to_style[cond_label],
+                            label=f"empirical {cond_label}",
+                        ))
+            elif true_arr is not None:
                 cond_handles.append(Line2D([0], [0], color="black", lw=2.5, label=true_label))
             ax[0].legend(handles=cond_handles, loc="upper right", fontsize=8)
         elif true_arr is not None:
@@ -1053,13 +1109,40 @@ def compute_per_run_lyapunov(
             fig, axes = plt.subplots(
                 nrow, ncol, figsize=(5.0 * ncol, 3.6 * nrow), squeeze=False
             )
+            # Linestyle / color convention shared across all subplots:
+            # condition selects linestyle (same as the summary plot),
+            # pred = blue, empirical = black.
+            cond_ls_map = {
+                lbl: ls
+                for lbl, ls in zip(
+                    sorted(empirical_per_condition.keys()) if empirical_per_condition
+                    else (sorted({k for _, d in success for k in (d.get("per_condition") or {})})),
+                    ["-", "--", ":", "-."],
+                )
+            }
             for i, (rid, d) in enumerate(success):
                 row, col = i // ncol, i % ncol
                 a = axes[row][col]
-                pred = np.array(d["lambda_spectrum"])
                 lit_label = "literature" if true_lyapunov else "empirical"
-                a.plot(true_arr, "k-", lw=1.5, label=lit_label)
-                a.plot(pred, "C0o-", lw=1, ms=3, label="pred")
+                # Empirical: per-condition when available, else single curve.
+                if empirical_per_condition:
+                    for cond_label, emp_spec in empirical_per_condition.items():
+                        ls = cond_ls_map.get(cond_label, "-")
+                        a.plot(emp_spec, color="black", lw=1.5, linestyle=ls,
+                               label=f"emp {cond_label}")
+                else:
+                    a.plot(true_arr, "k-", lw=1.5, label=lit_label)
+                # Predicted: per-condition when this run was trained with c.
+                per_cond_pred = d.get("per_condition") or {}
+                if per_cond_pred:
+                    for cond_label, cond_d in per_cond_pred.items():
+                        ls = cond_ls_map.get(cond_label, "-")
+                        a.plot(np.array(cond_d["lambda_spectrum"]),
+                               color="C0", lw=1.0, ms=2, marker="o",
+                               linestyle=ls, label=f"pred {cond_label}")
+                else:
+                    pred = np.array(d["lambda_spectrum"])
+                    a.plot(pred, "C0o-", lw=1, ms=3, label="pred")
                 a.axhline(0, color="gray", lw=0.5, ls="--")
                 s = summaries.get(rid, {})
                 tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
@@ -1069,7 +1152,7 @@ def compute_per_run_lyapunov(
                 a.set_title(title, fontsize=11)
                 a.tick_params(labelsize=10)
                 if i == 0:
-                    a.legend(fontsize=10, loc="upper right")
+                    a.legend(fontsize=8, loc="upper right")
             # Hide unused axes
             for j in range(n, nrow * ncol):
                 axes[j // ncol][j % ncol].axis("off")
@@ -1202,6 +1285,9 @@ def compute_per_run_lyapunov(
         "per_run": per_run,
         "empirical_mean": empirical_mean.tolist() if empirical_mean is not None else None,
         "empirical_per_traj_shape": list(empirical_per_traj.shape) if empirical_per_traj is not None else None,
+        "empirical_per_condition": {
+            k: v.tolist() for k, v in empirical_per_condition.items()
+        } if empirical_per_condition else None,
     }
 
 
