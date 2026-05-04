@@ -521,6 +521,83 @@ def plot_lyapunov_spectrum(
     return [fig_all, fig_zoom]
 
 
+def plot_lyapunov_spectrum_by_condition(
+    pred_per_group: dict[str, np.ndarray],   # label -> (n_in_group, n_lyaps)
+    emp_per_group: dict[str, np.ndarray],    # label -> (n_in_group, n_lyaps)
+    true_lyapunov: list[float] | None = None,
+    loop_closure_weight: float | None = None,
+) -> plt.Figure | list[plt.Figure]:
+    """Per-condition Lyapunov spectrum overlay.
+
+    Used when the model was trained with per-trajectory conditions
+    (combined-source dataloader). One curve per (condition × {pred, emp})
+    on a single axis: e.g. with two conditions you get four curves.
+
+    Each curve uses mean ± std across the trajectories in that condition
+    group, drawn as bars with error caps (matches the unconditioned
+    plot's visual style).
+    """
+    # Determine n_lyaps as the min across all groups.
+    n_lyaps = min(
+        min((arr.shape[1] for arr in pred_per_group.values()), default=10**9),
+        min((arr.shape[1] for arr in emp_per_group.values()), default=10**9),
+    )
+    if true_lyapunov is not None:
+        n_lyaps = min(n_lyaps, len(true_lyapunov))
+
+    def _draw(ax: plt.Axes, k: int) -> None:
+        x_idx = np.arange(k)
+        # One bar per (group × {pred, emp}) plus optional literature.
+        n_bars_per_group = 2  # pred + emp
+        groups_pred = list(pred_per_group.keys())
+        groups_emp = list(emp_per_group.keys())
+        # Use union of group labels in stable order: pred groups first.
+        labels = list(dict.fromkeys(groups_pred + groups_emp))
+        n_bars = len(labels) * n_bars_per_group + (1 if true_lyapunov is not None else 0)
+        bar_w = min(0.8 / n_bars, 0.18)
+        offsets = np.linspace(-(n_bars - 1) / 2, (n_bars - 1) / 2, n_bars) * bar_w
+
+        bar_idx = 0
+        for label in labels:
+            if label in pred_per_group:
+                arr = pred_per_group[label]
+                m = arr.mean(axis=0)[:k]
+                s = arr.std(axis=0)[:k]
+                ax.bar(x_idx + offsets[bar_idx], m, width=bar_w, yerr=s,
+                       capsize=3, label=f"Predicted [{label}]", alpha=0.8)
+                bar_idx += 1
+            if label in emp_per_group:
+                arr = emp_per_group[label]
+                m = arr.mean(axis=0)[:k]
+                s = arr.std(axis=0)[:k]
+                ax.bar(x_idx + offsets[bar_idx], m, width=bar_w, yerr=s,
+                       capsize=3, label=f"Empirical [{label}]", alpha=0.8)
+                bar_idx += 1
+        if true_lyapunov is not None:
+            ax.bar(x_idx + offsets[bar_idx], true_lyapunov[:k], width=bar_w,
+                   label="Literature", alpha=0.8)
+
+        ax.axhline(y=0, color="k", linestyle="--", lw=0.5)
+        ax.set_xticks(x_idx)
+        ax.set_xlabel("Exponent index")
+        ax.set_ylabel("Lyapunov exponent")
+        title = "Lyapunov Spectrum (by condition)"
+        if loop_closure_weight is not None:
+            title += f" (loop_closure_weight={loop_closure_weight})"
+        ax.set_title(title)
+        ax.legend(fontsize=8, loc="best")
+
+    fig_all, ax_all = plt.subplots(figsize=(14, 5))
+    _draw(ax_all, n_lyaps)
+    plt.tight_layout()
+    if n_lyaps <= 20:
+        return fig_all
+    fig_zoom, ax_zoom = plt.subplots(figsize=(14, 5))
+    _draw(ax_zoom, 10)
+    plt.tight_layout()
+    return [fig_all, fig_zoom]
+
+
 def plot_kaplan_yorke(
     ky_pred_np: np.ndarray,
     ky_emp_np: np.ndarray | None = None,
@@ -1559,6 +1636,17 @@ def run_analytics(
         # ============================================================
         if "lyapunov" in active_sections:
             print("Computing Lyapunov exponents ...")
+            # Detect per-trajectory conditions (combined-loader path). When
+            # present, the dynamics MLP and encoder were trained with c, so
+            # compute_jacobians MUST be called with the right per-traj c —
+            # passing c=None into a conditioned MLP raises. Below we thread
+            # c into the predicted-Jac computation and use the per-source eq
+            # from trajs["source_eqs_by_condition"] for empirical Jacobians.
+            _test_condition_arr = trajs.get("test_condition") if isinstance(trajs, dict) else None
+            _src_eqs_by_cond = trajs.get("source_eqs_by_condition") if isinstance(trajs, dict) else None
+            _is_conditioned = _test_condition_arr is not None and getattr(
+                getattr(lit_model, "encoder", None), "condition_dim", 0
+            ) > 0
             with torch.no_grad():
                 # --- Full-length trajectory Lyapunov (PLOTTED) ---
                 # Uses trajs['test_trajs'].sequence — the actual full-length test
@@ -1568,7 +1656,15 @@ def run_analytics(
                 traj_seq_full = torch.as_tensor(
                     trajs["test_trajs"].sequence
                 ).float().to(device_obj)
-                z_seq_full = lit_model.encode_trajectory(traj_seq_full) if is_latent else traj_seq_full
+                _c_full_t = (
+                    torch.as_tensor(_test_condition_arr).float().to(device_obj)
+                    if _is_conditioned else None
+                )
+                z_seq_full = (
+                    lit_model.encode_trajectory(traj_seq_full, _c_full_t)
+                    if is_latent and _is_conditioned
+                    else (lit_model.encode_trajectory(traj_seq_full) if is_latent else traj_seq_full)
+                )
                 z_for_jac_full = _z_dyn(z_seq_full, n_target_dims)
                 n_full_trajs = z_for_jac_full.shape[0]
                 print(f"  Computing full-trajectory Lyapunov ({n_full_trajs} test trajs, "
@@ -1586,7 +1682,8 @@ def run_analytics(
                     desc="    full-traj Lyap chunks",
                 ):
                     _z_chunk = z_for_jac_full[_ci:_ci + _lyap_chunk_size]
-                    _jacs_chunk = lit_model.compute_jacobians(_z_chunk)
+                    _c_chunk = _c_full_t[_ci:_ci + _lyap_chunk_size] if _is_conditioned else None
+                    _jacs_chunk = lit_model.compute_jacobians(_z_chunk, c=_c_chunk)
                     _le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(
                         _jacs_chunk, dt
                     )
@@ -1595,45 +1692,52 @@ def run_analytics(
                 _state["all_pred_lyap_full"] = all_pred_lyap_full
 
                 # --- Batch + burn-in Lyapunov (128 sampled windowed trajs) ---
-                # Uses test_dl.dataset.sequence — the windowed/batched sequences.
-                traj_batched_t = torch.as_tensor(
-                    test_dl.dataset.sequence
-                ).float().to(device_obj)
-                # Encode in chunks to avoid OOM on large test sets
-                if is_latent:
-                    _enc_chunks = []
-                    _chunk_size = 64
-                    for _ci in range(0, traj_batched_t.shape[0], _chunk_size):
-                        _enc_chunks.append(
-                            lit_model.encode_trajectory(traj_batched_t[_ci:_ci + _chunk_size])
-                        )
-                    z_batched_t = torch.cat(_enc_chunks, dim=0)
+                # Skip for conditioned models: JacobianODEint.generate_dynamics
+                # calls compute_jacobians without c, which would raise on a
+                # conditioned MLP. Full-trajectory Lyap (above) is the
+                # primary signal; burn-in is supplementary and would need a
+                # per-condition refactor to support c-aware rollout.
+                if _is_conditioned:
+                    all_pred_lyap = all_pred_lyap_full  # alias for downstream code
                 else:
-                    z_batched_t = traj_batched_t
-                z_for_jac = _z_dyn(z_batched_t, n_target_dims)
-                gen = torch.Generator().manual_seed(0)
-                perm = torch.randperm(z_for_jac.shape[0], generator=gen)[:n_sample]
-                z_sampled = z_for_jac[perm]
+                    traj_batched_t = torch.as_tensor(
+                        test_dl.dataset.sequence
+                    ).float().to(device_obj)
+                    # Encode in chunks to avoid OOM on large test sets
+                    if is_latent:
+                        _enc_chunks = []
+                        _chunk_size = 64
+                        for _ci in range(0, traj_batched_t.shape[0], _chunk_size):
+                            _enc_chunks.append(
+                                lit_model.encode_trajectory(traj_batched_t[_ci:_ci + _chunk_size])
+                            )
+                        z_batched_t = torch.cat(_enc_chunks, dim=0)
+                    else:
+                        z_batched_t = traj_batched_t
+                    z_for_jac = _z_dyn(z_batched_t, n_target_dims)
+                    gen = torch.Generator().manual_seed(0)
+                    perm = torch.randperm(z_for_jac.shape[0], generator=gen)[:n_sample]
+                    z_sampled = z_for_jac[perm]
 
-                B, T_true, D_dyn = z_sampled.shape
-                z_padded = torch.cat(
-                    [z_sampled, torch.zeros(B, lyapunov_burn_in_steps, D_dyn, device=device_obj)],
-                    dim=1,
-                )
-                jacobian_odeint = JacobianODEint(lit_model.compute_jacobians, dt)
-                z_combined = jacobian_odeint.generate_dynamics(
-                    z_padded,
-                    traj_init_steps=T_true,
-                    alpha_teacher_forcing=0.0,
-                    fast_mode=True,
-                    verbose=False,
-                    interp_pts=4,
-                    inner_N=20,
-                )
-                jacs_burn = lit_model.compute_jacobians(z_combined)
-                all_pred_lyap = LitLatentJacobianODE.compute_lyapunov_exponents(
-                    jacs_burn[:, lyapunov_burn_in_drop:], dt
-                )
+                    B, T_true, D_dyn = z_sampled.shape
+                    z_padded = torch.cat(
+                        [z_sampled, torch.zeros(B, lyapunov_burn_in_steps, D_dyn, device=device_obj)],
+                        dim=1,
+                    )
+                    jacobian_odeint = JacobianODEint(lit_model.compute_jacobians, dt)
+                    z_combined = jacobian_odeint.generate_dynamics(
+                        z_padded,
+                        traj_init_steps=T_true,
+                        alpha_teacher_forcing=0.0,
+                        fast_mode=True,
+                        verbose=False,
+                        interp_pts=4,
+                        inner_N=20,
+                    )
+                    jacs_burn = lit_model.compute_jacobians(z_combined)
+                    all_pred_lyap = LitLatentJacobianODE.compute_lyapunov_exponents(
+                        jacs_burn[:, lyapunov_burn_in_drop:], dt
+                    )
 
             pred_lyap = all_pred_lyap.mean(dim=0).cpu()
             pred_lyap_std = all_pred_lyap.std(dim=0).cpu()
@@ -1654,10 +1758,15 @@ def run_analytics(
             if true_lyapunov:
                 print(f"True:      {true_lyapunov}")
 
-            # Empirical from analytical Jacobian (if eq available)
+            # Empirical from analytical Jacobian (if eq available).
+            # For conditioned runs, use trajs["source_eqs_by_condition"] —
+            # a list of (cond_row, eq) — to apply the matching per-source eq
+            # to each subset of trajectories. Falls back to the single `eq`
+            # when conditioning isn't in play (back-compat).
             emp_np: np.ndarray | None = None
             emp_std_np: np.ndarray | None = None
-            if eq is not None:
+            _has_eq_source = (eq is not None) or (_src_eqs_by_cond is not None and len(_src_eqs_by_cond) > 0)
+            if _has_eq_source:
                 mu_val = cfg.data.postprocessing.mu
                 sigma_norm = cfg.data.postprocessing.sigma
                 if "test_trajs_full" in trajs:
@@ -1666,47 +1775,97 @@ def run_analytics(
                     traj_full_np = trajs["test_trajs"].sequence
                 traj_raw = np.asarray(traj_full_np) * sigma_norm + mu_val
 
+                # Build a list of (label, mask, src_eq) groups to iterate over.
+                # Single-source: one group spanning all trajectories with the
+                # provided `eq`. Multi-source: one group per (cond_row, eq) in
+                # the lookup, masked by per-traj condition match.
                 n_test_t = traj_raw.shape[0]
-                if hasattr(eq, "model"):
-                    # Torch-native eq.jac (e.g. wmtask): broadcasts over a leading
-                    # batch dim, so chunk-batch the trajectories on `device_obj`
-                    # and keep the inner Lyapunov QR loop on GPU.
-                    traj_raw_t = torch.as_tensor(traj_raw).float().to(device_obj)
-                    _emp_chunk_size = 64
-                    _emp_n_chunks = (n_test_t + _emp_chunk_size - 1) // _emp_chunk_size
-                    _emp_chunks: list[torch.Tensor] = []
-                    for _ci in tqdm(
-                        range(0, n_test_t, _emp_chunk_size),
-                        total=_emp_n_chunks,
-                        desc="    empirical Lyap chunks",
-                    ):
-                        _traj_chunk = traj_raw_t[_ci:_ci + _emp_chunk_size]
-                        _jacs_chunk = eq.jac(_traj_chunk, t=0)
-                        _le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(
-                            _jacs_chunk, dt
+                _emp_groups: list[tuple[str, np.ndarray, Any]] = []
+                if _is_conditioned and _src_eqs_by_cond:
+                    test_cond_arr = np.asarray(_test_condition_arr)
+                    for cond_row, src_eq in _src_eqs_by_cond:
+                        mask = np.all(test_cond_arr == cond_row, axis=1)
+                        if not mask.any():
+                            continue
+                        _emp_groups.append(
+                            (f"c={cond_row.tolist()}", mask, src_eq)
                         )
-                        _emp_chunks.append(_le_chunk.cpu())
-                    all_emp_lyap_t = torch.cat(_emp_chunks, dim=0)
                 else:
-                    # Numpy-based dysts eq.jac: D is small (3-5), per-traj loop is
-                    # cheap and the internal jac dispatcher already handles only
-                    # specific input shapes. Leave it untouched.
-                    all_emp_lyap = []
-                    for i in range(n_test_t):
-                        traj_i = traj_raw[i]
-                        jacs_np = eq.jac(traj_i, t=0)
-                        jacs_t = torch.as_tensor(jacs_np).float()
-                        le_i = LitLatentJacobianODE.compute_lyapunov_exponents(jacs_t, dt)
-                        all_emp_lyap.append(le_i)
-                    all_emp_lyap_t = torch.stack(all_emp_lyap).cpu()
+                    _emp_groups.append(("all", np.ones(n_test_t, dtype=bool), eq))
+
+                # Compute per-group empirical Lyap, store on `_state` as a
+                # dict {label: tensor (n_in_group, n_lyaps)} for the plot/report
+                # path. Also build the legacy `all_emp_lyap_t` (concatenated)
+                # so KY dimension and other downstream code keeps working.
+                emp_per_group: dict[str, torch.Tensor] = {}
+                concat_lyaps: list[torch.Tensor] = []
+                for label, mask, src_eq in _emp_groups:
+                    sub_raw = traj_raw[mask]
+                    if hasattr(src_eq, "model"):
+                        sub_raw_t = torch.as_tensor(sub_raw).float().to(device_obj)
+                        _emp_chunk_size = 64
+                        n_sub = sub_raw_t.shape[0]
+                        _emp_n_chunks = (n_sub + _emp_chunk_size - 1) // _emp_chunk_size
+                        _emp_chunks: list[torch.Tensor] = []
+                        for _ci in tqdm(
+                            range(0, n_sub, _emp_chunk_size),
+                            total=_emp_n_chunks,
+                            desc=f"    empirical Lyap chunks ({label})",
+                        ):
+                            _traj_chunk = sub_raw_t[_ci:_ci + _emp_chunk_size]
+                            _jacs_chunk = src_eq.jac(_traj_chunk, t=0)
+                            _le_chunk = LitLatentJacobianODE.compute_lyapunov_exponents(
+                                _jacs_chunk, dt
+                            )
+                            _emp_chunks.append(_le_chunk.cpu())
+                        group_lyap = torch.cat(_emp_chunks, dim=0)
+                    else:
+                        # Numpy-based dysts eq.jac: D is small (3-5), per-traj loop is
+                        # cheap and the internal jac dispatcher already handles only
+                        # specific input shapes. Leave it untouched.
+                        group_lyaps = []
+                        for i in range(sub_raw.shape[0]):
+                            traj_i = sub_raw[i]
+                            jacs_np = src_eq.jac(traj_i, t=0)
+                            jacs_t = torch.as_tensor(jacs_np).float()
+                            le_i = LitLatentJacobianODE.compute_lyapunov_exponents(jacs_t, dt)
+                            group_lyaps.append(le_i)
+                        group_lyap = torch.stack(group_lyaps).cpu()
+                    emp_per_group[label] = group_lyap
+                    concat_lyaps.append(group_lyap)
+                all_emp_lyap_t = torch.cat(concat_lyaps, dim=0)
                 _state["all_emp_lyap_t"] = all_emp_lyap_t
+                _state["emp_lyap_per_group"] = emp_per_group
                 emp_np = all_emp_lyap_t.mean(dim=0).numpy()
                 emp_std_np = all_emp_lyap_t.std(dim=0).numpy()
-                print("Empirical Lyapunov exponents (mean ± std):")
+                print("Empirical Lyapunov exponents (mean ± std, all trajectories):")
                 for i, (le, std) in enumerate(zip(emp_np, emp_std_np)):
                     print(f"  λ_{i+1} = {le:+.4f} ± {std:.4f}")
+                if _is_conditioned and len(emp_per_group) > 1:
+                    print("Empirical Lyapunov per condition:")
+                    for label, lyap in emp_per_group.items():
+                        print(f"  {label}:")
+                        m = lyap.mean(dim=0).numpy()
+                        s = lyap.std(dim=0).numpy()
+                        for i, (le, std) in enumerate(zip(m, s)):
+                            print(f"    λ_{i+1} = {le:+.4f} ± {std:.4f}")
 
             _state["all_pred_lyap"] = all_pred_lyap.cpu()
+
+            # Per-condition predicted Lyap groups: same condition partition
+            # used for empirical above, but applied to the full-trajectory
+            # predicted Lyap. Stored on _state so the plot function can
+            # overlay one curve per condition for both pred and emp.
+            pred_lyap_per_group: dict[str, torch.Tensor] = {}
+            if _is_conditioned and _src_eqs_by_cond:
+                test_cond_arr = np.asarray(_test_condition_arr)
+                for cond_row, _src_eq in _src_eqs_by_cond:
+                    mask = np.all(test_cond_arr == cond_row, axis=1)
+                    if not mask.any():
+                        continue
+                    label = f"c={cond_row.tolist()}"
+                    pred_lyap_per_group[label] = all_pred_lyap_full[mask]
+            _state["pred_lyap_per_group"] = pred_lyap_per_group
 
             best_lambda = None
             try:
@@ -1731,11 +1890,20 @@ def run_analytics(
             _html_section("Lyapunov Spectrum", _lyap_lines)
             _summary_lines += ["", "=== Lyapunov Spectrum ==="] + _lyap_lines
 
-            result = plot_lyapunov_spectrum(
-                pred_np, pred_std_np, emp_np, emp_std_np,
-                true_lyapunov=true_lyapunov, loop_closure_weight=best_lambda,
-                full_lyap_np=pred_full_np, full_lyap_std_np=pred_full_std_np,
-            )
+            if _is_conditioned and pred_lyap_per_group and _state.get("emp_lyap_per_group"):
+                # Per-condition overlay: one curve per (condition × {pred, emp}).
+                result = plot_lyapunov_spectrum_by_condition(
+                    pred_per_group={k: v.numpy() for k, v in pred_lyap_per_group.items()},
+                    emp_per_group={k: v.numpy() for k, v in _state["emp_lyap_per_group"].items()},
+                    true_lyapunov=true_lyapunov,
+                    loop_closure_weight=best_lambda,
+                )
+            else:
+                result = plot_lyapunov_spectrum(
+                    pred_np, pred_std_np, emp_np, emp_std_np,
+                    true_lyapunov=true_lyapunov, loop_closure_weight=best_lambda,
+                    full_lyap_np=pred_full_np, full_lyap_std_np=pred_full_std_np,
+                )
             if isinstance(result, list):
                 _emit("lyapunov", result[0])
                 _emit("lyapunov_top10", result[1])

@@ -388,6 +388,23 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         test_inds=test_inds,
     )
 
+    # Per-trajectory condition slices for downstream analytics. These are
+    # PER-TRAJECTORY (NOT per-sequence-window like the dataset condition
+    # above) — same first-axis length as trajs['*_trajs'].sequence. The
+    # analytics pipeline (run_analytics) uses these to compute per-condition
+    # Lyapunov spectra for the chosen run.
+    if condition is not None:
+        cond_arr_for_trajs = condition.detach().cpu().numpy() if isinstance(condition, torch.Tensor) else np.asarray(condition)
+        if split_by == 'trajectory':
+            trajs['train_condition'] = cond_arr_for_trajs[train_inds]
+            trajs['val_condition'] = cond_arr_for_trajs[val_inds]
+            trajs['test_condition'] = cond_arr_for_trajs[test_inds]
+        elif split_by == 'time':
+            # All trajectories appear in every split.
+            trajs['train_condition'] = cond_arr_for_trajs
+            trajs['val_condition'] = cond_arr_for_trajs
+            trajs['test_condition'] = cond_arr_for_trajs
+
     if return_full_obs:
         for key, raw in [
             ('train_trajs_full', train_trajs_full_raw),

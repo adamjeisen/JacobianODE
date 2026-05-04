@@ -234,9 +234,32 @@ def _load_recent_run(
             return_full = "LitEncoderDecoder" in str(cfg.training.lightning.get("_target_", ""))
         else:
             return_full = return_full_obs
+        # Combined-loader path: sol carries per-trajectory `condition` and
+        # `source_id`. Forward both into create_dataloaders so the test
+        # dataset carries condition tags (analytics needs them to compute
+        # per-condition Lyapunov / etc.) and the train/val/test split is
+        # balanced per source.
+        _condition = sol.get("condition") if isinstance(sol, dict) else None
+        _split_groups = sol.get("source_id") if isinstance(sol, dict) else None
         train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
-            cfg, values, return_full_obs=return_full
+            cfg, values, return_full_obs=return_full,
+            condition=_condition, split_groups=_split_groups,
         )
+        # Attach the per-source eq objects + a condition→eq lookup to trajs
+        # so analytics can compute per-condition empirical Lyapunov against
+        # the ground-truth dynamics that produced each subset of trajectories.
+        if isinstance(sol, dict) and sol.get("source_eqs") is not None and _condition is not None:
+            src_eqs = sol["source_eqs"]
+            src_ids = np.asarray(sol["source_id"])
+            cond_arr = np.asarray(_condition)
+            cond_to_eq: list[tuple[np.ndarray, Any]] = []
+            for src_idx, src_eq in enumerate(src_eqs):
+                mask = src_ids == src_idx
+                if not mask.any():
+                    continue
+                first_row = cond_arr[np.where(mask)[0][0]].copy()
+                cond_to_eq.append((first_row, src_eq))
+            trajs["source_eqs_by_condition"] = cond_to_eq
     else:
         values = None
         train_dataloader = None

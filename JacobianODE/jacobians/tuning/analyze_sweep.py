@@ -734,9 +734,19 @@ def compute_per_run_lyapunov(
                 raise RuntimeError(f"No trajectories returned by load_run for {run_id}")
             if "train_trajs" in trajs:
                 model_seq = trajs["train_trajs"].sequence
+                _cond_seq = trajs.get("train_condition")
             else:
                 model_seq = trajs["test_trajs"].sequence
+                _cond_seq = trajs.get("test_condition")
             test_trajs_this_run = model_seq[:n_sample_trajectories].to(device)
+            # Per-trajectory condition for conditioned models. None for
+            # unconditioned runs, in which case compute_jacobians is called
+            # without c (back-compat unchanged).
+            _has_cdim = bool(getattr(getattr(lit_model, "encoder", None), "condition_dim", 0))
+            _cond_for_run = (
+                torch.as_tensor(_cond_seq[:n_sample_trajectories]).float().to(device)
+                if (_has_cdim and _cond_seq is not None) else None
+            )
 
             # Compute Jacobians along the test trajectories (chunked). Vanilla
             # JacobianODE (LitMLP) has no encoder — operate directly on the
@@ -747,12 +757,20 @@ def compute_per_run_lyapunov(
             with torch.no_grad():
                 for start in range(0, test_trajs_this_run.shape[0], chunk_size):
                     chunk = test_trajs_this_run[start : start + chunk_size]
+                    c_chunk = (
+                        _cond_for_run[start : start + chunk_size]
+                        if _cond_for_run is not None else None
+                    )
                     if is_vanilla:
-                        jacs = lit_model.compute_jacobians(chunk)  # (B, T, D, D)
+                        jacs = lit_model.compute_jacobians(chunk, c=c_chunk)  # (B, T, D, D)
                     else:
-                        z_full = lit_model.encode_trajectory(chunk)
+                        z_full = (
+                            lit_model.encode_trajectory(chunk, c_chunk)
+                            if c_chunk is not None
+                            else lit_model.encode_trajectory(chunk)
+                        )
                         mu_dyn, _ = lit_model._split_latent(z_full)
-                        jacs = lit_model.compute_jacobians(mu_dyn)  # (B, T, D, D)
+                        jacs = lit_model.compute_jacobians(mu_dyn, c=c_chunk)  # (B, T, D, D)
                         del z_full, mu_dyn
                     lams = LitLatentJacobianODE.compute_lyapunov_exponents(jacs, dt)
                     lambdas.append(lams.detach().cpu())
