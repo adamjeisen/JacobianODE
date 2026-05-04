@@ -97,6 +97,8 @@ _ALL_SECTIONS = [
     "encoder_decoder_jacobians",
     "amplification",
     "tangent_spectrum",
+    "gramians_overlay",
+    "gramians_metric_overlay",
 ]
 
 
@@ -596,6 +598,154 @@ def plot_lyapunov_spectrum_by_condition(
     _draw(ax_zoom, 10)
     plt.tight_layout()
     return [fig_all, fig_zoom]
+
+
+def plot_block_gramians_per_condition(
+    per_panel: dict,
+    title: str,
+    cond_labels: list[str],
+) -> plt.Figure:
+    """Per-condition cross-area block-Gramian overlay (2×3 panel).
+
+    `per_panel` shape:
+        per_panel[stat][kind][direction][cond_label] = mean_value (float)
+    where:
+        stat ∈ {"log_trace", "log_min"}  (rows)
+        kind ∈ {"reach", "ctrl", "obs"}  (cols)
+        direction ∈ {"vis→cog", "cog→vis"}  (x-axis groups within a panel)
+        cond_label is one of cond_labels
+    Each direction × condition × {gt, pred} → 1 bar; fixed color per
+    condition, hatching distinguishes pred from gt (pred hatched, gt solid).
+    """
+    stats = ["log_trace", "log_min"]
+    kinds = ["reach", "ctrl", "obs"]
+    directions = ["vis→cog", "cog→vis"]
+    # Fixed condition→color mapping; reused across panels for legibility.
+    cond_palette = {
+        cond_labels[0]: "#4477AA",  # blue
+        **({cond_labels[1]: "#EE6677"} if len(cond_labels) > 1 else {}),  # red
+    }
+    if len(cond_labels) > 2:
+        extra_colors = ["#228833", "#CCBB44", "#66CCEE", "#AA3377"]
+        for i, lbl in enumerate(cond_labels[2:]):
+            cond_palette[lbl] = extra_colors[i % len(extra_colors)]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+    n_cond = len(cond_labels)
+    n_per_dir = 2 * n_cond  # gt + pred per condition
+    bar_w = 0.8 / n_per_dir
+    direction_centers = np.array([0.0, 1.0])  # x positions for the two direction groups
+
+    legend_handles_done = False
+    for r, stat in enumerate(stats):
+        for c, kind in enumerate(kinds):
+            ax = axes[r][c]
+            stat_data = per_panel.get(stat, {}).get(kind, {})
+            for di, direction in enumerate(directions):
+                dir_data = stat_data.get(direction, {})
+                # Layout per direction group: [gt c0, pred c0, gt c1, pred c1, ...]
+                bar_idx = 0
+                for cond_label in cond_labels:
+                    color = cond_palette[cond_label]
+                    for kind_label, hatch in [("gt", None), ("pred", "//")]:
+                        val = dir_data.get(cond_label, {}).get(kind_label)
+                        if val is None or not np.isfinite(val):
+                            bar_idx += 1
+                            continue
+                        x = direction_centers[di] + (bar_idx - (n_per_dir - 1) / 2) * bar_w
+                        ax.bar(
+                            x, val, width=bar_w * 0.95, color=color,
+                            hatch=hatch, edgecolor="black", linewidth=0.5,
+                            label=(
+                                f"{cond_label} {kind_label}"
+                                if (not legend_handles_done and di == 0) else None
+                            ),
+                        )
+                        bar_idx += 1
+            ax.set_xticks(direction_centers)
+            ax.set_xticklabels(directions)
+            ax.axhline(0, color="k", lw=0.5)
+            ax.set_title(f"{kind} | {stat.replace('_', ' ')}")
+            ax.grid(True, alpha=0.3, axis="y")
+            if r == 0 and c == 0 and not legend_handles_done:
+                ax.legend(loc="best", fontsize=8)
+                legend_handles_done = True
+
+    fig.suptitle(title, y=1.01, fontsize=12)
+    fig.tight_layout()
+    return fig
+
+
+def _direct_sum_block_indices(lit_model) -> tuple[list[slice], list[slice], list[int]] | None:
+    """For a DirectSumCouplingEncoder, return (latent_blocks, obs_blocks, k_per_block).
+
+    latent_blocks[i] indexes the dynamic latent dims belonging to area i;
+    obs_blocks[i]   indexes the observation dims belonging to area i (from area_indices).
+
+    Returns None if the model isn't a DirectSum encoder or block info is missing.
+    """
+    enc = getattr(lit_model, "encoder", None)
+    if enc is None:
+        return None
+    k_per_block = getattr(enc, "_k_per_block", None) or getattr(enc, "n_target_dims_per_block", None)
+    area_indices = getattr(enc, "area_indices", None)
+    if k_per_block is None or area_indices is None:
+        return None
+    if len(k_per_block) != len(area_indices):
+        return None
+    # Latent dyn slices: contiguous in z_dyn since the DirectSum permutes
+    # each area's latent target into the front of z, in area order.
+    cumsum = [0]
+    for k in k_per_block:
+        cumsum.append(cumsum[-1] + int(k))
+    latent_blocks = [slice(cumsum[i], cumsum[i + 1]) for i in range(len(k_per_block))]
+    # Obs slices: area_indices[i] is a list of indices (likely contiguous
+    # for the WMTask config). Convert to slice when possible.
+    obs_blocks: list[slice] = []
+    for ai in area_indices:
+        ai_list = list(ai)
+        if ai_list == list(range(ai_list[0], ai_list[-1] + 1)):
+            obs_blocks.append(slice(ai_list[0], ai_list[-1] + 1))
+        else:
+            obs_blocks.append(ai_list)  # fallback: list-style indexing
+    return latent_blocks, obs_blocks, [int(k) for k in k_per_block]
+
+
+def _terminal_block_summary(
+    A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
+    dt: float, gramian_module,
+    B_factor: torch.Tensor | None = None,
+    C_factor: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Run compute_all_gramians (or metric variant) and return terminal
+    log-trace + log-min-eig averaged across batch."""
+    kwargs = dict(
+        dt=dt, return_sequences=False, return_spectrums=True, rescale=True,
+    )
+    if B_factor is not None:
+        kwargs["B_factor"] = B_factor
+    if C_factor is not None:
+        kwargs["C_factor"] = C_factor
+    with torch.no_grad():
+        (_, _, _), (spec_r, spec_c, spec_o) = gramian_module.compute_all_gramians(
+            A, B, C, **kwargs
+        )
+
+    def _log_trace(spec):
+        # rescale=True returns log eigenvalues; logsumexp over them = log of trace.
+        return torch.logsumexp(spec, dim=-1).mean().item()
+
+    def _log_min(spec):
+        return spec[..., -1].mean().item()
+
+    return {
+        ("reach", "log_trace"): _log_trace(spec_r),
+        ("reach", "log_min"):   _log_min(spec_r),
+        ("ctrl",  "log_trace"): _log_trace(spec_c),
+        ("ctrl",  "log_min"):   _log_min(spec_c),
+        ("obs",   "log_trace"): _log_trace(spec_o),
+        ("obs",   "log_min"):   _log_min(spec_o),
+    }
 
 
 def plot_kaplan_yorke(
@@ -2557,6 +2707,177 @@ def run_analytics(
                 _summary_lines += ["", "=== Tangent Space Spectrum ==="] + _ts_lines
             except Exception as exc:
                 print(f"  tangent_spectrum failed: {exc}")
+
+        # ============================================================
+        # 13 + 14. Cross-area block Gramians (per-condition overlay)
+        # ============================================================
+        for sec_name, gram_module_path, sec_title_suffix in [
+            ("gramians_overlay",        "JacobianODE.control.gramians",        "(standard)"),
+            ("gramians_metric_overlay", "JacobianODE.control.gramians_metric", "(metric, B/C-factor weighted)"),
+        ]:
+            if sec_name not in active_sections:
+                continue
+            if not is_latent or not _is_conditioned_model:
+                print(f"Skipping '{sec_name}': requires latent + conditioned model.")
+                continue
+            block_info = _direct_sum_block_indices(lit_model)
+            if block_info is None or len(block_info[2]) != 2:
+                print(f"Skipping '{sec_name}': requires DirectSum 2-block encoder.")
+                continue
+            if not (_test_traj_cond_full is not None and _src_eqs_by_cond):
+                print(f"Skipping '{sec_name}': requires per-condition test data + source_eqs.")
+                continue
+            print(f"Computing {sec_name} ...")
+            import importlib
+            gram_mod = importlib.import_module(gram_module_path)
+            is_metric_variant = sec_name.endswith("metric_overlay")
+            latent_blocks, obs_blocks, k_per_block = block_info
+            VIS_LAT, COG_LAT = latent_blocks[0], latent_blocks[1]
+            VIS_OBS, COG_OBS = obs_blocks[0], obs_blocks[1]
+
+            # per_panel[stat][kind][direction][cond_label] = mean log value
+            per_panel: dict = {
+                stat: {kind: {dir_: {} for dir_ in ("vis→cog", "cog→vis")}
+                       for kind in ("reach", "ctrl", "obs")}
+                for stat in ("log_trace", "log_min")
+            }
+            cond_labels: list[str] = []
+
+            try:
+                with torch.no_grad():
+                    test_trajs_t = torch.as_tensor(trajs["test_trajs"].sequence).float().to(device_obj)
+                    if "test_trajs_full" in trajs:
+                        test_trajs_full_t = torch.as_tensor(trajs["test_trajs_full"].sequence).float().to(device_obj)
+                    else:
+                        test_trajs_full_t = test_trajs_t
+                    mu_val = float(cfg.data.postprocessing.mu)
+                    sigma_val = float(cfg.data.postprocessing.sigma)
+                    test_cond_arr = np.asarray(_test_condition_arr)
+
+                    # n_sample per condition for tractable compute
+                    n_per_cond = 16
+                    for cond_row, src_eq in _src_eqs_by_cond:
+                        mask = np.all(test_cond_arr == cond_row, axis=1)
+                        if not mask.any():
+                            continue
+                        idx = np.where(mask)[0][:n_per_cond]
+                        cond_label = f"c={cond_row.tolist()}"
+                        cond_labels.append(cond_label)
+
+                        sub_t = test_trajs_t[idx]
+                        sub_full_t = test_trajs_full_t[idx]
+                        cond_t_chunk = torch.as_tensor(cond_row).float().unsqueeze(0).repeat(len(idx), 1).to(device_obj)
+
+                        # --- Predicted dynamics Jacobian in latent dyn space ---
+                        z_full = lit_model.encode_trajectory(sub_t, cond_t_chunk)
+                        z_dyn, _ = lit_model._split_latent(z_full)
+                        J_pred = lit_model.compute_jacobians(z_dyn, c=cond_t_chunk).double()  # (B, T, N, N)
+
+                        # --- Ground-truth obs-space Jacobian via source_eq ---
+                        sub_raw = sub_full_t * sigma_val + mu_val
+                        J_gt = src_eq.jac(sub_raw, t=0).double()  # (B, T, D_obs, D_obs)
+
+                        # --- Encoder Jacobian per timestep (only for metric variant) ---
+                        B_factor_pred_vis = B_factor_pred_cog = None
+                        C_factor_pred_vis = C_factor_pred_cog = None
+                        if is_metric_variant:
+                            # _encoder_jacobian_at expects flat (M, n_obs).
+                            B, T, D_obs = sub_t.shape
+                            n_dyn_total = z_dyn.shape[-1]
+                            J_E_flat = lit_model._encoder_jacobian_at(
+                                sub_t.reshape(-1, D_obs), n_dyn_total, D_obs,
+                            )  # (B*T, n_dyn, D_obs)
+                            J_E = J_E_flat.reshape(B, T, n_dyn_total, D_obs).double()
+                            # Block-restrict per source area:
+                            #   vis area: J_E[:, :, latent_vis, obs_vis]  → (B,T,k_vis,64)
+                            J_E_vis = J_E[..., VIS_LAT, VIS_OBS]
+                            J_E_cog = J_E[..., COG_LAT, COG_OBS]
+
+                            def _inv_sqrt(M: torch.Tensor) -> torch.Tensor:
+                                # M: (..., k, k) SPD → M^{-1/2} via eigh
+                                vals, vecs = torch.linalg.eigh(M)
+                                inv_sqrt_vals = (vals.clamp_min(1e-12)).rsqrt()
+                                return vecs @ torch.diag_embed(inv_sqrt_vals) @ vecs.transpose(-2, -1)
+
+                            M_vis = J_E_vis @ J_E_vis.transpose(-2, -1)  # (B,T,k_vis,k_vis)
+                            M_cog = J_E_cog @ J_E_cog.transpose(-2, -1)
+                            B_factor_pred_vis = _inv_sqrt(M_vis)
+                            B_factor_pred_cog = _inv_sqrt(M_cog)
+                            # For C_factor on the OUTPUT side, output area is the
+                            # OPPOSITE block (e.g., for vis→cog the C output coupling
+                            # block is C[vis, cog] so output dim = vis); use vis factor.
+                            C_factor_pred_vis = B_factor_pred_vis  # output = vis when target=cog
+                            C_factor_pred_cog = B_factor_pred_cog  # output = cog when target=vis
+
+                        # --- Two directions: vis→cog and cog→vis ---
+                        for dir_label, target_lat, source_lat, target_obs, source_obs, B_f, C_f in [
+                            ("vis→cog", COG_LAT, VIS_LAT, COG_OBS, VIS_OBS, B_factor_pred_vis, C_factor_pred_vis),
+                            ("cog→vis", VIS_LAT, COG_LAT, VIS_OBS, COG_OBS, B_factor_pred_cog, C_factor_pred_cog),
+                        ]:
+                            # Predicted (latent space)
+                            A_p = J_pred[..., target_lat, target_lat]
+                            B_p = J_pred[..., target_lat, source_lat]
+                            C_p = J_pred[..., source_lat, target_lat]
+                            try:
+                                pred_terminal = _terminal_block_summary(
+                                    A_p, B_p, C_p, dt, gram_mod,
+                                    B_factor=B_f, C_factor=C_f,
+                                )
+                            except Exception as e:
+                                print(f"  pred {cond_label} {dir_label} failed: {e}")
+                                pred_terminal = {}
+                            # GT (obs space) — never metric-weighted (already obs)
+                            A_g = J_gt[..., target_obs, target_obs]
+                            B_g = J_gt[..., target_obs, source_obs]
+                            C_g = J_gt[..., source_obs, target_obs]
+                            try:
+                                gt_terminal = _terminal_block_summary(A_g, B_g, C_g, dt, gram_mod)
+                            except Exception as e:
+                                print(f"  gt {cond_label} {dir_label} failed: {e}")
+                                gt_terminal = {}
+
+                            for (kind, stat), v in pred_terminal.items():
+                                per_panel[stat][kind][dir_label].setdefault(cond_label, {})["pred"] = v
+                            for (kind, stat), v in gt_terminal.items():
+                                per_panel[stat][kind][dir_label].setdefault(cond_label, {})["gt"] = v
+
+                            print(
+                                f"  {cond_label} {dir_label}  "
+                                f"reach (pred log_tr / gt log_tr): "
+                                f"{pred_terminal.get(('reach','log_trace'), float('nan')):.3f} / "
+                                f"{gt_terminal.get(('reach','log_trace'), float('nan')):.3f}"
+                            )
+
+                if cond_labels:
+                    fig = plot_block_gramians_per_condition(
+                        per_panel,
+                        title=(
+                            f"Cross-area block Gramians per condition "
+                            f"{sec_title_suffix}\n"
+                            "color = condition, hatching = predicted (vs solid = ground truth)"
+                        ),
+                        cond_labels=cond_labels,
+                    )
+                    _emit(sec_name, fig)
+                    _gram_lines = [f"Conditions: {cond_labels}"]
+                    for stat in ("log_trace", "log_min"):
+                        for kind in ("reach", "ctrl", "obs"):
+                            for dir_ in ("vis→cog", "cog→vis"):
+                                for cl in cond_labels:
+                                    d = per_panel[stat][kind][dir_].get(cl, {})
+                                    p = d.get("pred", float("nan"))
+                                    g = d.get("gt", float("nan"))
+                                    _gram_lines.append(
+                                        f"  {dir_} {kind} {stat}  {cl}: pred={p:.4f} gt={g:.4f}"
+                                    )
+                    _html_section(f"Block Gramians {sec_title_suffix}", _gram_lines)
+                    _summary_lines += ["", f"=== Block Gramians {sec_title_suffix} ==="] + _gram_lines
+                else:
+                    print(f"  {sec_name}: no condition groups found, skipping plot.")
+            except Exception as exc:
+                print(f"  {sec_name} failed: {exc}")
+                import traceback as _tb
+                _tb.print_exc()
 
         # ============================================================
         # Final: consolidated summary section (HTML only — always last)
