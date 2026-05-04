@@ -1443,6 +1443,11 @@ def run_analytics(
     #     aligns with trajs['test_trajs'].sequence (per-trajectory)
     # Both are None when not conditioned; model.* methods accept c=None.
     _is_conditioned_model = bool(getattr(getattr(lit_model, "encoder", None), "condition_dim", 0))
+    # Per-trajectory condition + per-source eq lookup (combined-loader path).
+    # Defined at top scope so any chosen-run section (lyap, gramians, etc.)
+    # can reference them without depending on lyap having run first.
+    _test_condition_arr = trajs.get("test_condition") if isinstance(trajs, dict) else None
+    _src_eqs_by_cond = trajs.get("source_eqs_by_condition") if isinstance(trajs, dict) else None
     _test_seq_cond_full = None
     _test_traj_cond_full = None
     if _is_conditioned_model:
@@ -1841,17 +1846,9 @@ def run_analytics(
         # ============================================================
         if "lyapunov" in active_sections:
             print("Computing Lyapunov exponents ...")
-            # Detect per-trajectory conditions (combined-loader path). When
-            # present, the dynamics MLP and encoder were trained with c, so
-            # compute_jacobians MUST be called with the right per-traj c —
-            # passing c=None into a conditioned MLP raises. Below we thread
-            # c into the predicted-Jac computation and use the per-source eq
-            # from trajs["source_eqs_by_condition"] for empirical Jacobians.
-            _test_condition_arr = trajs.get("test_condition") if isinstance(trajs, dict) else None
-            _src_eqs_by_cond = trajs.get("source_eqs_by_condition") if isinstance(trajs, dict) else None
-            _is_conditioned = _test_condition_arr is not None and getattr(
-                getattr(lit_model, "encoder", None), "condition_dim", 0
-            ) > 0
+            # _test_condition_arr and _src_eqs_by_cond are defined at the
+            # top of run_analytics so all chosen-run sections share them.
+            _is_conditioned = _test_condition_arr is not None and _is_conditioned_model
             with torch.no_grad():
                 # --- Full-length trajectory Lyapunov (PLOTTED) ---
                 # Uses trajs['test_trajs'].sequence — the actual full-length test
