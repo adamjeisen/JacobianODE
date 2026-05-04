@@ -959,6 +959,7 @@ def run_analytics(
     sweep_result: Any | None = None,
     sweep_lambdas: list[float] | None = None,
     ranking_method: str = "pareto_knee", # "best_traj_loss" | "pareto_knee" | "geo_rank" | "minimax_rank" | "geo_log_score" | "minimax_log_score"
+    eigenvalue_threshold: float = 0.001,
     return_model: bool = False,
     use_all_runs: bool = False,
 ) -> Any:
@@ -1061,6 +1062,7 @@ def run_analytics(
             save_dir=save_dir,
             wandb_group=wandb_group,
             ranking_method=ranking_method,
+            eigenvalue_threshold=eigenvalue_threshold,
             verbose=True,
             use_all_runs=use_all_runs,
         )

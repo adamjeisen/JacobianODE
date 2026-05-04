@@ -421,6 +421,7 @@ def run_full_analytics(
     lyapunov_burn_in_steps: int = 400,
     lyapunov_burn_in_drop: int = 100,
     sections_override: list[str] | None = None,
+    eigenvalue_threshold: float = float("inf"),
 ) -> tuple[dict[str, str], str]:
     """Invoke run_analytics with the standard (or overridden) section set.
 
@@ -464,6 +465,7 @@ def run_full_analytics(
             output_dir=str(figures_dir),
             sections=sections,
             ranking_method="best_traj_loss",
+            eigenvalue_threshold=eigenvalue_threshold,
             lyapunov_burn_in_steps=lyapunov_burn_in_steps,
             lyapunov_burn_in_drop=lyapunov_burn_in_drop,
             use_all_runs=True,
@@ -1297,6 +1299,7 @@ def analyze(
     true_lyapunov: list | None = None,
     lyapunov_burn_in_steps: int = 400,
     lyapunov_burn_in_drop: int = 100,
+    eigenvalue_threshold: float = float("inf"),
 ) -> Path:
     """Top-level: analyse one sweep's sentinel → produce analysis/<group>/."""
     # Accept the sentinel from any of done/, processed/, or failed/. Auto-analyze
@@ -1369,6 +1372,7 @@ def analyze(
             true_lyapunov=true_lyapunov,
             lyapunov_burn_in_steps=lyapunov_burn_in_steps,
             lyapunov_burn_in_drop=lyapunov_burn_in_drop,
+            eigenvalue_threshold=eigenvalue_threshold,
         )
     except Exception as e:
         analytics_error = f"{type(e).__name__}: {e}"
@@ -1483,6 +1487,7 @@ def backfill(
     true_lyapunov: list | None = None,
     lyapunov_burn_in_steps: int = 400,
     lyapunov_burn_in_drop: int = 100,
+    eigenvalue_threshold: float = float("inf"),
 ) -> Path:
     """Re-run only missing analytics sections for an existing report.
 
@@ -1553,6 +1558,7 @@ def backfill(
             true_lyapunov=true_lyapunov,
             lyapunov_burn_in_steps=lyapunov_burn_in_steps,
             lyapunov_burn_in_drop=lyapunov_burn_in_drop,
+            eigenvalue_threshold=eigenvalue_threshold,
             sections_override=missing_sections,
         )
     except Exception as e:
@@ -1600,6 +1606,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lyapunov-burn-in-drop", type=int, default=100,
                         help="Initial Jacobians to drop from the Lyapunov QR so Q can converge "
                              "(default: 100)")
+    parser.add_argument("--eigenvalue-threshold", type=float, default=float("inf"),
+                        help="C3 threshold for fast_eigenvalue_fraction in best-run "
+                             "selection. Default inf disables C3 entirely — the flat "
+                             "0.001 default is nonsensical at high n_target_dims where "
+                             "off-manifold contracting modes legitimately register as "
+                             "'fast'. Pass 0.001 to restore the original behavior.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args(argv)
@@ -1623,6 +1635,7 @@ def main(argv: list[str] | None = None) -> int:
             true_lyapunov=true_lyapunov,
             lyapunov_burn_in_steps=args.lyapunov_burn_in_steps,
             lyapunov_burn_in_drop=args.lyapunov_burn_in_drop,
+            eigenvalue_threshold=args.eigenvalue_threshold,
         )
     except Exception:
         traceback.print_exc()
