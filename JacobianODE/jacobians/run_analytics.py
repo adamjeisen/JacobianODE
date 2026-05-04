@@ -611,87 +611,107 @@ def plot_block_gramians_per_condition(
         per_panel[stat][kind][direction][cond_label] = mean_value (float)
 
     Visual encoding:
+        - x-axis groups bars by gt/pred (gt block on left, pred block on
+          right of each panel). Within each block, 2 directions × N cond
+          values lay out side by side.
         - color = direction (cog→vis blue, vis→cog red)
-        - hatching = predicted (gt solid, pred hatched)
-        - condition = subtle outlined bounding box around each condition's
-          group of bars, with a small condition label below the box
-        - twin y-axes: gt bars on the LEFT axis, pred bars on the RIGHT
-          axis (the two scales typically differ by orders of magnitude
-          since gt is in obs space and pred is in latent space). Y-tick
-          colors match each axis's bar color (black for gt-left, gray
-          for pred-right) so the reader knows which scale to read.
+        - alpha = condition (first cond fully opaque, second cond lighter)
+        - hatching = pred (white hatch on pred bars; gt unhatched).
+          Redundant with x-position but helps at-a-glance.
+        - twin y-axes: gt block bars use the LEFT axis, pred block bars
+          use the RIGHT axis. Each axis auto-scales to its own data
+          (no forced inclusion of 0) so we don't waste vertical space
+          when a panel is e.g. all-negative on one side and all-positive
+          on the other.
     """
-    from matplotlib.patches import Rectangle
+    from matplotlib.patches import Patch
+    # White hatching (mpl default is black). rc_context scopes this so we
+    # don't leak the setting into other plot calls in the same process.
+    plt.rcParams["hatch.color"] = "white"
+    plt.rcParams["hatch.linewidth"] = 0.8
     stats = ["log_trace", "log_min"]
     kinds = ["reach", "ctrl", "obs"]
     directions = ["cog→vis", "vis→cog"]
-    # Fixed direction→color mapping; reused across panels.
     dir_palette = {"cog→vis": "#4477AA", "vis→cog": "#EE6677"}
-
-    fig, axes = plt.subplots(2, 3, figsize=(16, 7.5))
+    # Condition → alpha. Two-condition case gets {1.0, 0.45} so the
+    # second condition reads as a "ghost" of the first while staying
+    # the same color (so the direction is still the primary visual hue).
     n_cond = len(cond_labels)
-    n_per_cond = 2 * len(directions)  # (gt+pred) × (cog→vis, vis→cog)
-    bar_w = 0.8 / max(n_per_cond * n_cond, 1)
-    cond_centers = np.linspace(0.0, max(0.0, n_cond - 1), n_cond)
+    if n_cond == 1:
+        cond_alpha = {cond_labels[0]: 1.0}
+    elif n_cond == 2:
+        cond_alpha = {cond_labels[0]: 1.0, cond_labels[1]: 0.45}
+    else:
+        cond_alpha = {lbl: 1.0 - 0.55 * (i / max(n_cond - 1, 1))
+                      for i, lbl in enumerate(cond_labels)}
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+
+    # Layout: each panel has 2 x-blocks (gt at x=0, pred at x=1). Within
+    # each block, bars for (direction × cond) lay tightly side-by-side.
+    n_per_block = len(directions) * n_cond
+    block_total_w = 0.55                 # horizontal extent of a block
+    bar_w = block_total_w / n_per_block
+    block_centers = np.array([0.0, 1.0])
 
     handles_done = False
     for r, stat in enumerate(stats):
         for c, kind in enumerate(kinds):
             ax_gt = axes[r][c]
-            ax_pred = ax_gt.twinx()  # separate scale for pred
+            ax_pred = ax_gt.twinx()
             stat_data = per_panel.get(stat, {}).get(kind, {})
-
-            # Track value ranges so we can size each y-axis independently.
             gt_vals: list[float] = []
             pred_vals: list[float] = []
 
-            for ci, cond_label in enumerate(cond_labels):
-                # Within this condition group, lay out 4 bars:
-                # [gt cog→vis, pred cog→vis, gt vis→cog, pred vis→cog]
+            for kind_idx, (kind_label, hatch, ax_target, value_bucket) in enumerate([
+                ("gt",   None,   ax_gt,   gt_vals),
+                ("pred", "////", ax_pred, pred_vals),
+            ]):
+                center = block_centers[kind_idx]
+                # Place bars in order: for each direction, all conditions
+                # adjacent (so the eye sees the cond effect within direction).
                 bar_offset = 0
                 for direction in directions:
                     color = dir_palette[direction]
-                    for kind_label, hatch, ax_target, value_bucket in [
-                        ("gt",   None, ax_gt,   gt_vals),
-                        ("pred", "//", ax_pred, pred_vals),
-                    ]:
+                    for cond_label in cond_labels:
                         val = stat_data.get(direction, {}).get(cond_label, {}).get(kind_label)
                         if val is None or not np.isfinite(val):
                             bar_offset += 1
                             continue
-                        x = (
-                            cond_centers[ci]
-                            + (bar_offset - (n_per_cond - 1) / 2) * bar_w
-                        )
+                        x = center + (bar_offset - (n_per_block - 1) / 2) * bar_w
                         ax_target.bar(
-                            x, val, width=bar_w * 0.92, color=color,
+                            x, val, width=bar_w * 0.95, color=color,
+                            alpha=cond_alpha[cond_label],
                             hatch=hatch, edgecolor="black", linewidth=0.5,
                             zorder=3,
                         )
                         value_bucket.append(val)
                         bar_offset += 1
 
-                # Subtle bounding box around each condition's bar group.
-                left = cond_centers[ci] - (n_per_cond - 1) / 2 * bar_w - bar_w * 0.6
-                right = cond_centers[ci] + (n_per_cond - 1) / 2 * bar_w + bar_w * 0.6
-                width = right - left
-                # Use the data limits in axis coordinates (ax_gt) for the y span.
-                # We draw the box in axis-fraction coords spanning full height.
-                ax_gt.add_patch(Rectangle(
-                    (left, 0.02), width, 0.96,
-                    transform=ax_gt.get_xaxis_transform(),
-                    facecolor="none", edgecolor="#888", linewidth=0.8,
-                    linestyle="--", alpha=0.7, zorder=2,
-                ))
-                ax_gt.text(
-                    cond_centers[ci], -0.08, cond_label,
-                    transform=ax_gt.get_xaxis_transform(),
-                    ha="center", va="top", fontsize=8, color="#444",
-                )
+            # Auto-scale each axis independently using only its data range.
+            # mpl's default would include 0 from bars; use 5% padding from
+            # the data extent instead so all-negative / all-positive panels
+            # don't waste vertical space on the irrelevant side.
+            def _set_lim(ax, vals):
+                if not vals:
+                    return
+                vmin, vmax = min(vals), max(vals)
+                pad = 0.05 * max(abs(vmax - vmin), 1e-12)
+                # Snap toward 0 if data straddles zero so the zero line is meaningful.
+                if vmin > 0:
+                    ax.set_ylim(0, vmax + pad)
+                elif vmax < 0:
+                    ax.set_ylim(vmin - pad, 0)
+                else:
+                    ax.set_ylim(vmin - pad, vmax + pad)
 
-            ax_gt.set_xticks([])
-            ax_gt.axhline(0, color="k", lw=0.5)
-            ax_pred.axhline(0, color="gray", lw=0.5, ls=":")
+            _set_lim(ax_gt, gt_vals)
+            _set_lim(ax_pred, pred_vals)
+
+            ax_gt.set_xticks(block_centers)
+            ax_gt.set_xticklabels(["ground truth", "predicted"])
+            ax_gt.set_xlim(block_centers[0] - block_total_w / 2 - bar_w,
+                           block_centers[1] + block_total_w / 2 + bar_w)
             ax_gt.set_title(f"{kind} | {stat.replace('_', ' ')}")
             ax_gt.set_ylabel("ground truth", color="black", fontsize=9)
             ax_pred.set_ylabel("predicted", color="gray", fontsize=9)
@@ -701,17 +721,26 @@ def plot_block_gramians_per_condition(
             ax_gt.grid(True, alpha=0.25, axis="y")
 
             if r == 0 and c == 0 and not handles_done:
-                from matplotlib.patches import Patch
-                handles = []
-                for direction, color in dir_palette.items():
-                    handles.append(Patch(facecolor=color, edgecolor="black", label=f"{direction} (gt)"))
-                    handles.append(Patch(facecolor=color, edgecolor="black", hatch="//", label=f"{direction} (pred)"))
-                ax_gt.legend(handles=handles, loc="upper right", fontsize=7, ncol=2)
+                # Direction handles (color)
+                handles = [
+                    Patch(facecolor=color, edgecolor="black", label=direction)
+                    for direction, color in dir_palette.items()
+                ]
+                # Condition handles (alpha, neutral gray to convey "same color, less saturated")
+                for cond_label in cond_labels:
+                    handles.append(Patch(
+                        facecolor="#888", edgecolor="black",
+                        alpha=cond_alpha[cond_label],
+                        label=cond_label,
+                    ))
+                # gt/pred handles (hatching)
+                handles.append(Patch(facecolor="white", edgecolor="black", label="gt"))
+                handles.append(Patch(facecolor="white", edgecolor="black", hatch="////", label="pred"))
+                ax_gt.legend(handles=handles, loc="best", fontsize=7, ncol=2)
                 handles_done = True
 
     fig.suptitle(title, y=1.01, fontsize=12)
-    # Pad bottom so condition labels don't get cropped.
-    fig.tight_layout(rect=(0, 0.03, 1, 0.99))
+    fig.tight_layout()
     return fig
 
 
