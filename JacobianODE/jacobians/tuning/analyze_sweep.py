@@ -786,14 +786,45 @@ def compute_per_run_lyapunov(
             if 0 < k_star < len(lambda_mean):
                 # fractional correction
                 ky_dim = float(k_star + cum[k_star - 1] / max(abs(lambda_mean[k_star]), 1e-12))
+
+            # Per-condition spectra: for conditioned models, group
+            # lambda_per_traj rows by the per-trajectory condition value
+            # so the per-run plot can show one spectrum per (run, condition).
+            # Otherwise empty.
+            per_condition: dict[str, dict] = {}
+            if _cond_for_run is not None:
+                cond_np = _cond_for_run.cpu().numpy()
+                # Take only the rows that actually contributed to lambda_per_traj
+                cond_used = cond_np[: lambda_per_traj.shape[0]]
+                unique_c = np.unique(cond_used, axis=0)
+                for cond_row in unique_c:
+                    mask = np.all(cond_used == cond_row, axis=1)
+                    if not mask.any():
+                        continue
+                    sub = lambda_per_traj[mask]
+                    sub_mean = sub.mean(axis=0)
+                    label = f"c={cond_row.tolist()}"
+                    per_condition[label] = {
+                        "lambda_spectrum": sub_mean.tolist(),
+                        "lambda_max": float(sub_mean.max()),
+                        "lambda_sum": float(sub_mean.sum()),
+                        "n_trajs": int(mask.sum()),
+                    }
             per_run[run_id] = {
                 "lambda_spectrum": lambda_mean.tolist(),
                 "lambda_max": lambda_max,
                 "lambda_sum": lambda_sum,
                 "kaplan_yorke_dim": ky_dim,
+                "per_condition": per_condition,
                 "error": None,
             }
-            logger.info(f"  [{i + 1}/{len(all_runs)}] {run_id}: λ_max={lambda_max:.4f}, sum={lambda_sum:.2f}")
+            if per_condition:
+                cond_summary = "  ".join(
+                    f"{lbl} λ_max={d['lambda_max']:.4f}" for lbl, d in per_condition.items()
+                )
+                logger.info(f"  [{i + 1}/{len(all_runs)}] {run_id}: combined λ_max={lambda_max:.4f}  | per-cond: {cond_summary}")
+            else:
+                logger.info(f"  [{i + 1}/{len(all_runs)}] {run_id}: λ_max={lambda_max:.4f}, sum={lambda_sum:.2f}")
         except Exception as e:
             per_run[run_id] = {"error": f"{type(e).__name__}: {e}"}
             logger.warning(f"  [{i + 1}/{len(all_runs)}] {run_id}: FAILED — {e}")
@@ -913,19 +944,54 @@ def compute_per_run_lyapunov(
         lc_for_color = np.array([max(v, 1e-12) for v in lc_vals])
         norm = matplotlib.colors.LogNorm(vmin=lc_for_color.min(), vmax=lc_for_color.max())
         cmap = plt.cm.viridis
+        # If runs carry per-condition spectra (combined-loader runs), draw
+        # one curve per (run × condition) using a different linestyle per
+        # condition. Otherwise one curve per run as before.
+        any_per_cond = any(d.get("per_condition") for _, d in success)
+        cond_linestyles = ["-", "--", ":", "-."]
+        cond_label_to_style: dict[str, str] = {}
         for (rid, d), lc in zip(success, lc_vals):
-            ax[0].plot(
-                d["lambda_spectrum"],
-                color=cmap(norm(max(lc, 1e-12))),
-                alpha=0.6, lw=1.0,
-            )
+            color = cmap(norm(max(lc, 1e-12)))
+            per_cond = d.get("per_condition") or {}
+            if per_cond:
+                for cond_label, cond_d in per_cond.items():
+                    if cond_label not in cond_label_to_style:
+                        cond_label_to_style[cond_label] = cond_linestyles[
+                            len(cond_label_to_style) % len(cond_linestyles)
+                        ]
+                    ax[0].plot(
+                        cond_d["lambda_spectrum"],
+                        color=color,
+                        linestyle=cond_label_to_style[cond_label],
+                        alpha=0.6, lw=1.0,
+                    )
+            else:
+                ax[0].plot(
+                    d["lambda_spectrum"],
+                    color=color,
+                    alpha=0.6, lw=1.0,
+                )
         if true_arr is not None:
             ax[0].plot(true_arr, color="black", lw=2.5, label=true_label, zorder=10)
+        # Add a linestyle legend for conditions when present (separate from
+        # the LC colorbar — colors carry LC weight, linestyles carry condition).
+        if cond_label_to_style:
+            from matplotlib.lines import Line2D
+            cond_handles = [
+                Line2D([0], [0], color="k", linestyle=ls, label=lbl)
+                for lbl, ls in cond_label_to_style.items()
+            ]
+            if true_arr is not None:
+                cond_handles.append(Line2D([0], [0], color="black", lw=2.5, label=true_label))
+            ax[0].legend(handles=cond_handles, loc="upper right", fontsize=8)
+        elif true_arr is not None:
             ax[0].legend(loc="upper right")
         ax[0].axhline(0, color="k", lw=0.5, ls="--")
         ax[0].set_xlabel("Index (sorted desc)")
         ax[0].set_ylabel(r"$\lambda_i$")
-        ax[0].set_title(f"Lyapunov spectra, {len(success)} runs  (color = LC weight)")
+        n_curves = sum(len(d.get("per_condition") or {}) or 1 for _, d in success)
+        title_extra = f"  ({n_curves} curves over {len(success)} runs × conditions)" if any_per_cond else ""
+        ax[0].set_title(f"Lyapunov spectra, {len(success)} runs  (color = LC weight){title_extra}")
         sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap); sm.set_array([])
         plt.colorbar(sm, ax=ax[0], label="LC weight", fraction=0.04, pad=0.04)
 

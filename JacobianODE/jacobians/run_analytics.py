@@ -1275,32 +1275,31 @@ def run_analytics(
 
     # Conditioned models (encoder.condition_dim > 0) require per-sample c
     # threaded through every encode_trajectory / compute_jacobians call.
-    # Only the sections that have been explicitly updated to do so are
-    # supported below. Drop the rest with a clear message rather than
-    # crashing mid-report. Currently supported: lyapunov, kaplan_yorke
-    # (which reuses lyapunov), and the no-model sections (sweep_overview,
-    # sweep_pareto). Per-run lyapunov is computed in tuning/analyze_sweep,
-    # which already threads c through.
+    # Each section pulls c from one of two sources:
+    #   _test_seq_cond_full : (n_test_sequences, condition_dim) — aligns
+    #     with test_dl.dataset.sequence (per-window, tiled across sliding
+    #     windows of each trajectory)
+    #   _test_traj_cond_full: (n_test_trajectories, condition_dim) —
+    #     aligns with trajs['test_trajs'].sequence (per-trajectory)
+    # Both are None when not conditioned; model.* methods accept c=None.
     _is_conditioned_model = bool(getattr(getattr(lit_model, "encoder", None), "condition_dim", 0))
+    _test_seq_cond_full = None
+    _test_traj_cond_full = None
     if _is_conditioned_model:
-        _cond_unsupported = {
-            "reconstruction",
-            "mase",
-            "latent_utilization",
-            "prediction_windows",
-            "prediction_detail",
-            "long_trajectory",
-            "encoder_decoder_jacobians",
-            "amplification",
-            "tangent_spectrum",
-        }
-        _cond_skipped = active_sections & _cond_unsupported
-        if _cond_skipped:
-            print(
-                f"condition_dim>0 → skipping sections that don't yet thread c: "
-                f"{sorted(_cond_skipped)}. Lyapunov, KY, sweep_* still run."
-            )
-        active_sections = active_sections - _cond_unsupported
+        _ds_cond = getattr(test_dl.dataset, "condition", None)
+        if _ds_cond is not None:
+            _test_seq_cond_full = _ds_cond.to(device_obj)
+        _trajs_cond = trajs.get("test_condition") if isinstance(trajs, dict) else None
+        if _trajs_cond is not None:
+            _test_traj_cond_full = torch.as_tensor(_trajs_cond).float().to(device_obj)
+
+    def _seq_c(idx):
+        """Per-sequence-window condition slice; None when not conditioned."""
+        return _test_seq_cond_full[idx] if _test_seq_cond_full is not None else None
+
+    def _traj_c(idx):
+        """Per-trajectory condition slice; None when not conditioned."""
+        return _test_traj_cond_full[idx] if _test_traj_cond_full is not None else None
 
     # -------------------------------------------------------- config extraction
     mu = float(cfg.data.postprocessing.mu) if np.isscalar(cfg.data.postprocessing.mu) else np.array(cfg.data.postprocessing.mu)
@@ -1475,8 +1474,9 @@ def run_analytics(
             with torch.no_grad():
                 # compute recon nMSE on first 16 test samples
                 batch = test_dl.dataset.sequence[:16].to(device_obj)
-                z_enc = lit_model.encode_trajectory(batch)
-                recon = lit_model.decode_trajectory(z_enc)
+                batch_c = _seq_c(slice(0, 16))
+                z_enc = lit_model.encode_trajectory(batch, batch_c)
+                recon = lit_model.decode_trajectory(z_enc, batch_c)
                 margin = getattr(lit_model.encoder, "context_margin", 0)
                 targets = batch[:, margin:] if margin > 0 else batch
                 targets = targets[..., :decoder_n_out]
@@ -1490,7 +1490,7 @@ def run_analytics(
                 # which are raw sequence-wide metrics.
                 try:
                     train_recon_loss_val = float(
-                        lit_model._reconstruction_loss(batch).item()
+                        lit_model._reconstruction_loss(batch, c=batch_c).item()
                     )
                 except Exception as e:
                     print(f"  (skipped training-eqv reconstruction loss: {e})")
@@ -1499,7 +1499,7 @@ def run_analytics(
                 inv_err_val: float | None = None
                 null_rms_val: float | None = None
                 if is_coupling:
-                    x_rt = lit_model.decode_trajectory(z_enc)
+                    x_rt = lit_model.decode_trajectory(z_enc, batch_c)
                     inv_err_val = float(F.mse_loss(x_rt, batch).item())
                     z_n = _z_null(z_enc, n_target_dims)
                     null_rms_val = (
@@ -1509,13 +1509,15 @@ def run_analytics(
                     )
 
                 # Build decoded trajectory for first test trajectory
-                latent_full = lit_model.encode_trajectory(test_trajs_obs.to(device_obj))
+                test_trajs_obs_t = test_trajs_obs.to(device_obj)
+                test_trajs_c = _traj_c(slice(None))
+                latent_full = lit_model.encode_trajectory(test_trajs_obs_t, test_trajs_c)
                 if is_coupling:
                     latent_dyn = _z_dyn(latent_full, n_target_dims)
                     latent_padded = lit_model._pad_to_full_dim(latent_dyn)
                 else:
                     latent_padded = latent_full
-                decoded_full = lit_model.decode_trajectory(latent_padded)
+                decoded_full = lit_model.decode_trajectory(latent_padded, test_trajs_c)
 
             latent_full_cpu = latent_full.cpu()
             decoded_full_cpu = decoded_full.cpu()
@@ -1581,12 +1583,18 @@ def run_analytics(
                 num_workers=val_dl.num_workers,
                 pin_memory=getattr(val_dl, "pin_memory", False),
             )
-            for i, batch in enumerate(tqdm(rand_dl, desc="MASE batches", total=n_mase_batches)):
+            # When val_dl uses collate_with_optional_condition, items are
+            # (batch, c) tuples; otherwise plain tensors. _unpack_batch
+            # accepts both forms uniformly.
+            for i, item in enumerate(tqdm(rand_dl, desc="MASE batches", total=n_mase_batches)):
                 if i >= n_mase_batches:
                     break
+                batch, batch_c = lit_model._unpack_batch(item)
                 batch = batch.to(device_obj)
+                if batch_c is not None:
+                    batch_c = batch_c.to(device_obj)
                 with torch.no_grad():
-                    _tms_kw = dict(alpha_teacher_forcing=1)
+                    _tms_kw = dict(alpha_teacher_forcing=1, c=batch_c)
                     if is_latent:
                         _tms_kw["return_decoded"] = True
                     ret_f = lit_model.trajectory_model_step(batch, **_tms_kw)
@@ -1621,11 +1629,19 @@ def run_analytics(
             print("Computing latent utilization ...")
             traj_key = "train_trajs"
             trajs_obs_lat = trajs[traj_key].sequence
+            # Per-trajectory condition for the train split (matches
+            # trajs['train_trajs'].sequence ordering). None when not conditioned.
+            _train_cond_arr = trajs.get("train_condition") if isinstance(trajs, dict) else None
+            _train_cond_t = (
+                torch.as_tensor(_train_cond_arr).float().to(device_obj)
+                if (_is_conditioned_model and _train_cond_arr is not None) else None
+            )
             all_latents = []
             with torch.no_grad():
                 for i in range(0, trajs_obs_lat.shape[0], 8):
                     x = torch.as_tensor(trajs_obs_lat[i:i + 8]).float().to(device_obj)
-                    z = lit_model.encode_trajectory(x)
+                    c_chunk = _train_cond_t[i:i + 8] if _train_cond_t is not None else None
+                    z = lit_model.encode_trajectory(x, c_chunk)
                     all_latents.append(z.cpu())
             Z = torch.cat(all_latents, dim=0).numpy()
             Z_dyn = _z_dyn(torch.from_numpy(Z), n_target_dims).numpy()
@@ -2066,12 +2082,13 @@ def run_analytics(
                 traj_i = torch.as_tensor(
                     test_trajs_obs_pw[t_idx:t_idx + 1]
                 ).float().to(device_obj)
+                c_i = _traj_c(slice(t_idx, t_idx + 1))
                 with torch.no_grad():
-                    _pw_kw: dict = dict(alpha_teacher_forcing=0.0, obs_noise_scale=0)
+                    _pw_kw: dict = dict(alpha_teacher_forcing=0.0, obs_noise_scale=0, c=c_i)
                     if is_latent:
                         _pw_kw["return_decoded"] = True
                     rd = lit_model.trajectory_model_step(traj_i, **_pw_kw)
-                    z_true_i = lit_model.encode_trajectory(traj_i) if is_latent else traj_i
+                    z_true_i = lit_model.encode_trajectory(traj_i, c_i) if is_latent else traj_i
 
                 z_pred_i = rd["outputs"].cpu()
                 if is_latent:
@@ -2158,6 +2175,7 @@ def run_analytics(
             print("Computing long-trajectory free-running rollouts ...")
             test_trajs_obs_lt = trajs["test_trajs"].sequence
             traj_long = torch.as_tensor(test_trajs_obs_lt[[0]]).float().to(device_obj)
+            traj_long_c = _traj_c(slice(0, 1))
             T_full = traj_long.shape[1]
 
             if not is_latent:
@@ -2166,6 +2184,7 @@ def run_analytics(
                 with torch.no_grad():
                     rd_long = lit_model.trajectory_model_step(
                         traj_long, alpha_teacher_forcing=0.0, obs_noise_scale=0,
+                        c=traj_long_c,
                     )
                 traj_true_lt = traj_long[0].cpu().numpy()
                 decoded_pred_lt = rd_long["outputs"][0].cpu().numpy()
@@ -2186,7 +2205,7 @@ def run_analytics(
                 # Encode once; each seed slices from the front and pads
                 # the rest with zeros so generate_dynamics rolls forward.
                 with torch.no_grad():
-                    z_full_enc = lit_model.encode_trajectory(traj_long)
+                    z_full_enc = lit_model.encode_trajectory(traj_long, traj_long_c)
                 z_dyn_enc, _ = lit_model._split_latent(z_full_enc)  # (1, T_full, D_dyn)
                 D_dyn = z_dyn_enc.shape[-1]
 
@@ -2208,7 +2227,13 @@ def run_analytics(
                 # Drop seeds whose init >= T_full; keep order.
                 seeds = [(n, k) for (n, k) in seeds if 0 < k < T_full]
 
-                jac_ode = JacobianODEint(lit_model.compute_jacobians, dt)
+                # Bind the per-trajectory c into compute_jacobians so the
+                # integrator's variadic call (z, t) doesn't need to know about c.
+                _jac_fn = (
+                    (lambda z, *_a, _c=traj_long_c, **_k: lit_model.compute_jacobians(z, c=_c))
+                    if traj_long_c is not None else lit_model.compute_jacobians
+                )
+                jac_ode = JacobianODEint(_jac_fn, dt)
                 rollouts = []
                 for name, init_n in seeds:
                     roll_n = T_full - init_n
@@ -2229,7 +2254,7 @@ def run_analytics(
                             inner_N=ikw.get("inner_N", 20),
                         )  # (1, T_full, D_dyn)
                         z_full_pred = lit_model._pad_to_full_dim(z_pred)
-                        decoded = lit_model.decode_trajectory(z_full_pred)[0]
+                        decoded = lit_model.decode_trajectory(z_full_pred, traj_long_c)[0]
                     rollouts.append(dict(
                         name=name,
                         init_n=init_n,
@@ -2268,6 +2293,11 @@ def run_analytics(
                 except Exception:
                     enc_accepts_flat = False
 
+            # Per-trajectory condition tensor for the test split. We later
+            # slice it to whichever subset of trajectories the encoder
+            # branch picked. None when not conditioned.
+            _ed_traj_cond = _test_traj_cond_full
+
             with torch.no_grad():
                 if hasattr(_enc, "time_window"):
                     _w = _enc.time_window
@@ -2275,38 +2305,71 @@ def run_analytics(
                     n_win = _windows.shape[0]
                     idx_w = rng_jac.choice(n_win, min(N_JAC, n_win), replace=False)
                     _windows_s = _windows[torch.from_numpy(idx_w).to(device_obj)]
+                    # Each window came from a specific trajectory; map window
+                    # idx → traj idx so we can pull the matching condition.
+                    if _ed_traj_cond is not None:
+                        n_windows_per_traj = n_win // _traj_jac.shape[0]
+                        traj_idx_for_w = idx_w // n_windows_per_traj
+                        _windows_c = _ed_traj_cond[torch.as_tensor(traj_idx_for_w, device=device_obj)]
+                    else:
+                        _windows_c = None
 
-                    def _enc_one(x): return _enc.encode(x.unsqueeze(0)).squeeze(0)
-                    def _dec_one(z): return _enc.decode(z.unsqueeze(0)).squeeze(0)
+                    def _enc_one(x, c=None): return _enc.encode(x.unsqueeze(0), c.unsqueeze(0) if c is not None else None).squeeze(0)
+                    def _dec_one(z, c=None): return _enc.decode(z.unsqueeze(0), c.unsqueeze(0) if c is not None else None).squeeze(0)
 
-                    _z_jac = _enc.encode(_windows_s)
-                    encoder_jacobian = vmap(jacrev(_enc_one))(_windows_s)
-                    decoder_jacobian = vmap(jacfwd(_dec_one))(_z_jac)
+                    if _windows_c is not None:
+                        _z_jac = _enc.encode(_windows_s, _windows_c)
+                        encoder_jacobian = vmap(jacrev(_enc_one, argnums=0))(_windows_s, _windows_c)
+                        decoder_jacobian = vmap(jacfwd(_dec_one, argnums=0))(_z_jac, _windows_c)
+                    else:
+                        _z_jac = _enc.encode(_windows_s)
+                        encoder_jacobian = vmap(jacrev(lambda x: _enc_one(x)))(_windows_s)
+                        decoder_jacobian = vmap(jacfwd(lambda z: _dec_one(z)))(_z_jac)
 
                 elif enc_accepts_flat:
                     test_pts = _traj_jac.reshape(-1, D_obs_jac)
                     n_pts = test_pts.shape[0]
                     idx_p = rng_jac.choice(n_pts, min(N_JAC, n_pts), replace=False)
                     x_flat = test_pts[torch.from_numpy(idx_p).to(device_obj)]
+                    if _ed_traj_cond is not None:
+                        T = _traj_jac.shape[1]
+                        traj_idx_for_p = idx_p // T  # each test_pts row came from this trajectory
+                        x_c = _ed_traj_cond[torch.as_tensor(traj_idx_for_p, device=device_obj)]
+                    else:
+                        x_c = None
 
-                    def _enc_one(x): return _enc.encode(x.unsqueeze(0)).squeeze(0)
-                    def _dec_one(z): return _enc.decode(z.unsqueeze(0)).squeeze(0)
+                    def _enc_one(x, c=None): return _enc.encode(x.unsqueeze(0), c.unsqueeze(0) if c is not None else None).squeeze(0)
+                    def _dec_one(z, c=None): return _enc.decode(z.unsqueeze(0), c.unsqueeze(0) if c is not None else None).squeeze(0)
 
-                    _z_jac = _enc.encode(x_flat)
-                    encoder_jacobian = vmap(jacrev(_enc_one))(x_flat)
-                    decoder_jacobian = vmap(jacfwd(_dec_one))(_z_jac)
+                    if x_c is not None:
+                        _z_jac = _enc.encode(x_flat, x_c)
+                        encoder_jacobian = vmap(jacrev(_enc_one, argnums=0))(x_flat, x_c)
+                        decoder_jacobian = vmap(jacfwd(_dec_one, argnums=0))(_z_jac, x_c)
+                    else:
+                        _z_jac = _enc.encode(x_flat)
+                        encoder_jacobian = vmap(jacrev(lambda x: _enc_one(x)))(x_flat)
+                        decoder_jacobian = vmap(jacfwd(lambda z: _dec_one(z)))(_z_jac)
 
                 else:
                     B_jac = _traj_jac.shape[0]
                     idx_t = rng_jac.choice(B_jac, min(N_JAC, B_jac), replace=False)
-                    _traj_s = _traj_jac[torch.from_numpy(idx_t).to(device_obj)]
+                    idx_t_t = torch.from_numpy(idx_t).to(device_obj)
+                    _traj_s = _traj_jac[idx_t_t]
+                    _traj_s_c = _ed_traj_cond[idx_t_t] if _ed_traj_cond is not None else None
 
-                    def _enc_traj(x): return lit_model.encode_trajectory(x.unsqueeze(0)).squeeze(0)
-                    def _dec_traj(z): return lit_model.decode_trajectory(z.unsqueeze(0)).squeeze(0)
+                    def _enc_traj(x, c=None):
+                        return lit_model.encode_trajectory(x.unsqueeze(0), c.unsqueeze(0) if c is not None else None).squeeze(0)
+                    def _dec_traj(z, c=None):
+                        return lit_model.decode_trajectory(z.unsqueeze(0), c.unsqueeze(0) if c is not None else None).squeeze(0)
 
-                    _z_jac = lit_model.encode_trajectory(_traj_s)
-                    encoder_jacobian = vmap(jacrev(_enc_traj))(_traj_s)
-                    decoder_jacobian = vmap(jacfwd(_dec_traj))(_z_jac)
+                    if _traj_s_c is not None:
+                        _z_jac = lit_model.encode_trajectory(_traj_s, _traj_s_c)
+                        encoder_jacobian = vmap(jacrev(_enc_traj, argnums=0))(_traj_s, _traj_s_c)
+                        decoder_jacobian = vmap(jacfwd(_dec_traj, argnums=0))(_z_jac, _traj_s_c)
+                    else:
+                        _z_jac = lit_model.encode_trajectory(_traj_s)
+                        encoder_jacobian = vmap(jacrev(lambda x: _enc_traj(x)))(_traj_s)
+                        decoder_jacobian = vmap(jacfwd(lambda z: _dec_traj(z)))(_z_jac)
 
             print(f"encoder_jacobian: {tuple(encoder_jacobian.shape)}")
             print(f"decoder_jacobian: {tuple(decoder_jacobian.shape)}")
@@ -2363,9 +2426,23 @@ def run_analytics(
                     else:
                         X_de_s = x_de[torch.from_numpy(idx_amp)].to(device_obj)
                         X_orig_s = x_orig[torch.from_numpy(idx_amp)].to(device_obj)
+                        # Each extracted sequence came from a specific
+                        # trajectory: window order is (b, t0) so
+                        # source_traj_idx = idx // (T_obs - seq_length + 1).
+                        if _is_conditioned_model and _test_traj_cond_full is not None:
+                            n_per_traj = T_obs - seq_length + 1
+                            traj_idx_for_amp = idx_amp // n_per_traj
+                            X_amp_c = _test_traj_cond_full[
+                                torch.as_tensor(traj_idx_for_amp, device=device_obj)
+                            ]
+                        else:
+                            X_amp_c = None
 
                         with torch.no_grad():
-                            X_latent_amp = lit_model.encode_trajectory(X_de_s) if is_latent else X_de_s
+                            X_latent_amp = (
+                                lit_model.encode_trajectory(X_de_s, X_amp_c)
+                                if is_latent else X_de_s
+                            )
                             amp_true = loss_amplification(
                                 X_de_s, X_orig_s[..., [0]],
                                 n_neighbors=n_amp_neighbors, max_T=n_amp_max_t, normalize=True,
@@ -2395,6 +2472,19 @@ def run_analytics(
         # 12. Tangent-space spectrum (encoder Jacobian × latent velocity)
         # ============================================================
         if "tangent_spectrum" in active_sections and is_latent and hasattr(
+            lit_model, "compute_tangent_spectrum"
+        ) and _is_conditioned_model:
+            # compute_tangent_spectrum's internal vmap+jacrev path doesn't yet
+            # accept a per-sample c. Fixing it requires per-sample-c-aware
+            # vmap'd Jacobians inside _encoder_jacobian_at — substantial; see
+            # the analogous compute_jacobians fix in the lyapunov section.
+            # Skip explicitly here rather than crash the section.
+            print(
+                "Skipping 'tangent_spectrum' for conditioned model: "
+                "compute_tangent_spectrum needs c plumbing through "
+                "_encoder_jacobian_at's vmap+jacrev (TODO)."
+            )
+        elif "tangent_spectrum" in active_sections and is_latent and hasattr(
             lit_model, "compute_tangent_spectrum"
         ):
             print("Computing tangent space spectrum ...")
