@@ -2793,11 +2793,27 @@ def run_analytics(
                             # row's condition (constant over T per cond group,
                             # but we tile to flat shape for the vmap call).
                             c_flat = cond_t_chunk[:, None, :].expand(B, T, -1).reshape(-1, cond_t_chunk.shape[-1])
-                            J_E_flat = lit_model._encoder_jacobian_at(
-                                sub_t.reshape(-1, D_obs), n_dyn_total, D_obs,
-                                c_flat=c_flat,
-                            )  # (B*T, n_dyn, D_obs)
-                            J_E = J_E_flat.reshape(B, T, n_dyn_total, D_obs).double()
+                            x_flat = sub_t.reshape(-1, D_obs)
+                            # Chunk the vmap+jacrev so the autograd graph
+                            # for all B*T points doesn't get materialised at
+                            # once. Same OOM-class as encoder_decoder_jacobians;
+                            # tighter chunk on conditioned DirectSum because
+                            # the per-area index_copy_ inside encoder.encode
+                            # doesn't batch cleanly under vmap (PyTorch warning).
+                            _je_chunk = 16 if not _is_conditioned_model else 4
+                            je_chunks: list[torch.Tensor] = []
+                            for _ji in range(0, x_flat.shape[0], _je_chunk):
+                                _xc = x_flat[_ji:_ji + _je_chunk]
+                                _cc = c_flat[_ji:_ji + _je_chunk]
+                                je_chunks.append(
+                                    lit_model._encoder_jacobian_at(
+                                        _xc, n_dyn_total, D_obs, c_flat=_cc,
+                                    ).cpu()
+                                )
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                            J_E_flat = torch.cat(je_chunks, dim=0)  # (B*T, n_dyn, D_obs)
+                            J_E = J_E_flat.reshape(B, T, n_dyn_total, D_obs).double().to(device_obj)
                             # Block-restrict per source area:
                             #   vis area: J_E[:, :, latent_vis, obs_vis]  → (B,T,k_vis,64)
                             J_E_vis = J_E[..., VIS_LAT, VIS_OBS]
