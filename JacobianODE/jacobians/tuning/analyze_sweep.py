@@ -62,6 +62,8 @@ ANALYTICS_SECTIONS = [
     "encoder_decoder_jacobians",
     "amplification",
     "tangent_spectrum",
+    "gramians_overlay",
+    "gramians_metric_overlay",
 ]
 
 

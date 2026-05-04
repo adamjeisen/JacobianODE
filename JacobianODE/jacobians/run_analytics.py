@@ -609,70 +609,109 @@ def plot_block_gramians_per_condition(
 
     `per_panel` shape:
         per_panel[stat][kind][direction][cond_label] = mean_value (float)
-    where:
-        stat ∈ {"log_trace", "log_min"}  (rows)
-        kind ∈ {"reach", "ctrl", "obs"}  (cols)
-        direction ∈ {"vis→cog", "cog→vis"}  (x-axis groups within a panel)
-        cond_label is one of cond_labels
-    Each direction × condition × {gt, pred} → 1 bar; fixed color per
-    condition, hatching distinguishes pred from gt (pred hatched, gt solid).
+
+    Visual encoding:
+        - color = direction (cog→vis blue, vis→cog red)
+        - hatching = predicted (gt solid, pred hatched)
+        - condition = subtle outlined bounding box around each condition's
+          group of bars, with a small condition label below the box
+        - twin y-axes: gt bars on the LEFT axis, pred bars on the RIGHT
+          axis (the two scales typically differ by orders of magnitude
+          since gt is in obs space and pred is in latent space). Y-tick
+          colors match each axis's bar color (black for gt-left, gray
+          for pred-right) so the reader knows which scale to read.
     """
+    from matplotlib.patches import Rectangle
     stats = ["log_trace", "log_min"]
     kinds = ["reach", "ctrl", "obs"]
-    directions = ["vis→cog", "cog→vis"]
-    # Fixed condition→color mapping; reused across panels for legibility.
-    cond_palette = {
-        cond_labels[0]: "#4477AA",  # blue
-        **({cond_labels[1]: "#EE6677"} if len(cond_labels) > 1 else {}),  # red
-    }
-    if len(cond_labels) > 2:
-        extra_colors = ["#228833", "#CCBB44", "#66CCEE", "#AA3377"]
-        for i, lbl in enumerate(cond_labels[2:]):
-            cond_palette[lbl] = extra_colors[i % len(extra_colors)]
+    directions = ["cog→vis", "vis→cog"]
+    # Fixed direction→color mapping; reused across panels.
+    dir_palette = {"cog→vis": "#4477AA", "vis→cog": "#EE6677"}
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 7))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 7.5))
     n_cond = len(cond_labels)
-    n_per_dir = 2 * n_cond  # gt + pred per condition
-    bar_w = 0.8 / n_per_dir
-    direction_centers = np.array([0.0, 1.0])  # x positions for the two direction groups
+    n_per_cond = 2 * len(directions)  # (gt+pred) × (cog→vis, vis→cog)
+    bar_w = 0.8 / max(n_per_cond * n_cond, 1)
+    cond_centers = np.linspace(0.0, max(0.0, n_cond - 1), n_cond)
 
-    legend_handles_done = False
+    handles_done = False
     for r, stat in enumerate(stats):
         for c, kind in enumerate(kinds):
-            ax = axes[r][c]
+            ax_gt = axes[r][c]
+            ax_pred = ax_gt.twinx()  # separate scale for pred
             stat_data = per_panel.get(stat, {}).get(kind, {})
-            for di, direction in enumerate(directions):
-                dir_data = stat_data.get(direction, {})
-                # Layout per direction group: [gt c0, pred c0, gt c1, pred c1, ...]
-                bar_idx = 0
-                for cond_label in cond_labels:
-                    color = cond_palette[cond_label]
-                    for kind_label, hatch in [("gt", None), ("pred", "//")]:
-                        val = dir_data.get(cond_label, {}).get(kind_label)
+
+            # Track value ranges so we can size each y-axis independently.
+            gt_vals: list[float] = []
+            pred_vals: list[float] = []
+
+            for ci, cond_label in enumerate(cond_labels):
+                # Within this condition group, lay out 4 bars:
+                # [gt cog→vis, pred cog→vis, gt vis→cog, pred vis→cog]
+                bar_offset = 0
+                for direction in directions:
+                    color = dir_palette[direction]
+                    for kind_label, hatch, ax_target, value_bucket in [
+                        ("gt",   None, ax_gt,   gt_vals),
+                        ("pred", "//", ax_pred, pred_vals),
+                    ]:
+                        val = stat_data.get(direction, {}).get(cond_label, {}).get(kind_label)
                         if val is None or not np.isfinite(val):
-                            bar_idx += 1
+                            bar_offset += 1
                             continue
-                        x = direction_centers[di] + (bar_idx - (n_per_dir - 1) / 2) * bar_w
-                        ax.bar(
-                            x, val, width=bar_w * 0.95, color=color,
-                            hatch=hatch, edgecolor="black", linewidth=0.5,
-                            label=(
-                                f"{cond_label} {kind_label}"
-                                if (not legend_handles_done and di == 0) else None
-                            ),
+                        x = (
+                            cond_centers[ci]
+                            + (bar_offset - (n_per_cond - 1) / 2) * bar_w
                         )
-                        bar_idx += 1
-            ax.set_xticks(direction_centers)
-            ax.set_xticklabels(directions)
-            ax.axhline(0, color="k", lw=0.5)
-            ax.set_title(f"{kind} | {stat.replace('_', ' ')}")
-            ax.grid(True, alpha=0.3, axis="y")
-            if r == 0 and c == 0 and not legend_handles_done:
-                ax.legend(loc="best", fontsize=8)
-                legend_handles_done = True
+                        ax_target.bar(
+                            x, val, width=bar_w * 0.92, color=color,
+                            hatch=hatch, edgecolor="black", linewidth=0.5,
+                            zorder=3,
+                        )
+                        value_bucket.append(val)
+                        bar_offset += 1
+
+                # Subtle bounding box around each condition's bar group.
+                left = cond_centers[ci] - (n_per_cond - 1) / 2 * bar_w - bar_w * 0.6
+                right = cond_centers[ci] + (n_per_cond - 1) / 2 * bar_w + bar_w * 0.6
+                width = right - left
+                # Use the data limits in axis coordinates (ax_gt) for the y span.
+                # We draw the box in axis-fraction coords spanning full height.
+                ax_gt.add_patch(Rectangle(
+                    (left, 0.02), width, 0.96,
+                    transform=ax_gt.get_xaxis_transform(),
+                    facecolor="none", edgecolor="#888", linewidth=0.8,
+                    linestyle="--", alpha=0.7, zorder=2,
+                ))
+                ax_gt.text(
+                    cond_centers[ci], -0.08, cond_label,
+                    transform=ax_gt.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=8, color="#444",
+                )
+
+            ax_gt.set_xticks([])
+            ax_gt.axhline(0, color="k", lw=0.5)
+            ax_pred.axhline(0, color="gray", lw=0.5, ls=":")
+            ax_gt.set_title(f"{kind} | {stat.replace('_', ' ')}")
+            ax_gt.set_ylabel("ground truth", color="black", fontsize=9)
+            ax_pred.set_ylabel("predicted", color="gray", fontsize=9)
+            ax_gt.tick_params(axis="y", colors="black")
+            ax_pred.tick_params(axis="y", colors="gray")
+            ax_gt.spines["right"].set_color("gray")
+            ax_gt.grid(True, alpha=0.25, axis="y")
+
+            if r == 0 and c == 0 and not handles_done:
+                from matplotlib.patches import Patch
+                handles = []
+                for direction, color in dir_palette.items():
+                    handles.append(Patch(facecolor=color, edgecolor="black", label=f"{direction} (gt)"))
+                    handles.append(Patch(facecolor=color, edgecolor="black", hatch="//", label=f"{direction} (pred)"))
+                ax_gt.legend(handles=handles, loc="upper right", fontsize=7, ncol=2)
+                handles_done = True
 
     fig.suptitle(title, y=1.01, fontsize=12)
-    fig.tight_layout()
+    # Pad bottom so condition labels don't get cropped.
+    fig.tight_layout(rect=(0, 0.03, 1, 0.99))
     return fig
 
 
