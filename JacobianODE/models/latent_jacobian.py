@@ -570,9 +570,27 @@ class LitLatentJacobianODE(LitBase):
                     'n_dyn': n_dyn, 'n_obs': n_obs}
         J_all = self._encoder_jacobian_at(x_sample, n_dyn, n_obs)
         with torch.no_grad():
-            U, _, _ = torch.linalg.svd(J_all, full_matrices=False)  # (M, n_dyn, K)
+            # Filter out pairs whose Jacobian or tangent contains non-finite
+            # entries — a single NaN crashes cuSolver's SVD with
+            # CUSOLVER_STATUS_INVALID_VALUE, and even on backends that don't
+            # crash it would poison the projection means. NaN here usually
+            # signals a diverged training run or a numerically-unstable encoder
+            # input; the diagnostic should report what it can on the surviving
+            # pairs rather than failing wholesale.
+            finite = (
+                torch.isfinite(J_all).all(dim=-1).all(dim=-1)
+                & torch.isfinite(dz_sample).all(dim=-1)
+            )
+            J_finite = J_all[finite]
+            dz_finite = dz_sample[finite]
+            if J_finite.numel() == 0:
+                K = min(n_dyn, n_obs)
+                nans = torch.full((K,), float('nan'), device=batch.device)
+                return {'energy': nans, 'spectrum': nans, 'n_pairs': 0,
+                        'n_dyn': n_dyn, 'n_obs': n_obs}
+            U, _, _ = torch.linalg.svd(J_finite, full_matrices=False)  # (M, n_dyn, K)
             projections = torch.bmm(
-                U.transpose(-2, -1), dz_sample.unsqueeze(-1)
+                U.transpose(-2, -1), dz_finite.unsqueeze(-1)
             ).squeeze(-1)                                            # (M, K)
             E_unsorted = (projections ** 2).mean(dim=0)              # (K,)
             # Sort descending by mean energy. Singular-value ordering is
@@ -585,7 +603,7 @@ class LitLatentJacobianODE(LitBase):
         return {
             'energy': E,
             'spectrum': p,
-            'n_pairs': int(dz_sample.shape[0]),
+            'n_pairs': int(dz_finite.shape[0]),
             'n_dyn': n_dyn,
             'n_obs': n_obs,
         }

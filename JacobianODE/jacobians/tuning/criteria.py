@@ -19,18 +19,6 @@ from tqdm.auto import tqdm
 import torch
 from torch.utils.data import DataLoader, RandomSampler
 
-# Use magma for CUDA linear-algebra ops where available. cuSolver's Xgeev
-# (the default) returns CUSOLVER_STATUS_INTERNAL_ERROR on Jacobians from
-# diverged training runs whose matrix-balance step fails (very disparate
-# row/column scales). magma's eigenvalue routines are much more
-# tolerant of ill-conditioned matrices. Setting this is a no-op when
-# magma isn't available — torch then falls back to cuSolver.
-try:
-    torch.backends.cuda.preferred_linalg_library("magma")
-except Exception:  # pragma: no cover — older torch / no CUDA
-    pass
-
-
 @dataclass
 class DiagnosticMetrics:
     """Diagnostic metrics computed for a single trained model.
@@ -161,10 +149,9 @@ def compute_all_diagnostics(
             # Eigenvalue fraction. Filter NaN/inf Jacobians first so a
             # diverged training run doesn't poison the whole batch's
             # eigvals call (the GPU/CPU eigenvalue routines return
-            # garbage or throw on non-finite input). Surviving Jacobians
-            # are passed to eigvals; the magma backend (set at module
-            # load) handles ill-conditioned matrices gracefully where
-            # cuSolver's Xgeev would error out.
+            # garbage or throw on non-finite input — cuSolver's Xgeev
+            # explicitly errors with CUSOLVER_STATUS_INVALID_VALUE on
+            # NaN entries). Surviving Jacobians are passed to eigvals.
             pred_jacs = lit_model.compute_jacobians(z_for_eval)
             B, T, D, _ = pred_jacs.shape
             jacs_flat = pred_jacs.reshape(B * T, D, D)
