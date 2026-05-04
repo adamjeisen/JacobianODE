@@ -171,7 +171,7 @@ def pick_survivors(
                           "skip_reason": f"state={state}"})
             continue
         best = math.inf
-        last = None  # most recent observed value, including NaN
+        saw_nan = False
         try:
             for row in r.scan_history(keys=[metric]):
                 v = row.get(metric)
@@ -181,7 +181,8 @@ def pick_survivors(
                     v = float(v)
                 except (TypeError, ValueError):
                     continue
-                last = v
+                if math.isnan(v):
+                    saw_nan = True
                 if v < best:  # NaN comparisons return False — only finites update
                     best = v
         except Exception as e:
@@ -194,16 +195,20 @@ def pick_survivors(
                           "best_metric": None, "kept": False,
                           "skip_reason": f"no_value_for_{metric}"})
             continue
-        # Skip runs whose FINAL metric value is NaN. Two-stage protocol
-        # copies last.ckpt (not best.ckpt) into the cell-keyed path that
-        # Stage B resumes from — if training diverged at the end, those
-        # weights are NaN and Stage B inherits a permanently-broken model.
-        # The `best < inf` check above isn't sufficient: a run that was
-        # healthy mid-training but went NaN late still has finite `best`.
-        if last is not None and math.isnan(last):
+        # Skip runs that hit NaN at ANY point in training, not just at the
+        # end. A mid-training NaN spike — even one that "recovers" to a
+        # finite final value — signals that the hyperparameter combo is
+        # numerically unstable for this initialization; resuming Stage B
+        # from any checkpoint of this run is going to hit the same wall.
+        # Empirically: in the obs_noise>=0.01 sweep cells, every Stage A
+        # rep diverged to NaN train loss, and Stage B inherited NaN-weighted
+        # checkpoints (65/67 NaN params + 130 NaN optimizer states). Even
+        # rolling back to a "healthy" earlier epoch wouldn't help — the same
+        # gradient explosion would happen again on the same data.
+        if saw_nan:
             audit.append({"run_id": rid, "state": state,
                           "best_metric": None, "kept": False,
-                          "skip_reason": f"final_{metric}_is_nan"})
+                          "skip_reason": f"saw_nan_{metric}"})
             continue
         scored.append((best, r))
 

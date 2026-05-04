@@ -247,28 +247,33 @@ class TestPickSurvivors:
         survivors, _ = pick_survivors(runs, DEFAULT_METRIC, 0.99)
         assert len(survivors) == 1
 
-    def test_skips_runs_whose_final_metric_is_nan(self):
-        """Runs whose FINAL logged metric is NaN are skipped, even if
-        intermediate values were finite. Two-stage protocol resumes from
-        last.ckpt, so a late-training divergence to NaN means Stage B
-        loads NaN weights — better to drop the cell than poison Stage B."""
+    def test_skips_runs_with_any_nan_in_history(self):
+        """Runs that hit NaN at ANY point in training are skipped, even if
+        the value recovered to finite later. A NaN spike — even one that
+        appears to recover — signals the hyperparameter combo is numerically
+        unstable for this initialization, and Stage B resuming from any
+        checkpoint of this run will hit the same wall."""
         runs = [
             # Healthy: monotonically improving, finite throughout.
             _MockRun("healthy", "finished", [{DEFAULT_METRIC: 1.0},
                                               {DEFAULT_METRIC: 0.5}]),
             # Diverged late: had a great mid-training value but final is NaN.
-            # Without the NaN-final skip this would beat "healthy" on best=0.1
-            # and Stage B would load its NaN-weighted last.ckpt.
+            # Without the NaN-skip this would beat "healthy" on best=0.1.
             _MockRun("late_nan", "finished", [{DEFAULT_METRIC: 0.5},
                                                 {DEFAULT_METRIC: 0.1},
                                                 {DEFAULT_METRIC: float("nan")}]),
+            # Transient NaN: spiked NaN mid-training, "recovered" to finite.
+            # Still dropped — the underlying instability will recur in Stage B.
+            _MockRun("transient_nan", "finished", [{DEFAULT_METRIC: 0.4},
+                                                    {DEFAULT_METRIC: float("nan")},
+                                                    {DEFAULT_METRIC: 0.2}]),
         ]
         survivors, audit = pick_survivors(runs, DEFAULT_METRIC, 0.0)
         assert {r.id for r in survivors} == {"healthy"}
-        late_nan_audit = next(a for a in audit if a["run_id"] == "late_nan")
-        assert late_nan_audit["kept"] is False
-        assert "final_" in late_nan_audit["skip_reason"]
-        assert "nan" in late_nan_audit["skip_reason"]
+        for rid in ("late_nan", "transient_nan"):
+            entry = next(a for a in audit if a["run_id"] == rid)
+            assert entry["kept"] is False
+            assert "saw_nan_" in entry["skip_reason"]
 
 
 # ---------------------------------------------------------------------------
