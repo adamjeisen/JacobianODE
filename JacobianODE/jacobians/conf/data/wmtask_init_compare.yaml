@@ -1,0 +1,49 @@
+# WMTask data with TWO checkpoints of the same network as conditions:
+# init (random init, before any training) and 'final' (end of training).
+#
+# Companion to wmtask_epoch_compare.yaml. The epoch_compare variant
+# (epoch=1 vs final) showed the WMTask RNN converges so quickly that
+# epoch=1 dynamics are nearly identical to epoch=41 (~0.1-1% rhs diff).
+# This variant uses the random INIT checkpoint for the maximum dynamical
+# contrast available — same recipe otherwise.
+
+defaults:
+  - base@_here_
+  - _self_
+
+data_type: wmtask
+name: WMTask_init_compare
+
+dataset_loader:
+  _target_: JacobianODE.jacobians.data.combined_loader.load_combined_for_jacobianode
+  sources:
+    - condition: [-1.0]
+      loader:
+        _target_: wmtask.trajectories.load_wmtask_for_jacobianode
+        _partial_: true
+        project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
+        name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
+        model_to_load: "init"           # random initialization
+        dataloader_to_use: "all"
+        traj_window: "delay2"
+        verbose: true
+        use_cache: true
+    - condition: [1.0]
+      loader:
+        _target_: wmtask.trajectories.load_wmtask_for_jacobianode
+        _partial_: true
+        project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
+        name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
+        model_to_load: "final"          # end of training (epoch 41)
+        dataloader_to_use: "all"
+        traj_window: "delay2"
+        verbose: true
+        use_cache: true
+
+flow:
+  dim: 128
+
+postprocessing:
+  obs_noise: 0.1
+  filter_data: false
+  normalize: false
