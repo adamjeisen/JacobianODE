@@ -758,8 +758,12 @@ def compute_per_run_lyapunov(
                     mask = np.all(_cond_seq_arr == cond_row, axis=1)
                     g_idx = np.where(mask)[0][:per_group].tolist()
                     picked_idx.extend(g_idx)
-                picked_idx_t = torch.tensor(picked_idx, dtype=torch.long, device=device)
-                test_trajs_this_run = model_seq[picked_idx_t].to(device)
+                # Index on CPU (model_seq is a CPU tensor) THEN move the
+                # selected trajectories to device. Indexing CPU tensors
+                # with a CUDA index raises "indices should be either on
+                # cpu or on the same device as the indexed tensor".
+                picked_idx_cpu = torch.tensor(picked_idx, dtype=torch.long)
+                test_trajs_this_run = model_seq[picked_idx_cpu].to(device)
                 _cond_for_run = torch.as_tensor(
                     _cond_seq_arr[picked_idx]
                 ).float().to(device)
