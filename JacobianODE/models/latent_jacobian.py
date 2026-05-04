@@ -481,40 +481,56 @@ class LitLatentJacobianODE(LitBase):
             return dz_flat[idx], x_flat[idx], n_dyn, n_obs
         return dz_flat, x_flat, n_dyn, n_obs
 
-    def _encoder_jacobian_at(self, x_flat, n_dyn, n_obs):
+    def _encoder_jacobian_at(self, x_flat, n_dyn, n_obs, c_flat=None):
         """Compute the encoder Jacobian dz_dyn/dx at a flat batch of obs.
 
         Returns ``(M, n_dyn, n_obs)`` Jacobian matrices via ``torch.func``,
         chosen between ``jacrev``/``jacfwd`` based on shape. For coupling
         encoders (``n_target_dims is not None``), only the dynamic subspace
         rows are computed.
+
+        Per-sample condition support: when ``c_flat`` is provided (shape
+        ``(M, condition_dim)``), each per-sample Jacobian is computed at
+        the matching condition and the encoder.encode call receives c.
+        Required when the encoder was built with condition_dim > 0.
         """
         n_target = self.n_target_dims  # None for non-coupling
         if hasattr(self.encoder, 'time_window'):
             w = self.encoder.time_window
             D = x_flat.shape[-1] // w
 
-            def _encode_point(x_flat_pt):
-                z = self.encoder.encode(x_flat_pt.reshape(1, w, D)).squeeze(0)
+            def _encode_point(x_flat_pt, c_pt=None):
+                if c_pt is None:
+                    z = self.encoder.encode(x_flat_pt.reshape(1, w, D)).squeeze(0)
+                else:
+                    z = self.encoder.encode(x_flat_pt.reshape(1, w, D), c_pt.unsqueeze(0)).squeeze(0)
                 return z[:n_target] if n_target is not None else z
         else:
-            def _encode_point(x_pt):
-                z = self.encoder.encode(
-                    x_pt.unsqueeze(0).unsqueeze(0)
-                ).squeeze(0).squeeze(0)
+            def _encode_point(x_pt, c_pt=None):
+                if c_pt is None:
+                    z = self.encoder.encode(
+                        x_pt.unsqueeze(0).unsqueeze(0)
+                    ).squeeze(0).squeeze(0)
+                else:
+                    z = self.encoder.encode(
+                        x_pt.unsqueeze(0).unsqueeze(0), c_pt.unsqueeze(0)
+                    ).squeeze(0).squeeze(0)
                 return z[:n_target] if n_target is not None else z
 
         # Pick jacrev vs jacfwd based on output vs input dimension.
         if n_dyn <= n_obs:
-            jac_fn = torch.func.jacrev(_encode_point)
+            jac_fn = torch.func.jacrev(_encode_point, argnums=0)
         else:
-            jac_fn = torch.func.jacfwd(_encode_point)
+            jac_fn = torch.func.jacfwd(_encode_point, argnums=0)
 
         was_training = self.encoder.training
         self.encoder.eval()
         try:
             with torch.no_grad():
-                J_all = torch.func.vmap(jac_fn)(x_flat)  # (M, n_dyn, n_obs)
+                if c_flat is None:
+                    J_all = torch.func.vmap(jac_fn)(x_flat)  # (M, n_dyn, n_obs)
+                else:
+                    J_all = torch.func.vmap(jac_fn, in_dims=(0, 0))(x_flat, c_flat)
         finally:
             if was_training:
                 self.encoder.train()

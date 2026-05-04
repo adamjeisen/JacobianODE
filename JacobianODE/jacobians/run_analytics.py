@@ -2529,7 +2529,10 @@ def run_analytics(
                     # OOMs for large encoders (saw 18.76 GiB allocations
                     # for 128 trajs × T=49 × D=128 with conditioning).
                     # Process in chunks of _ed_chunk and concatenate.
-                    _ed_chunk = 8
+                    # Tighter chunk for conditioned DirectSum: each
+                    # area's coupling layer's index_copy_ doesn't batch
+                    # cleanly under vmap (PyTorch warning), pushing memory.
+                    _ed_chunk = 2 if _is_conditioned_model else 8
                     enc_chunks: list[torch.Tensor] = []
                     dec_chunks: list[torch.Tensor] = []
                     for _bi in range(0, _traj_s.shape[0], _ed_chunk):
@@ -2786,8 +2789,13 @@ def run_analytics(
                             # _encoder_jacobian_at expects flat (M, n_obs).
                             B, T, D_obs = sub_t.shape
                             n_dyn_total = z_dyn.shape[-1]
+                            # Per-point c: each (B*T) row gets its source
+                            # row's condition (constant over T per cond group,
+                            # but we tile to flat shape for the vmap call).
+                            c_flat = cond_t_chunk[:, None, :].expand(B, T, -1).reshape(-1, cond_t_chunk.shape[-1])
                             J_E_flat = lit_model._encoder_jacobian_at(
                                 sub_t.reshape(-1, D_obs), n_dyn_total, D_obs,
+                                c_flat=c_flat,
                             )  # (B*T, n_dyn, D_obs)
                             J_E = J_E_flat.reshape(B, T, n_dyn_total, D_obs).double()
                             # Block-restrict per source area:
