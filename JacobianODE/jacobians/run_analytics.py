@@ -2369,12 +2369,39 @@ def run_analytics(
 
                     if _traj_s_c is not None:
                         _z_jac = lit_model.encode_trajectory(_traj_s, _traj_s_c)
-                        encoder_jacobian = vmap(jacrev(_enc_traj, argnums=0))(_traj_s, _traj_s_c)
-                        decoder_jacobian = vmap(jacfwd(_dec_traj, argnums=0))(_z_jac, _traj_s_c)
                     else:
                         _z_jac = lit_model.encode_trajectory(_traj_s)
-                        encoder_jacobian = vmap(jacrev(lambda x: _enc_traj(x)))(_traj_s)
-                        decoder_jacobian = vmap(jacfwd(lambda z: _dec_traj(z)))(_z_jac)
+
+                    # Chunk the vmap'd jacrev/jacfwd: vmap expands the
+                    # autograd graph for all N_JAC samples at once, which
+                    # OOMs for large encoders (saw 18.76 GiB allocations
+                    # for 128 trajs × T=49 × D=128 with conditioning).
+                    # Process in chunks of _ed_chunk and concatenate.
+                    _ed_chunk = 8
+                    enc_chunks: list[torch.Tensor] = []
+                    dec_chunks: list[torch.Tensor] = []
+                    for _bi in range(0, _traj_s.shape[0], _ed_chunk):
+                        _s = _traj_s[_bi:_bi + _ed_chunk]
+                        _zs = _z_jac[_bi:_bi + _ed_chunk]
+                        if _traj_s_c is not None:
+                            _cs = _traj_s_c[_bi:_bi + _ed_chunk]
+                            enc_chunks.append(
+                                vmap(jacrev(_enc_traj, argnums=0))(_s, _cs).cpu()
+                            )
+                            dec_chunks.append(
+                                vmap(jacfwd(_dec_traj, argnums=0))(_zs, _cs).cpu()
+                            )
+                        else:
+                            enc_chunks.append(
+                                vmap(jacrev(lambda x: _enc_traj(x)))(_s).cpu()
+                            )
+                            dec_chunks.append(
+                                vmap(jacfwd(lambda z: _dec_traj(z)))(_zs).cpu()
+                            )
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    encoder_jacobian = torch.cat(enc_chunks, dim=0)
+                    decoder_jacobian = torch.cat(dec_chunks, dim=0)
 
             print(f"encoder_jacobian: {tuple(encoder_jacobian.shape)}")
             print(f"decoder_jacobian: {tuple(decoder_jacobian.shape)}")

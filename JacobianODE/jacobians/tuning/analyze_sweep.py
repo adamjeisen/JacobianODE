@@ -1493,6 +1493,19 @@ def analyze(
         analytics_error = f"{type(e).__name__}: {e}"
         logger.exception("run_analytics raised")
 
+    # Recover any figures that were written to disk before the exception.
+    # run_analytics emits each section's PNG immediately via _emit, so a
+    # mid-loop OOM (e.g. encoder_decoder_jacobians' vmap'd jacrev blowing
+    # up) would lose only the in-memory figure_map, not the on-disk PNGs.
+    # Scan the figures dir and merge anything not already in figure_map so
+    # report.md / dashboard get the full set of what actually rendered.
+    figures_dir_local = output_dir / "figures"
+    if figures_dir_local.is_dir():
+        for png in figures_dir_local.glob("*.png"):
+            section_name = png.stem
+            if section_name not in figure_map:
+                figure_map[section_name] = str(png)
+
     # Per-run Lyapunov spectra (across the whole sweep). Expensive (~10-20s per
     # run) but valuable — gives both the spectrum overlay and λ_max vs val_loss
     # scatter for identifying runs with unphysical dynamics.
