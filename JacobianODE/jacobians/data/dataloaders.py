@@ -11,7 +11,7 @@ import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Subset
 
-from .splitting import generate_train_and_test_sets
+from .splitting import collate_with_optional_condition, generate_train_and_test_sets
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,8 @@ def create_dataloaders(
     persistent_workers: bool = True,
     pin_memory: bool = True,
     return_full_obs: bool = False,
+    condition: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    split_groups: Optional[np.ndarray] = None,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, Any]]:
     """Create PyTorch DataLoaders for training, validation, and testing.
 
@@ -79,10 +81,18 @@ def create_dataloaders(
         del cfg.data.train_test_params[key]
 
     train_dataset, val_dataset, test_dataset, trajs = generate_train_and_test_sets(
-        values, **cfg.data.train_test_params, return_full_obs=return_full_obs
+        values, **cfg.data.train_test_params, return_full_obs=return_full_obs,
+        condition=condition, split_groups=split_groups,
     )
 
     batch_size = cfg.training.batch_size
+
+    # When the datasets carry per-sample conditions (combined-loader path),
+    # use the condition-aware collate so DataLoaders yield (batch, c) tuples
+    # instead of stacking the (Tensor, Tensor) pairs incorrectly. The
+    # collate auto-detects: for conditionless datasets it behaves exactly
+    # like the default collate.
+    collate_fn = collate_with_optional_condition if condition is not None else None
 
     # Create continuous trajectory dataloaders
     train_dataloader = DataLoader(
@@ -92,6 +102,7 @@ def create_dataloaders(
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        collate_fn=collate_fn,
     )
 
     # Fixed random permutation so limit_val_batches selects a representative
@@ -109,6 +120,7 @@ def create_dataloaders(
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        collate_fn=collate_fn,
     )
 
     test_dataloader = DataLoader(
@@ -118,6 +130,7 @@ def create_dataloaders(
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        collate_fn=collate_fn,
     )
 
     if verbose:

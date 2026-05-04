@@ -114,7 +114,7 @@ def get_start_indices(seq_length, seq_spacing, T):
 
     return start_indices
 
-def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0.8, test_percent=0.05, split_by='time', dtype='torch.FloatTensor', delay_embedding_params=None, verbose=False, return_full_obs=False):
+def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0.8, test_percent=0.05, split_by='time', dtype='torch.FloatTensor', delay_embedding_params=None, verbose=False, return_full_obs=False, condition=None, split_groups=None):
     """
     Generate training, validation, and test datasets from time series data.
 
@@ -152,6 +152,23 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         ``trajs['val_trajs_full']``, and ``trajs['test_trajs_full']``.
         The same split indices are used, so sequences align with the
         corresponding filtered trajs.  Defaults to False.
+    condition : np.ndarray or torch.Tensor, optional
+        Per-trajectory condition tensor of shape ``(n_trajectories, condition_dim)``.
+        When provided, each split's TimeSeriesDataset is built with the
+        per-sequence condition (tiled across start_indices to match the
+        sequence layout) so DataLoaders yield ``(batch, c)`` tuples. When
+        None (default), datasets carry no condition and DataLoaders yield
+        plain tensors. Only meaningful when ``split_by='trajectory'``;
+        for ``split_by='time'`` every trajectory appears in every split,
+        so the condition naturally propagates without extra wiring.
+    split_groups : np.ndarray, optional
+        Per-trajectory integer group ID of shape ``(n_trajectories,)``.
+        When provided AND ``split_by='trajectory'``, train/val/test
+        indices are picked independently within each group and then
+        concatenated, so each group's trajectory ratio is preserved
+        across splits (= conditions balanced across train/val/test for
+        the multi-condition combined-loader use case). When None, the
+        full set of trajectory indices is split as before.
 
     Returns
     -------
@@ -194,10 +211,43 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
         if convert_to_trajs_needed(val_percent) > pts.shape[0]:
             raise ValueError(f'With split_by==trajectory, not enough trajectories ({pts.shape[0]}) to satisfy val_percent ({val_percent:.4f})')
 
-        train_inds = np.random.choice(pts.shape[0], int(train_percent*pts.shape[0]), replace=False)
-        remaining_inds = np.array([i for i in np.arange(pts.shape[0]) if i not in train_inds])
-        test_inds = np.random.choice(remaining_inds, int(test_percent*pts.shape[0]), replace=False)
-        val_inds = np.array([i for i in np.arange(pts.shape[0]) if i not in train_inds and i not in test_inds])
+        if split_groups is not None:
+            # Balanced split: pick train/test/val indices independently
+            # within each group, then concatenate. Each group's
+            # train/val/test ratio matches the global train/val/test ratio,
+            # so the condition mix is identical across splits.
+            split_groups_arr = np.asarray(split_groups)
+            if split_groups_arr.shape[0] != pts.shape[0]:
+                raise ValueError(
+                    f"split_groups length ({split_groups_arr.shape[0]}) must "
+                    f"match number of trajectories ({pts.shape[0]})"
+                )
+            train_parts: list[np.ndarray] = []
+            test_parts: list[np.ndarray] = []
+            val_parts: list[np.ndarray] = []
+            for g in np.unique(split_groups_arr):
+                g_inds = np.where(split_groups_arr == g)[0]
+                n_g = g_inds.size
+                if n_g < 3:
+                    raise ValueError(
+                        f"split_groups: group {g!r} has only {n_g} "
+                        "trajectories; need at least 3 for train/val/test."
+                    )
+                g_train = np.random.choice(g_inds, int(train_percent * n_g), replace=False)
+                g_remaining = np.array([i for i in g_inds if i not in g_train])
+                g_test = np.random.choice(g_remaining, int(test_percent * n_g), replace=False)
+                g_val = np.array([i for i in g_remaining if i not in g_test])
+                train_parts.append(g_train)
+                test_parts.append(g_test)
+                val_parts.append(g_val)
+            train_inds = np.concatenate(train_parts)
+            test_inds = np.concatenate(test_parts)
+            val_inds = np.concatenate(val_parts)
+        else:
+            train_inds = np.random.choice(pts.shape[0], int(train_percent*pts.shape[0]), replace=False)
+            remaining_inds = np.array([i for i in np.arange(pts.shape[0]) if i not in train_inds])
+            test_inds = np.random.choice(remaining_inds, int(test_percent*pts.shape[0]), replace=False)
+            val_inds = np.array([i for i in np.arange(pts.shape[0]) if i not in train_inds and i not in test_inds])
 
         train_trajs = pts[train_inds]
         val_trajs = pts[val_inds]
@@ -278,9 +328,39 @@ def generate_train_and_test_sets(pts, seq_length, seq_spacing=1, train_percent=0
             val_trajs_full_raw = pts_full[:, np.arange(int(train_percent*pts_full.shape[1]), int((train_percent + val_percent)*pts_full.shape[1]))]  # (n_traj, T_val, D_full)
             test_trajs_full_raw = pts_full[:, np.arange(int((train_percent + val_percent)*pts_full.shape[1]), pts_full.shape[1])]  # (n_traj, T_test, D_full)
 
-    train_dataset = TimeSeriesDataset(torch.from_numpy(train_examples).type(dtype))
-    val_dataset = TimeSeriesDataset(torch.from_numpy(val_examples).type(dtype))
-    test_dataset = TimeSeriesDataset(torch.from_numpy(test_examples).type(dtype))
+    # Per-sequence condition (tiled to match the (block × n_trajs) layout
+    # of the *_examples arrays). Mirrors the inner loops above:
+    #   trajectory split: examples[i*n_split : (i+1)*n_split] holds
+    #     trajectory order [0, 1, ..., n_split-1] at start_indices[i].
+    #     So per-sequence cond = tile(cond[split_inds], len(start_indices)).
+    #   time split: examples[i*n_trajs : (i+1)*n_trajs] holds the same
+    #     trajectory set at start_indices_split[i].
+    #     So per-sequence cond = tile(cond, len(start_indices_split)).
+    train_cond_t = val_cond_t = test_cond_t = None
+    if condition is not None:
+        cond_arr = condition.detach().cpu().numpy() if isinstance(condition, torch.Tensor) else np.asarray(condition)
+        if cond_arr.ndim != 2 or cond_arr.shape[0] != pts.shape[0]:
+            raise ValueError(
+                f"condition must have shape (n_trajectories={pts.shape[0]}, "
+                f"condition_dim), got {cond_arr.shape}"
+            )
+        if split_by == 'trajectory':
+            train_cond_per_seq = np.tile(cond_arr[train_inds], (len(start_indices), 1))
+            val_cond_per_seq = np.tile(cond_arr[val_inds], (len(start_indices), 1))
+            test_cond_per_seq = np.tile(cond_arr[test_inds], (len(start_indices), 1))
+        elif split_by == 'time':
+            train_cond_per_seq = np.tile(cond_arr, (len(start_indices_train), 1))
+            val_cond_per_seq = np.tile(cond_arr, (len(start_indices_val), 1))
+            test_cond_per_seq = np.tile(cond_arr, (len(start_indices_test), 1))
+        else:
+            raise ValueError(f"condition not supported for split_by={split_by!r}")
+        train_cond_t = torch.from_numpy(train_cond_per_seq).type(dtype)
+        val_cond_t = torch.from_numpy(val_cond_per_seq).type(dtype)
+        test_cond_t = torch.from_numpy(test_cond_per_seq).type(dtype)
+
+    train_dataset = TimeSeriesDataset(torch.from_numpy(train_examples).type(dtype), condition=train_cond_t)
+    val_dataset = TimeSeriesDataset(torch.from_numpy(val_examples).type(dtype), condition=val_cond_t)
+    test_dataset = TimeSeriesDataset(torch.from_numpy(test_examples).type(dtype), condition=test_cond_t)
 
     if isinstance(train_trajs, np.ndarray):
         train_trajs = torch.from_numpy(train_trajs).type(dtype)

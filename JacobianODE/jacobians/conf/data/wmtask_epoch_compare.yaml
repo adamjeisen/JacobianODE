@@ -1,0 +1,55 @@
+# WMTask data with TWO checkpoints of the same network as conditions:
+# epoch=1 (just-after-warmup) and epoch='final' (end of training).
+#
+# Trajectories from both checkpoints are concatenated and tagged with a
+# per-trajectory condition (-1 for epoch=1, +1 for final). Normalization
+# (postprocess_data) and noise-scale calibration are computed on the
+# pooled data so the two conditions share the same observable scale.
+# Train/val/test splits are balanced per-condition (each split has the
+# same fraction of epoch=1 vs final trajectories) via source_id-aware
+# splitting in generate_train_and_test_sets.
+
+defaults:
+  - base@_here_
+  - _self_
+
+# Reuse the wmtask code path in trajectory.py — the combined loader
+# returns the same (eq, sol, dt) shape, plus extra `condition` and
+# `source_id` keys in sol that downstream code (run_jacobians +
+# create_dataloaders) propagates into the dataset / dataloader path.
+data_type: wmtask
+name: WMTask_epoch_compare
+
+dataset_loader:
+  _target_: JacobianODE.jacobians.data.combined_loader.load_combined_for_jacobianode
+  sources:
+    - condition: [-1.0]
+      loader:
+        _target_: wmtask.trajectories.load_wmtask_for_jacobianode
+        _partial_: true
+        project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
+        name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
+        model_to_load: 1                # epoch 1 (just after warmup)
+        dataloader_to_use: "all"
+        traj_window: "delay2"
+        verbose: true
+        use_cache: true
+    - condition: [1.0]
+      loader:
+        _target_: wmtask.trajectories.load_wmtask_for_jacobianode
+        _partial_: true
+        project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
+        name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
+        model_to_load: "final"          # end of training (epoch 41)
+        dataloader_to_use: "all"
+        traj_window: "delay2"
+        verbose: true
+        use_cache: true
+
+flow:
+  dim: 128
+
+postprocessing:
+  obs_noise: 0.1
+  filter_data: false
+  normalize: false

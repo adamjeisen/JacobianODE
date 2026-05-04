@@ -175,8 +175,15 @@ def _run_training(cfg: DictConfig) -> Optional[float]:
     # ----------------------------------------
     # CREATE DATALOADERS
     # ----------------------------------------
+    # Combined-loader path: sol carries per-trajectory `condition` and
+    # `source_id`. Forward both into create_dataloaders so each split
+    # carries its slice of conditions and the per-source split is balanced
+    # across train/val/test. Both default to None for single-source
+    # loaders (the standard path).
+    condition = sol.get("condition")
+    split_groups = sol.get("source_id")
     train_dataloader, val_dataloader, test_dataloader, trajs = create_dataloaders(
-        cfg, values
+        cfg, values, condition=condition, split_groups=split_groups,
     )
 
     # ----------------------------------------
