@@ -171,6 +171,7 @@ def pick_survivors(
                           "skip_reason": f"state={state}"})
             continue
         best = math.inf
+        last = None  # most recent observed value, including NaN
         try:
             for row in r.scan_history(keys=[metric]):
                 v = row.get(metric)
@@ -180,7 +181,8 @@ def pick_survivors(
                     v = float(v)
                 except (TypeError, ValueError):
                     continue
-                if v < best:
+                last = v
+                if v < best:  # NaN comparisons return False — only finites update
                     best = v
         except Exception as e:
             audit.append({"run_id": rid, "state": state,
@@ -191,6 +193,17 @@ def pick_survivors(
             audit.append({"run_id": rid, "state": state,
                           "best_metric": None, "kept": False,
                           "skip_reason": f"no_value_for_{metric}"})
+            continue
+        # Skip runs whose FINAL metric value is NaN. Two-stage protocol
+        # copies last.ckpt (not best.ckpt) into the cell-keyed path that
+        # Stage B resumes from — if training diverged at the end, those
+        # weights are NaN and Stage B inherits a permanently-broken model.
+        # The `best < inf` check above isn't sufficient: a run that was
+        # healthy mid-training but went NaN late still has finite `best`.
+        if last is not None and math.isnan(last):
+            audit.append({"run_id": rid, "state": state,
+                          "best_metric": None, "kept": False,
+                          "skip_reason": f"final_{metric}_is_nan"})
             continue
         scored.append((best, r))
 

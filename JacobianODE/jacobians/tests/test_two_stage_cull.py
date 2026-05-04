@@ -247,6 +247,29 @@ class TestPickSurvivors:
         survivors, _ = pick_survivors(runs, DEFAULT_METRIC, 0.99)
         assert len(survivors) == 1
 
+    def test_skips_runs_whose_final_metric_is_nan(self):
+        """Runs whose FINAL logged metric is NaN are skipped, even if
+        intermediate values were finite. Two-stage protocol resumes from
+        last.ckpt, so a late-training divergence to NaN means Stage B
+        loads NaN weights — better to drop the cell than poison Stage B."""
+        runs = [
+            # Healthy: monotonically improving, finite throughout.
+            _MockRun("healthy", "finished", [{DEFAULT_METRIC: 1.0},
+                                              {DEFAULT_METRIC: 0.5}]),
+            # Diverged late: had a great mid-training value but final is NaN.
+            # Without the NaN-final skip this would beat "healthy" on best=0.1
+            # and Stage B would load its NaN-weighted last.ckpt.
+            _MockRun("late_nan", "finished", [{DEFAULT_METRIC: 0.5},
+                                                {DEFAULT_METRIC: 0.1},
+                                                {DEFAULT_METRIC: float("nan")}]),
+        ]
+        survivors, audit = pick_survivors(runs, DEFAULT_METRIC, 0.0)
+        assert {r.id for r in survivors} == {"healthy"}
+        late_nan_audit = next(a for a in audit if a["run_id"] == "late_nan")
+        assert late_nan_audit["kept"] is False
+        assert "final_" in late_nan_audit["skip_reason"]
+        assert "nan" in late_nan_audit["skip_reason"]
+
 
 # ---------------------------------------------------------------------------
 # swept_overrides_from_config
