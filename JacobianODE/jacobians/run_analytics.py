@@ -1273,6 +1273,35 @@ def run_analytics(
             )
         active_sections = active_sections - _dropped
 
+    # Conditioned models (encoder.condition_dim > 0) require per-sample c
+    # threaded through every encode_trajectory / compute_jacobians call.
+    # Only the sections that have been explicitly updated to do so are
+    # supported below. Drop the rest with a clear message rather than
+    # crashing mid-report. Currently supported: lyapunov, kaplan_yorke
+    # (which reuses lyapunov), and the no-model sections (sweep_overview,
+    # sweep_pareto). Per-run lyapunov is computed in tuning/analyze_sweep,
+    # which already threads c through.
+    _is_conditioned_model = bool(getattr(getattr(lit_model, "encoder", None), "condition_dim", 0))
+    if _is_conditioned_model:
+        _cond_unsupported = {
+            "reconstruction",
+            "mase",
+            "latent_utilization",
+            "prediction_windows",
+            "prediction_detail",
+            "long_trajectory",
+            "encoder_decoder_jacobians",
+            "amplification",
+            "tangent_spectrum",
+        }
+        _cond_skipped = active_sections & _cond_unsupported
+        if _cond_skipped:
+            print(
+                f"condition_dim>0 → skipping sections that don't yet thread c: "
+                f"{sorted(_cond_skipped)}. Lyapunov, KY, sweep_* still run."
+            )
+        active_sections = active_sections - _cond_unsupported
+
     # -------------------------------------------------------- config extraction
     mu = float(cfg.data.postprocessing.mu) if np.isscalar(cfg.data.postprocessing.mu) else np.array(cfg.data.postprocessing.mu)
     sigma = float(cfg.data.postprocessing.sigma)
