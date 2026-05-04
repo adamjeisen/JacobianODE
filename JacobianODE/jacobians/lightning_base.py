@@ -646,15 +646,60 @@ class LitBase(L.LightningModule):
         if loop_closure_interp_pts is None:
             loop_closure_interp_pts = self.loop_closure_interp_pts
 
-        # Bind c into compute_jacobians. For unconditioned models (c=None,
-        # condition_dim=0) this is a no-op. For conditioned models with
-        # mix_trajectories=True, loop_closure synthesises loops by mixing
-        # points across batch elements — the per-sample c then doesn't
-        # broadcast cleanly to the synthesised loop points; that path is
-        # not yet supported and will surface a shape error at jac_func call
-        # time. Use mix_trajectories=False (one loop per batch element) to
-        # preserve a clean per-sample c assignment.
-        # Variadic so the integrator can pass extra positional args (e.g. time t).
+        # When the batch carries per-sample conditions and mix_trajectories
+        # is True, loop_closure synthesises loops by mixing points across
+        # batch elements — but a synthesised loop only makes sense if every
+        # contributing trajectory shares the same condition (the dynamics
+        # MLP is conditioned on c, so a c=-1 → c=+1 round-trip is undefined).
+        # Group the batch by unique c rows and compute LC within each
+        # group, then mean across groups (each condition contributes
+        # equally regardless of group size). For unconditioned models or
+        # mix_trajectories=False, fall through to the original single-pass.
+        if c is not None and mix_trajectories:
+            unique_c, inverse = torch.unique(c, dim=0, return_inverse=True)
+            per_group_losses: list[torch.Tensor] = []
+            per_group_outputs: list[torch.Tensor] = []
+            for g in range(unique_c.shape[0]):
+                mask = (inverse == g)
+                group_size = int(mask.sum().item())
+                # Need >=2 trajectories to form even a degenerate loop.
+                if group_size < 2:
+                    continue
+                batch_g = batch[mask]
+                c_g = c[mask]  # all rows identical to unique_c[g]
+                jac_fn_g = (lambda z, *_a, _cg=c_g, **_k: self.compute_jacobians(z, _cg))
+                n_loops_g = group_size if n_loops is None else max(1, n_loops)
+                loop_int_g = loop_closure(
+                    batch_g, jac_fn_g, dt=self.dt,
+                    n_loops=n_loops_g, n_loop_pts=n_loop_pts,
+                    loop_path=loop_path,
+                    loop_closure_interp_pts=loop_closure_interp_pts,
+                    mix_trajectories=mix_trajectories,
+                    int_method='Trapezoid',
+                )
+                per_group_losses.append((loop_int_g ** 2).mean())
+                per_group_outputs.append(loop_int_g)
+            if not per_group_losses:
+                # Pathological: every group has < 2 trajectories. Return a
+                # zero loss so training continues; this path shouldn't fire
+                # in practice (combined loader balances groups across
+                # splits, so each batch typically has multiple per group).
+                zero = batch.new_zeros(())
+                return {
+                    'loss': zero,
+                    'metric_vals': dict(mse=zero.detach()),
+                    'outputs': zero,
+                }
+            loop_loss = torch.stack(per_group_losses).mean()
+            metric_vals = dict(mse=loop_loss.detach().clone())
+            # Concatenate per-group outputs along the loops axis so callers
+            # that consume `outputs` (mostly diagnostics) see the union.
+            loop_int_cat = torch.cat(per_group_outputs, dim=0)
+            return {'loss': loop_loss, 'metric_vals': metric_vals, 'outputs': loop_int_cat}
+
+        # Unconditioned (c=None, condition_dim=0) or mix_trajectories=False:
+        # original single-pass. Variadic so the integrator can pass extra
+        # positional args (e.g. time t).
         jac_fn = (lambda z, *_a, **_k: self.compute_jacobians(z, c))
         loop_int = loop_closure(batch, jac_fn, dt=self.dt, n_loops=n_loops, n_loop_pts=n_loop_pts, loop_path=loop_path, loop_closure_interp_pts=loop_closure_interp_pts, mix_trajectories=mix_trajectories, int_method='Trapezoid')
 
