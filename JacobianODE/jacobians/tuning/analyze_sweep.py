@@ -738,15 +738,34 @@ def compute_per_run_lyapunov(
             else:
                 model_seq = trajs["test_trajs"].sequence
                 _cond_seq = trajs.get("test_condition")
-            test_trajs_this_run = model_seq[:n_sample_trajectories].to(device)
-            # Per-trajectory condition for conditioned models. None for
-            # unconditioned runs, in which case compute_jacobians is called
-            # without c (back-compat unchanged).
+            # For conditioned models, the balanced split concatenates
+            # source-0 trajectories before source-1 trajectories, so a
+            # naive `model_seq[:n_sample_trajectories]` slice grabs only
+            # source 0 — every per-run spectrum then comes back as a
+            # single-condition spectrum, which is exactly the "I see only
+            # one condition" bug. Pick a balanced subsample instead:
+            # take roughly n_sample_trajectories / n_unique_c trajs from
+            # each condition group.
             _has_cdim = bool(getattr(getattr(lit_model, "encoder", None), "condition_dim", 0))
-            _cond_for_run = (
-                torch.as_tensor(_cond_seq[:n_sample_trajectories]).float().to(device)
-                if (_has_cdim and _cond_seq is not None) else None
+            _cond_seq_arr = (
+                np.asarray(_cond_seq) if (_has_cdim and _cond_seq is not None) else None
             )
+            if _cond_seq_arr is not None:
+                unique_c = np.unique(_cond_seq_arr, axis=0)
+                per_group = max(1, n_sample_trajectories // len(unique_c))
+                picked_idx: list[int] = []
+                for cond_row in unique_c:
+                    mask = np.all(_cond_seq_arr == cond_row, axis=1)
+                    g_idx = np.where(mask)[0][:per_group].tolist()
+                    picked_idx.extend(g_idx)
+                picked_idx_t = torch.tensor(picked_idx, dtype=torch.long, device=device)
+                test_trajs_this_run = model_seq[picked_idx_t].to(device)
+                _cond_for_run = torch.as_tensor(
+                    _cond_seq_arr[picked_idx]
+                ).float().to(device)
+            else:
+                test_trajs_this_run = model_seq[:n_sample_trajectories].to(device)
+                _cond_for_run = None
 
             # Compute Jacobians along the test trajectories (chunked). Vanilla
             # JacobianODE (LitMLP) has no encoder — operate directly on the
@@ -1143,13 +1162,14 @@ def compute_per_run_lyapunov(
         # Figure 3: scatter of spectrum MSE vs trajectory val loss
         try:
             xs, ys, cs, rids = [], [], [], []
+            L = len(true_arr)
             for rid, d in success:
                 s = summaries.get(rid, {})
                 tl = s.get("val/trajectory_loss") or s.get("trajectory val_loss")
                 if tl is None:
                     continue
                 pred = np.array(d["lambda_spectrum"])[:L]
-                spec_mse = float(np.mean((pred - true_arr) ** 2))
+                spec_mse = float(np.mean((pred - true_arr[:len(pred)]) ** 2))
                 xs.append(float(tl))
                 ys.append(spec_mse)
                 cs.append(_to_float_or_none(_nested_get(cfgs.get(rid, {}), "training.lightning.loop_closure_weight")) or 0.0)
@@ -1259,6 +1279,17 @@ def compute_per_run_tangent_spectrum(
             run_obj, cfg, eq, dt, values, _, _, _, trajs, lit_model = loaded
             if not hasattr(lit_model, "compute_tangent_spectrum"):
                 per_run[run_id] = {"error": "model has no compute_tangent_spectrum"}
+                continue
+
+            # compute_tangent_spectrum's internal vmap+jacrev path doesn't yet
+            # accept a per-sample c. Fixing it requires per-sample-c-aware
+            # vmap'd Jacobians inside _encoder_jacobian_at — same TODO as the
+            # chosen-run section. Skip with a clear marker (NOT a generic
+            # exception swallow) so the figure cleanly shows "skipped" runs.
+            if bool(getattr(getattr(lit_model, "encoder", None), "condition_dim", 0)):
+                per_run[run_id] = {
+                    "error": "skipped: tangent_spectrum doesn't yet thread c"
+                }
                 continue
 
             load_checkpoint(run_obj, cfg, lit_model, save_dir=str(save_dir), verbose=False)

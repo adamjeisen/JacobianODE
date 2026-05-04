@@ -1227,16 +1227,21 @@ def run_analytics(
     from .jacobianODE import JacobianODEint
 
     print(f"Loading run {run_id} from {wandb_project_path} ...")
-    run, cfg, eq, dt, values, _, _, _, _, lit_model = load_run(
+    # Use the dataloaders / trajs from load_run directly. The previous
+    # double-load (load_run discarded the loaders, then a second
+    # create_dataloaders call rebuilt them with return_full_obs=True)
+    # silently dropped per-trajectory `condition` / `source_id` for
+    # combined-loader runs, because the second call wasn't passed those
+    # arguments and there's no way to reconstruct them from `values`
+    # alone (sol is local to load_run). Force return_full_obs=True here
+    # so the trajs dict still gets the full-state copies analytics needs.
+    run, cfg, eq, dt, values, train_dl, val_dl, test_dl, trajs, lit_model = load_run(
         wandb_project_path,
         run_id=run_id,
         save_dir=save_dir,
         generate_data=True,
         verbose=True,
-    )
-
-    train_dl, val_dl, test_dl, trajs = create_dataloaders(
-        cfg, values, verbose=True, return_full_obs=True
+        return_full_obs=True,
     )
 
     load_checkpoint(run, cfg, lit_model, save_dir=save_dir, epoch=epoch, verbose=True)
