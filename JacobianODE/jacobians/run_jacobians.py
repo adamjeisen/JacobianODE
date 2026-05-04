@@ -129,10 +129,17 @@ def _run_training(cfg: DictConfig) -> Optional[float]:
     log.info("make_trajectories returned")
     values_raw = sol["values"]
 
-    # Select which solution to use for noise scaling
+    # Select which solution to use for noise scaling. The standard wmtask
+    # loader path scales noise by the FINAL checkpoint's trajectory norm
+    # so noise is comparable across model_to_load choices. Combined loader
+    # has no single model_to_load — `sources` is a list — so this branch
+    # is skipped and noise is scaled by the concatenated trajectories
+    # themselves (which is already the desired behavior: shared scale
+    # across conditions).
     raw_values_noise = None
     if (
         cfg.data.data_type == "wmtask"
+        and OmegaConf.select(cfg, "data.dataset_loader.model_to_load") is not None
         and cfg.data.dataset_loader.model_to_load != "final"
     ):
         temp_cfg = cfg.copy()
