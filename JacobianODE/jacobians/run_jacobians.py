@@ -150,11 +150,68 @@ def _run_training(cfg: DictConfig) -> Optional[float]:
     # ----------------------------------------
     # POSTPROCESS DATA
     # ----------------------------------------
-    result = postprocess_data(cfg, values_raw, raw_values_to_use_for_noise=raw_values_noise)
-    values = result.values
-    mu = result.mu
-    sigma = result.sigma
-    noise_scale_factor = result.noise_scale_factor
+    # Optional per-condition normalization. When enabled AND the combined
+    # loader emitted source_id (one integer per trajectory), postprocess
+    # each source's trajectories independently — its own grand-mean center
+    # (single scalar across dims, NOT per-dim), its own noise_scale_factor.
+    # Each source then has its own observable scale; the model sees both
+    # conditions normalized to roughly comparable magnitudes regardless of
+    # whether the underlying network produced different output scales.
+    # Stitched back into a single `values` tensor preserving original order.
+    # Default (across-condition) path is unchanged.
+    _normalize_per_condition = bool(
+        OmegaConf.select(cfg, "data.postprocessing.normalize_per_condition", default=False)
+    )
+    _src_ids = sol.get("source_id") if isinstance(sol, dict) else None
+    if _normalize_per_condition and _src_ids is not None:
+        import numpy as _np
+        src_ids_arr = _np.asarray(_src_ids)
+        unique_src = _np.unique(src_ids_arr)
+        log.info(
+            f"per-condition normalization: {len(unique_src)} sources, "
+            f"sizes={[int((src_ids_arr == s).sum()) for s in unique_src]}"
+        )
+        # Allocate output container once; type matches the noisy postprocess
+        # output (np.float64 from np.random.normal addition).
+        if isinstance(values_raw, _np.ndarray):
+            values = _np.empty_like(values_raw, dtype=_np.float64)
+        else:
+            import torch as _torch
+            values = _torch.empty_like(values_raw, dtype=_torch.float64)
+        per_source_mu: list[float] = []
+        per_source_sigma: list[float] = []
+        per_source_nsf: list[float] = []
+        for s in unique_src:
+            mask = src_ids_arr == s
+            sub_raw = values_raw[mask]
+            sub_noise_ref = raw_values_noise[mask] if raw_values_noise is not None else None
+            sub_result = postprocess_data(
+                cfg, sub_raw, raw_values_to_use_for_noise=sub_noise_ref,
+            )
+            values[mask] = sub_result.values
+            per_source_mu.append(float(sub_result.mu))
+            per_source_sigma.append(float(sub_result.sigma))
+            per_source_nsf.append(float(sub_result.noise_scale_factor))
+            log.info(
+                f"  source {int(s)}: mu={sub_result.mu:.6g}, "
+                f"sigma={sub_result.sigma:.6g}, "
+                f"noise_scale_factor={sub_result.noise_scale_factor:.6g}"
+            )
+        # Top-level scalars are kept for back-compat with downstream code
+        # (analytics, load_run) that reads them. Use the mean across sources
+        # as a reasonable summary; per-source detail is in the lists below.
+        mu = float(_np.mean(per_source_mu))
+        sigma = float(_np.mean(per_source_sigma))
+        noise_scale_factor = float(_np.mean(per_source_nsf))
+        OmegaConf.update(cfg, "data.postprocessing.mu_per_source", per_source_mu, force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.sigma_per_source", per_source_sigma, force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.noise_scale_factor_per_source", per_source_nsf, force_add=True)
+    else:
+        result = postprocess_data(cfg, values_raw, raw_values_to_use_for_noise=raw_values_noise)
+        values = result.values
+        mu = result.mu
+        sigma = result.sigma
+        noise_scale_factor = result.noise_scale_factor
 
     # Store postprocessing metadata on config so it gets logged to W&B.
     # This allows load_run to correctly reconstruct the data pipeline.
