@@ -170,7 +170,13 @@ class TestCkptPath:
 
 class _MockRun:
     """Minimal stand-in for a wandb Run. Supports id, state, and
-    scan_history(keys=[...])."""
+    scan_history(keys=[...]).
+
+    Mirrors wandb's actual scan_history-with-keys behavior: rows are only
+    yielded when EVERY requested key is present (not None) in the row.
+    Train and val are usually logged at different steps in a real run, so
+    a row will typically have only one of {train_loss, val_loss} —
+    callers that need both must do two separate scan_history calls."""
     def __init__(self, run_id, state, history):
         self.id = run_id
         self.state = state
@@ -178,7 +184,8 @@ class _MockRun:
 
     def scan_history(self, keys):
         for row in self._history:
-            yield {k: row.get(k) for k in keys}
+            if all(row.get(k) is not None for k in keys):
+                yield {k: row[k] for k in keys}
 
 
 class TestPickSurvivors:
@@ -247,33 +254,73 @@ class TestPickSurvivors:
         survivors, _ = pick_survivors(runs, DEFAULT_METRIC, 0.99)
         assert len(survivors) == 1
 
-    def test_skips_runs_with_any_nan_in_history(self):
-        """Runs that hit NaN at ANY point in training are skipped, even if
-        the value recovered to finite later. A NaN spike — even one that
-        appears to recover — signals the hyperparameter combo is numerically
-        unstable for this initialization, and Stage B resuming from any
-        checkpoint of this run will hit the same wall."""
+    def test_train_and_val_logged_separately(self):
+        """Real-world structure: val_loss is logged at val-step rows and
+        train_loss at train-step rows; usually no single row has both.
+        The cull must do two separate scan_history calls and still skip
+        runs whose final train value is NaN."""
+        TRAIN = "train/total_loss"
         runs = [
-            # Healthy: monotonically improving, finite throughout.
-            _MockRun("healthy", "finished", [{DEFAULT_METRIC: 1.0},
-                                              {DEFAULT_METRIC: 0.5}]),
-            # Diverged late: had a great mid-training value but final is NaN.
-            # Without the NaN-skip this would beat "healthy" on best=0.1.
-            _MockRun("late_nan", "finished", [{DEFAULT_METRIC: 0.5},
-                                                {DEFAULT_METRIC: 0.1},
-                                                {DEFAULT_METRIC: float("nan")}]),
-            # Transient NaN: spiked NaN mid-training, "recovered" to finite.
-            # Still dropped — the underlying instability will recur in Stage B.
-            _MockRun("transient_nan", "finished", [{DEFAULT_METRIC: 0.4},
-                                                    {DEFAULT_METRIC: float("nan")},
-                                                    {DEFAULT_METRIC: 0.2}]),
+            # Healthy: alternating val/train rows, nothing NaN.
+            _MockRun("healthy", "finished", [
+                {DEFAULT_METRIC: 0.5},        # val-row
+                {TRAIN: 0.3},                 # train-row
+                {DEFAULT_METRIC: 0.4},
+                {TRAIN: 0.2},
+            ]),
+            # Train ended NaN at the final logged train step. Should skip
+            # even though val rows are all finite (rollout was healthy
+            # earlier; weights blew up after the last val).
+            _MockRun("dead", "finished", [
+                {DEFAULT_METRIC: 0.5},
+                {TRAIN: 0.3},
+                {DEFAULT_METRIC: 0.4},
+                {TRAIN: float("nan")},
+            ]),
         ]
         survivors, audit = pick_survivors(runs, DEFAULT_METRIC, 0.0)
         assert {r.id for r in survivors} == {"healthy"}
-        for rid in ("late_nan", "transient_nan"):
-            entry = next(a for a in audit if a["run_id"] == rid)
-            assert entry["kept"] is False
-            assert "saw_nan_" in entry["skip_reason"]
+        dead = next(a for a in audit if a["run_id"] == "dead")
+        assert dead["kept"] is False
+        assert TRAIN in dead["skip_reason"]
+
+    def test_skips_only_when_final_train_loss_is_nan(self):
+        """The NaN-safety filter checks the FINAL value of the train-loss
+        proxy, not the val ranking metric. Rationale: val loss is computed
+        under free-running rollout (alpha_teacher_forcing=0) so accumulated
+        error can blow it up to NaN even with perfectly healthy weights —
+        we'd over-cull. Train loss is the reliable "are the weights NaN"
+        proxy. Early NaN spikes (Adam warmup) that recover are also OK."""
+        TRAIN = "train/total_loss"
+
+        runs = [
+            # Healthy: finite val + finite train, monotonically improving.
+            _MockRun("healthy", "finished",
+                     [{DEFAULT_METRIC: 1.0, TRAIN: 0.5},
+                      {DEFAULT_METRIC: 0.5, TRAIN: 0.3}]),
+            # Final train NaN — weights are dead. Skip.
+            _MockRun("dead_weights", "finished",
+                     [{DEFAULT_METRIC: 0.5, TRAIN: 0.3},
+                      {DEFAULT_METRIC: 0.1, TRAIN: 0.2},
+                      {DEFAULT_METRIC: float("nan"), TRAIN: float("nan")}]),
+            # Early NaN (Adam warmup spike) that recovered — final train
+            # finite, so weights are fine. KEEP.
+            _MockRun("warmup_spike", "finished",
+                     [{DEFAULT_METRIC: float("nan"), TRAIN: float("nan")},
+                      {DEFAULT_METRIC: 0.4, TRAIN: 0.3},
+                      {DEFAULT_METRIC: 0.3, TRAIN: 0.2}]),
+            # Val NaN (rollout overflow) but final train finite — weights
+            # are fine. KEEP. This is the case the prior overly-broad
+            # "any-NaN" filter wrongly dropped.
+            _MockRun("val_only_nan", "finished",
+                     [{DEFAULT_METRIC: 0.5, TRAIN: 0.3},
+                      {DEFAULT_METRIC: float("nan"), TRAIN: 0.2}]),
+        ]
+        survivors, audit = pick_survivors(runs, DEFAULT_METRIC, 0.0)
+        assert {r.id for r in survivors} == {"healthy", "warmup_spike", "val_only_nan"}
+        dead = next(a for a in audit if a["run_id"] == "dead_weights")
+        assert dead["kept"] is False
+        assert TRAIN in dead["skip_reason"] and "nan" in dead["skip_reason"]
 
 
 # ---------------------------------------------------------------------------
