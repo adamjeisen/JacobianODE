@@ -680,18 +680,25 @@ def _direct_sum_block_indices(lit_model) -> tuple[list[slice], list[slice], list
     """For a DirectSumCouplingEncoder, return (latent_blocks, obs_blocks, k_per_block).
 
     latent_blocks[i] indexes the dynamic latent dims belonging to area i;
-    obs_blocks[i]   indexes the observation dims belonging to area i (from area_indices).
+    obs_blocks[i]   indexes the observation dims belonging to area i.
 
     Returns None if the model isn't a DirectSum encoder or block info is missing.
     """
     enc = getattr(lit_model, "encoder", None)
     if enc is None:
         return None
-    k_per_block = getattr(enc, "_k_per_block", None) or getattr(enc, "n_target_dims_per_block", None)
-    area_indices = getattr(enc, "area_indices", None)
-    if k_per_block is None or area_indices is None:
+    # DirectSumCouplingEncoder stores block sizes in `_k_per_block` (tuple)
+    # and per-area input indices as registered buffers `_area_idx_{i}`
+    # (NOT as an `area_indices` attribute — that's just the constructor arg).
+    k_per_block = getattr(enc, "_k_per_block", None)
+    n_areas = getattr(enc, "_n_areas", None)
+    if k_per_block is None or n_areas is None:
         return None
-    if len(k_per_block) != len(area_indices):
+    try:
+        area_indices_lists = [enc._area_idx(i).tolist() for i in range(int(n_areas))]
+    except Exception:
+        return None
+    if len(k_per_block) != len(area_indices_lists):
         return None
     # Latent dyn slices: contiguous in z_dyn since the DirectSum permutes
     # each area's latent target into the front of z, in area order.
@@ -699,15 +706,13 @@ def _direct_sum_block_indices(lit_model) -> tuple[list[slice], list[slice], list
     for k in k_per_block:
         cumsum.append(cumsum[-1] + int(k))
     latent_blocks = [slice(cumsum[i], cumsum[i + 1]) for i in range(len(k_per_block))]
-    # Obs slices: area_indices[i] is a list of indices (likely contiguous
-    # for the WMTask config). Convert to slice when possible.
-    obs_blocks: list[slice] = []
-    for ai in area_indices:
-        ai_list = list(ai)
+    # Obs slices: convert to slice when contiguous; fall back to list otherwise.
+    obs_blocks: list = []
+    for ai_list in area_indices_lists:
         if ai_list == list(range(ai_list[0], ai_list[-1] + 1)):
             obs_blocks.append(slice(ai_list[0], ai_list[-1] + 1))
         else:
-            obs_blocks.append(ai_list)  # fallback: list-style indexing
+            obs_blocks.append(ai_list)
     return latent_blocks, obs_blocks, [int(k) for k in k_per_block]
 
 
