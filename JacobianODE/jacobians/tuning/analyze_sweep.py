@@ -64,6 +64,8 @@ ANALYTICS_SECTIONS = [
     "tangent_spectrum",
     "gramians_overlay",
     "gramians_metric_overlay",
+    "gramians_overlay_k20",
+    "gramians_metric_overlay_k20",
 ]
 
 

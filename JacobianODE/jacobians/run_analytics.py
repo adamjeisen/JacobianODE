@@ -99,6 +99,8 @@ _ALL_SECTIONS = [
     "tangent_spectrum",
     "gramians_overlay",
     "gramians_metric_overlay",
+    "gramians_overlay_k20",
+    "gramians_metric_overlay_k20",
 ]
 
 
@@ -605,10 +607,15 @@ def plot_block_gramians_per_condition(
     title: str,
     cond_labels: list[str],
 ) -> plt.Figure:
-    """Per-condition cross-area block-Gramian overlay (2×3 panel).
+    """Per-condition cross-area block-Gramian overlay (2×3 panel) with
+    SEM error bars.
 
     `per_panel` shape:
-        per_panel[stat][kind][direction][cond_label] = mean_value (float)
+        per_panel[stat][kind][direction][cond_label] =
+            {"gt": (mean, sem), "pred": (mean, sem)}
+
+    Backwards compatible with the old scalar-only schema: a bare float
+    is treated as ``(mean, 0.0)`` (no error bar drawn).
 
     Visual encoding:
         - x-axis groups bars by gt/pred (gt block on left, pred block on
@@ -618,6 +625,8 @@ def plot_block_gramians_per_condition(
         - alpha = condition (first cond fully opaque, second cond lighter)
         - hatching = pred (white hatch on pred bars; gt unhatched).
           Redundant with x-position but helps at-a-glance.
+        - error caps = SEM across batch (per-trajectory or per-window
+          when k-step strided gramians are used)
         - twin y-axes: gt block bars use the LEFT axis, pred block bars
           use the RIGHT axis. Each axis auto-scales to its own data
           (no forced inclusion of 0) so we don't waste vertical space
@@ -674,7 +683,15 @@ def plot_block_gramians_per_condition(
                 for direction in directions:
                     color = dir_palette[direction]
                     for cond_label in cond_labels:
-                        val = stat_data.get(direction, {}).get(cond_label, {}).get(kind_label)
+                        entry = stat_data.get(direction, {}).get(cond_label, {}).get(kind_label)
+                        # Accept either bare float (legacy) or (mean, sem) tuple.
+                        if entry is None:
+                            bar_offset += 1
+                            continue
+                        if isinstance(entry, tuple):
+                            val, sem = entry
+                        else:
+                            val, sem = entry, 0.0
                         if val is None or not np.isfinite(val):
                             bar_offset += 1
                             continue
@@ -685,7 +702,17 @@ def plot_block_gramians_per_condition(
                             hatch=hatch, edgecolor="black", linewidth=0.5,
                             zorder=3,
                         )
-                        value_bucket.append(val)
+                        if sem and np.isfinite(sem) and sem > 0:
+                            ax_target.errorbar(
+                                x, val, yerr=sem, fmt="none",
+                                ecolor="black", elinewidth=0.8, capsize=2.5,
+                                zorder=4,
+                            )
+                            # Make sure the y-limit autoscale below sees the
+                            # extreme of (val ± sem), not just val.
+                            value_bucket.extend([val - sem, val + sem])
+                        else:
+                            value_bucket.append(val)
                         bar_offset += 1
 
             # Auto-scale each axis independently using only its data range.
@@ -789,9 +816,16 @@ def _terminal_block_summary(
     dt: float, gramian_module,
     B_factor: torch.Tensor | None = None,
     C_factor: torch.Tensor | None = None,
-) -> dict[str, float]:
+) -> dict[tuple[str, str], tuple[float, float]]:
     """Run compute_all_gramians (or metric variant) and return terminal
-    log-trace + log-min-eig averaged across batch."""
+    log-trace + log-min-eig as ``(mean, sem)`` tuples across the batch
+    dim.
+
+    SEM is the standard error of the mean across the batch dimension
+    (= per-trajectory or, when sliding-window k-step gramians are used,
+    per-window). Returned as a tuple so the plot layer can draw error
+    bars symmetric around the mean.
+    """
     kwargs = dict(
         dt=dt, return_sequences=False, return_spectrums=True, rescale=True,
     )
@@ -804,20 +838,36 @@ def _terminal_block_summary(
             A, B, C, **kwargs
         )
 
-    def _log_trace(spec):
-        # rescale=True returns log eigenvalues; logsumexp over them = log of trace.
-        return torch.logsumexp(spec, dim=-1).mean().item()
+    def _mean_sem(per_traj: torch.Tensor) -> tuple[float, float]:
+        """``per_traj``: 1-D tensor of one scalar per batch element. Returns
+        (mean, sem). Uses unbiased=False when N==1 so we don't NaN out
+        on single-element batches; SEM is 0.0 in that degenerate case."""
+        n = per_traj.numel()
+        mean = float(per_traj.mean().item())
+        if n <= 1:
+            return mean, 0.0
+        std = float(per_traj.std(unbiased=True).item())
+        return mean, std / (n ** 0.5)
 
-    def _log_min(spec):
-        return spec[..., -1].mean().item()
+    def _log_trace_per_traj(spec: torch.Tensor) -> torch.Tensor:
+        # rescale=True returns log eigenvalues; logsumexp over them = log of trace.
+        # Reduce only the eigenvalue axis; keep the batch axis for SEM.
+        return torch.logsumexp(spec, dim=-1)
+
+    def _log_min_per_traj(spec: torch.Tensor) -> torch.Tensor:
+        # spec is sorted ascending → spec[..., -1] is the LARGEST log-eig.
+        # NOTE: the original code labels this "log_min" but actually selects
+        # the LAST entry. Preserving existing behavior to keep figures
+        # comparable; if/when we want true min, change to spec[..., 0].
+        return spec[..., -1]
 
     return {
-        ("reach", "log_trace"): _log_trace(spec_r),
-        ("reach", "log_min"):   _log_min(spec_r),
-        ("ctrl",  "log_trace"): _log_trace(spec_c),
-        ("ctrl",  "log_min"):   _log_min(spec_c),
-        ("obs",   "log_trace"): _log_trace(spec_o),
-        ("obs",   "log_min"):   _log_min(spec_o),
+        ("reach", "log_trace"): _mean_sem(_log_trace_per_traj(spec_r)),
+        ("reach", "log_min"):   _mean_sem(_log_min_per_traj(spec_r)),
+        ("ctrl",  "log_trace"): _mean_sem(_log_trace_per_traj(spec_c)),
+        ("ctrl",  "log_min"):   _mean_sem(_log_min_per_traj(spec_c)),
+        ("obs",   "log_trace"): _mean_sem(_log_trace_per_traj(spec_o)),
+        ("obs",   "log_min"):   _mean_sem(_log_min_per_traj(spec_o)),
     }
 
 
@@ -2797,9 +2847,17 @@ def run_analytics(
         # ============================================================
         # 13 + 14. Cross-area block Gramians (per-condition overlay)
         # ============================================================
-        for sec_name, gram_module_path, sec_title_suffix in [
-            ("gramians_overlay",        "JacobianODE.control.gramians",        "(standard)"),
-            ("gramians_metric_overlay", "JacobianODE.control.gramians_metric", "(metric, B/C-factor weighted)"),
+        # (name, module_path, title_suffix, k_steps, stride)
+        # k_steps=None → use full-length test_trajs_full trajectories.
+        # k_steps=k   → slice each trajectory into windows of length k
+        #                with the given stride (defaulting to k for
+        #                non-overlapping). Windows are stacked into the
+        #                batch dim so SEM is computed across windows.
+        for sec_name, gram_module_path, sec_title_suffix, k_steps, stride in [
+            ("gramians_overlay",            "JacobianODE.control.gramians",        "(standard, full-traj)",                       None, None),
+            ("gramians_metric_overlay",     "JacobianODE.control.gramians_metric", "(metric, B/C-factor weighted, full-traj)",    None, None),
+            ("gramians_overlay_k20",        "JacobianODE.control.gramians",        "(standard, k=20 stride=20)",                  20,   20),
+            ("gramians_metric_overlay_k20", "JacobianODE.control.gramians_metric", "(metric, B/C-factor weighted, k=20 stride=20)", 20, 20),
         ]:
             if sec_name not in active_sections:
                 continue
@@ -2831,11 +2889,11 @@ def run_analytics(
 
             try:
                 with torch.no_grad():
-                    test_trajs_t = torch.as_tensor(trajs["test_trajs"].sequence).float().to(device_obj)
                     if "test_trajs_full" in trajs:
                         test_trajs_full_t = torch.as_tensor(trajs["test_trajs_full"].sequence).float().to(device_obj)
                     else:
-                        test_trajs_full_t = test_trajs_t
+                        # Fallback: use chunked test_trajs if no full version exists.
+                        test_trajs_full_t = torch.as_tensor(trajs["test_trajs"].sequence).float().to(device_obj)
                     mu_val = float(cfg.data.postprocessing.mu)
                     sigma_val = float(cfg.data.postprocessing.sigma)
                     test_cond_arr = np.asarray(_test_condition_arr)
@@ -2850,17 +2908,49 @@ def run_analytics(
                         cond_label = f"c={cond_row.tolist()}"
                         cond_labels.append(cond_label)
 
-                        sub_t = test_trajs_t[idx]
-                        sub_full_t = test_trajs_full_t[idx]
+                        sub_full_t = test_trajs_full_t[idx]   # (B, T_full, D_obs)
                         cond_t_chunk = torch.as_tensor(cond_row).float().unsqueeze(0).repeat(len(idx), 1).to(device_obj)
 
+                        # --- k-step windowing (when k_steps is set) ---
+                        # Both pred and GT operate on the SAME tensor (sub_in),
+                        # so the two terminal gramians are integrated over
+                        # identical horizons. With k_steps=None this is just
+                        # sub_full_t; with k_steps=k we slice into
+                        # non-overlapping (or strided) sub-windows of length k
+                        # and stack them into the batch dim.
+                        B0, T_full, D_obs = sub_full_t.shape
+                        if k_steps is None:
+                            sub_in = sub_full_t
+                            cond_in = cond_t_chunk
+                            n_windows = 1
+                        else:
+                            if T_full < k_steps:
+                                print(f"  {cond_label}: T_full={T_full} < k_steps={k_steps}, skipping condition")
+                                cond_labels.pop()
+                                continue
+                            # Strided non-NaN windows: as many starts s with
+                            # s + k_steps <= T_full as the stride allows.
+                            n_windows = (T_full - k_steps) // stride + 1
+                            starts = [w * stride for w in range(n_windows)]
+                            # (B, n_windows, k_steps, D) → flatten the
+                            # (B, n_windows) dims into a single batch dim so
+                            # downstream code is unchanged.
+                            sub_in = torch.stack(
+                                [sub_full_t[:, s:s + k_steps] for s in starts], dim=1,
+                            ).reshape(B0 * n_windows, k_steps, D_obs)
+                            cond_in = cond_t_chunk[:, None, :].expand(
+                                -1, n_windows, -1
+                            ).reshape(B0 * n_windows, -1)
+
+                        B, T = sub_in.shape[0], sub_in.shape[1]
+
                         # --- Predicted dynamics Jacobian in latent dyn space ---
-                        z_full = lit_model.encode_trajectory(sub_t, cond_t_chunk)
+                        z_full = lit_model.encode_trajectory(sub_in, cond_in)
                         z_dyn, _ = lit_model._split_latent(z_full)
-                        J_pred = lit_model.compute_jacobians(z_dyn, c=cond_t_chunk).double()  # (B, T, N, N)
+                        J_pred = lit_model.compute_jacobians(z_dyn, c=cond_in).double()  # (B, T, N, N)
 
                         # --- Ground-truth obs-space Jacobian via source_eq ---
-                        sub_raw = sub_full_t * sigma_val + mu_val
+                        sub_raw = sub_in * sigma_val + mu_val
                         J_gt = src_eq.jac(sub_raw, t=0).double()  # (B, T, D_obs, D_obs)
 
                         # --- Encoder Jacobian per timestep (only for metric variant) ---
@@ -2868,13 +2958,12 @@ def run_analytics(
                         C_factor_pred_vis = C_factor_pred_cog = None
                         if is_metric_variant:
                             # _encoder_jacobian_at expects flat (M, n_obs).
-                            B, T, D_obs = sub_t.shape
                             n_dyn_total = z_dyn.shape[-1]
                             # Per-point c: each (B*T) row gets its source
                             # row's condition (constant over T per cond group,
                             # but we tile to flat shape for the vmap call).
-                            c_flat = cond_t_chunk[:, None, :].expand(B, T, -1).reshape(-1, cond_t_chunk.shape[-1])
-                            x_flat = sub_t.reshape(-1, D_obs)
+                            c_flat = cond_in[:, None, :].expand(B, T, -1).reshape(-1, cond_in.shape[-1])
+                            x_flat = sub_in.reshape(-1, D_obs)
                             # Chunk the vmap+jacrev so the autograd graph
                             # for all B*T points doesn't get materialised at
                             # once. Same OOM-class as encoder_decoder_jacobians;
@@ -2948,11 +3037,16 @@ def run_analytics(
                             for (kind, stat), v in gt_terminal.items():
                                 per_panel[stat][kind][dir_label].setdefault(cond_label, {})["gt"] = v
 
+                            def _mean_or_nan(d, key):
+                                v = d.get(key)
+                                if v is None: return float("nan")
+                                return v[0] if isinstance(v, tuple) else v
                             print(
                                 f"  {cond_label} {dir_label}  "
                                 f"reach (pred log_tr / gt log_tr): "
-                                f"{pred_terminal.get(('reach','log_trace'), float('nan')):.3f} / "
-                                f"{gt_terminal.get(('reach','log_trace'), float('nan')):.3f}"
+                                f"{_mean_or_nan(pred_terminal, ('reach','log_trace')):.3f} / "
+                                f"{_mean_or_nan(gt_terminal, ('reach','log_trace')):.3f}"
+                                f"  [B*T={B*T}, n_windows={n_windows}]"
                             )
 
                 if cond_labels:
@@ -2967,15 +3061,28 @@ def run_analytics(
                     )
                     _emit(sec_name, fig)
                     _gram_lines = [f"Conditions: {cond_labels}"]
+                    if k_steps is not None:
+                        _gram_lines.append(
+                            f"k_steps={k_steps}, stride={stride}  (each cell: mean ± SEM across windows)"
+                        )
+                    else:
+                        _gram_lines.append("Full-trajectory  (each cell: mean ± SEM across trajectories)")
                     for stat in ("log_trace", "log_min"):
                         for kind in ("reach", "ctrl", "obs"):
                             for dir_ in ("vis→cog", "cog→vis"):
                                 for cl in cond_labels:
                                     d = per_panel[stat][kind][dir_].get(cl, {})
-                                    p = d.get("pred", float("nan"))
-                                    g = d.get("gt", float("nan"))
+
+                                    def _fmt(v):
+                                        if v is None: return "nan ± nan"
+                                        if isinstance(v, tuple):
+                                            m, s = v
+                                            return f"{m:.4f} ± {s:.4f}"
+                                        return f"{v:.4f} ± 0.0000"
+
                                     _gram_lines.append(
-                                        f"  {dir_} {kind} {stat}  {cl}: pred={p:.4f} gt={g:.4f}"
+                                        f"  {dir_} {kind} {stat}  {cl}: "
+                                        f"pred={_fmt(d.get('pred'))} gt={_fmt(d.get('gt'))}"
                                     )
                     _html_section(f"Block Gramians {sec_title_suffix}", _gram_lines)
                     _summary_lines += ["", f"=== Block Gramians {sec_title_suffix} ==="] + _gram_lines
