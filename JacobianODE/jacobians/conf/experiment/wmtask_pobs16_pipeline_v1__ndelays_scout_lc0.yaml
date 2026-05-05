@@ -48,8 +48,8 @@ metadata:
         full_max_epochs: 200
         cull_fraction: 0.5
         metric: trajectory val_loss
-      next_migrate_to:
-        partition: mit_normal_gpu
+      # next_migrate_to omitted: keep grid follow-up off mit_normal_gpu
+      # (mit_normal_gpu was a disaster on 2026-05-05; staying ou_bcs-only)
 
 sweep_grid:
   data.train_test_params.delay_embedding_params.n_delays: "3,6,9,12,15"
