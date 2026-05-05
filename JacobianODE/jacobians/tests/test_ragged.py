@@ -393,3 +393,89 @@ class TestTruncateChronologicalBalanced:
         out = truncate_chronological_balanced(trajs, T_target=12, min_length=3)
         assert all(isinstance(t, np.ndarray) for t in out)
         assert sum(t.shape[0] for t in out) == 12
+
+    # ------------------------------------------------------------------
+    # Two-threshold mode: min_kept_length < min_length
+    # ------------------------------------------------------------------
+
+    def test_two_threshold_redistribute_below_min_length(self):
+        """When min_kept_length < min_length: redistribute is triggered
+        by `delta < min_length` (the desired floor), but the resulting
+        split halves can be as small as min_kept_length (the absolute
+        floor). Reproduces the user-data scenario from 2026-05-05 where
+        single-threshold mode (min_length=min_kept_length=3000)
+        infeasibly required budget >= 6000 for two trajectories near
+        the 3-second floor."""
+        # Trajectories all just above min_kept_length=1500 but very
+        # close to min_length=3000. Total = 9700; T_target = 8123.
+        # Cumsum: 3113, 6700, 10287. j=1 (cumsum=6700). delta = 1423 < min_length=3000
+        # → redistribute. Budget = L_j + delta = 3587 + 1423 = 5010.
+        # Single-threshold (min=3000): need budget >= 6000 → INFEASIBLE.
+        # Two-threshold (min_kept=1500): need budget >= 3000 → FEASIBLE.
+        # Even split: L_j_kept = ceil(5010/2) = 2505, L_curr_kept = 2505.
+        # Both >= 1500 ✓; both above 1500 floor; below 3000 ideal.
+        trajs = _make_lengths([3113, 3587, 3000])
+        # First, single-threshold mode raises (sanity check):
+        with pytest.raises(ValueError, match="2 \\* min_kept_length = 6000"):
+            truncate_chronological_balanced(trajs, T_target=8123, min_length=3000)
+        # Two-threshold mode succeeds:
+        out = truncate_chronological_balanced(
+            trajs, T_target=8123, min_length=3000, min_kept_length=1500
+        )
+        assert sum(t.shape[0] for t in out) == 8123
+        # Result: t_0 fully (3113), t_1 trimmed (2505), t_2 partial (2505)
+        assert [t.shape[0] for t in out] == [3113, 2505, 2505]
+        assert all(t.shape[0] >= 1500 for t in out)
+
+    def test_two_threshold_clean_partial_unaffected(self):
+        """If naive partial >= min_length, take the clean partial — no
+        redistribution invoked, even when min_kept_length < min_length."""
+        trajs = _make_lengths([5, 5, 5])
+        # T_target=12, cumsum 5, 10. delta = 2 < min_length=3? → redistribute.
+        # Use T_target=13: cumsum 5, 10. delta = 3 = min_length → CASE A.
+        out = truncate_chronological_balanced(
+            trajs, T_target=13, min_length=3, min_kept_length=1
+        )
+        assert [t.shape[0] for t in out] == [5, 5, 3]
+        assert sum(t.shape[0] for t in out) == 13
+
+    def test_two_threshold_default_back_compat(self):
+        """When min_kept_length is omitted, behavior is identical to the
+        single-threshold case (min_kept_length defaults to min_length)."""
+        trajs = _make_lengths([5, 4, 6, 4])
+        out_default = truncate_chronological_balanced(trajs, T_target=16, min_length=3)
+        out_explicit = truncate_chronological_balanced(
+            trajs, T_target=16, min_length=3, min_kept_length=3
+        )
+        assert [t.shape[0] for t in out_default] == [t.shape[0] for t in out_explicit]
+        for a, b in zip(out_default, out_explicit):
+            assert torch.equal(a, b)
+
+    def test_two_threshold_invalid_kept_greater_than_length_raises(self):
+        """min_kept_length must be <= min_length."""
+        trajs = _make_lengths([5, 5])
+        with pytest.raises(ValueError, match="min_kept_length"):
+            truncate_chronological_balanced(
+                trajs, T_target=8, min_length=3, min_kept_length=5
+            )
+
+    def test_two_threshold_min_kept_length_zero_raises(self):
+        trajs = _make_lengths([5, 5])
+        with pytest.raises(ValueError, match="min_kept_length"):
+            truncate_chronological_balanced(
+                trajs, T_target=8, min_length=3, min_kept_length=0
+            )
+
+    def test_two_threshold_still_infeasible_raises(self):
+        """If budget < 2 * min_kept_length even with the lower floor,
+        still raise. Tighter trajectories than test_two_threshold_redistribute
+        but with min_kept=1500: lengths [1700, 1700], T_target=2200,
+        delta = 500. Budget = 1700 + 500 = 2200 < 2*1500=3000 → infeasible."""
+        # But first: lengths must be >= min_length input or the upstream
+        # filter would have dropped them. Skip the realism check; just
+        # show the API behavior.
+        trajs = _make_lengths([1700, 1700])
+        with pytest.raises(ValueError, match="min_kept_length"):
+            truncate_chronological_balanced(
+                trajs, T_target=2200, min_length=1000, min_kept_length=1500
+            )

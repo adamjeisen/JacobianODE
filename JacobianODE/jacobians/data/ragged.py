@@ -95,11 +95,25 @@ def truncate_chronological_balanced(
     trajs: Sequence[torch.Tensor | np.ndarray],
     T_target: int,
     min_length: int,
+    min_kept_length: int | None = None,
 ):
     """Trim a chronologically-ordered list of trajectories so that the
     total sample count equals ``T_target`` exactly, redistributing the
-    trim across the last two kept trajectories if needed to keep every
-    kept trajectory at least ``min_length`` samples long.
+    trim across the last two kept trajectories if the naive partial
+    would fall below ``min_length``.
+
+    Two thresholds:
+
+    * ``min_length``: the *desired* minimum trajectory length AND the
+      trigger for redistribution. If the naive partial of the next
+      trajectory would land below this, we attempt to redistribute.
+    * ``min_kept_length``: the *absolute floor* for any kept trajectory
+      after redistribution. Defaults to ``min_length`` (single-threshold
+      behavior). When the data has many trajectories close to
+      ``min_length`` already, the 2-way redistribute often can't keep
+      both halves at ``min_length``; setting ``min_kept_length`` lower
+      than ``min_length`` lets the redistributed pair drop below the
+      *desired* min while staying above the *hard* floor.
 
     Algorithm (chronological, with stub avoidance):
 
@@ -110,16 +124,17 @@ def truncate_chronological_balanced(
        If ``delta == 0``, return ``t_1..t_j`` as-is.
     3. **Case A** (``delta >= min_length``): take ``t_{j+1}[:delta]``
        as a clean partial. Return ``t_1..t_j + partial``.
-    4. **Case B** (``0 < delta < min_length``, stub case): redistribute
-       across ``t_j`` AND ``t_{j+1}``. The combined budget is
-       ``budget = L_j + delta = T_target - S_{j-1}``. Split into
+    4. **Case B** (``0 < delta < min_length``, redistribute case):
+       redistribute across ``t_j`` AND ``t_{j+1}``. The combined budget
+       is ``budget = L_j + delta = T_target - S_{j-1}``. Split into
        ``(L_j', L_{j+1}')`` summing to ``budget`` with both
-       ``>= min_length``. Even split, ceiling-rounded toward the
-       earlier trajectory on odd budgets (``L_j' = ceil(budget/2)``,
-       ``L_{j+1}' = floor(budget/2)``); clamp to upper bounds
-       ``L_j' <= L_j``, ``L_{j+1}' <= L_{j+1}`` and absorb overflow on
-       the other side. If ``budget < 2 * min_length``, raise — there's
-       no feasible split.
+       ``>= min_kept_length``. Even split, ceiling-rounded toward the
+       earlier trajectory on odd budgets
+       (``L_j' = ceil(budget/2)``, ``L_{j+1}' = floor(budget/2)``);
+       clamp to upper bounds (``L_j' <= L_j``, ``L_{j+1}' <= L_{j+1}``)
+       and absorb overflow on the other side. If
+       ``budget < 2 * min_kept_length``, raise — there's no feasible
+       split that keeps both above the absolute floor.
 
     Parameters
     ----------
@@ -129,27 +144,42 @@ def truncate_chronological_balanced(
     T_target : int
         Desired total sample count after truncation.
     min_length : int
-        Minimum allowed sample count per output trajectory.
+        Desired minimum length per kept trajectory AND the trigger for
+        redistribution (a clean partial is taken whenever
+        ``delta >= min_length``).
+    min_kept_length : int, optional
+        Absolute floor for any kept trajectory after redistribution.
+        Defaults to ``min_length`` (single-threshold mode). Must be
+        ``> 0`` and ``<= min_length``.
 
     Returns
     -------
     list
         Truncated trajectories whose sample counts sum to exactly
-        ``T_target``. Each entry has length ``>= min_length``. Same
-        array-like type as the input (slicing preserves the type).
+        ``T_target``. Each entry has length ``>= min_kept_length``.
+        Same array-like type as the input (slicing preserves the
+        type).
 
     Raises
     ------
     ValueError
-        If ``T_target < 0``, ``min_length <= 0``, total samples in
-        ``trajs`` is less than ``T_target``, or the redistribution is
-        infeasible because the budget for the last two kept
-        trajectories is ``< 2 * min_length``.
+        If ``T_target < 0``; ``min_length <= 0`` or
+        ``min_kept_length <= 0``; ``min_kept_length > min_length``;
+        total samples in ``trajs`` is less than ``T_target``; or the
+        redistribution budget is ``< 2 * min_kept_length``.
     """
     if T_target < 0:
         raise ValueError(f"T_target must be >= 0; got {T_target}")
     if min_length <= 0:
         raise ValueError(f"min_length must be > 0; got {min_length}")
+    if min_kept_length is None:
+        min_kept_length = min_length
+    if min_kept_length <= 0:
+        raise ValueError(f"min_kept_length must be > 0; got {min_kept_length}")
+    if min_kept_length > min_length:
+        raise ValueError(
+            f"min_kept_length ({min_kept_length}) must be <= min_length ({min_length})"
+        )
 
     if T_target == 0:
         return []
@@ -202,11 +232,11 @@ def truncate_chronological_balanced(
     L_j = int(trajs[j].shape[0])
     budget = L_j + delta  # samples assigned to t_j and t_{j+1} together
 
-    if budget < 2 * min_length:
+    if budget < 2 * min_kept_length:
         raise ValueError(
             f"truncate_chronological_balanced: budget {budget} samples for the last "
             f"two kept trajectories (#{j} length {L_j}, #{next_idx} length {L_curr}) "
-            f"is < 2 * min_length = {2 * min_length}; cannot avoid a stub."
+            f"is < 2 * min_kept_length = {2 * min_kept_length}; cannot avoid a stub."
         )
 
     # Even split, with the earlier trajectory getting the extra sample on odd
@@ -222,13 +252,14 @@ def truncate_chronological_balanced(
         L_curr_kept = L_curr
         L_j_kept = budget - L_curr_kept
 
-    # Defensive: feasibility should be guaranteed by the budget >= 2*min_length
-    # check above plus L_j + L_curr >= budget (since budget = L_j + delta and
-    # delta < L_curr). Validate anyway in case of arithmetic surprises.
-    if L_j_kept < min_length or L_curr_kept < min_length:
+    # Defensive: feasibility should be guaranteed by the
+    # budget >= 2*min_kept_length check above plus L_j + L_curr >= budget
+    # (since budget = L_j + delta and delta < L_curr). Validate anyway in case
+    # of arithmetic surprises.
+    if L_j_kept < min_kept_length or L_curr_kept < min_kept_length:
         raise ValueError(
             f"truncate_chronological_balanced: post-clamp split "
-            f"({L_j_kept}, {L_curr_kept}) violates min_length={min_length}; "
+            f"({L_j_kept}, {L_curr_kept}) violates min_kept_length={min_kept_length}; "
             f"budget={budget}, L_j={L_j}, L_curr={L_curr}"
         )
 
