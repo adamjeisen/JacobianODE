@@ -1,0 +1,49 @@
+# WMTask data with TWO checkpoints (epoch=1 and 'final') of the same
+# network as conditions, on a 16-per-area partial-obs slice.
+#
+# Same combined-loader pattern as wmtask_epoch_compare.yaml; partial-obs
+# selection (random 16 per area, fixed seed=42) is applied downstream in
+# generate_train_and_test_sets — both conditions go through the SAME
+# partial-obs selection because the seed is deterministic, so the
+# resulting observed channels are identical across c=-1 and c=+1.
+
+defaults:
+  - base@_here_
+  - _self_
+
+data_type: wmtask
+name: WMTask_epoch_compare_partialobs16
+
+dataset_loader:
+  _target_: JacobianODE.jacobians.data.combined_loader.load_combined_for_jacobianode
+  sources:
+    - condition: [-1.0]
+      loader:
+        _target_: wmtask.trajectories.load_wmtask_for_jacobianode
+        _partial_: true
+        project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
+        name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
+        model_to_load: 1
+        dataloader_to_use: "all"
+        traj_window: "delay2"
+        verbose: true
+        use_cache: true
+    - condition: [1.0]
+      loader:
+        _target_: wmtask.trajectories.load_wmtask_for_jacobianode
+        _partial_: true
+        project: "WMSelectionTask__cue_time_0.1__response_time_0.25__enforce_fixation_False"
+        name: "BiologicalRNN__cue_time_0.1__learning_rate_0.0005__max_epochs_42__N1_64__N2_64__tau_0.05__dt_0.02__eig_lower_bound_0.1__init_mode_random"
+        model_to_load: "final"
+        dataloader_to_use: "all"
+        traj_window: "delay2"
+        verbose: true
+        use_cache: true
+
+flow:
+  dim: 128
+
+postprocessing:
+  obs_noise: 0.1
+  filter_data: false
+  normalize: false
