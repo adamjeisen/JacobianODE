@@ -2874,10 +2874,14 @@ def run_analytics(
             print(f"Computing {sec_name} ...")
             import importlib
             gram_mod = importlib.import_module(gram_module_path)
-            is_metric_variant = sec_name.endswith("metric_overlay")
+            is_metric_variant = sec_name.endswith("metric_overlay") or sec_name.endswith("metric_overlay_k20")
             latent_blocks, obs_blocks, k_per_block = block_info
             VIS_LAT, COG_LAT = latent_blocks[0], latent_blocks[1]
-            VIS_OBS, COG_OBS = obs_blocks[0], obs_blocks[1]
+            # Encoder per-area indices: live in the encoder's input space
+            # (delay-embedded + partial-obs filtered for partial-obs setups,
+            # or raw 128-dim for full-obs). Used for the PRED side
+            # (encoder Jacobian J_E block-restrict).
+            VIS_OBS_PRED, COG_OBS_PRED = obs_blocks[0], obs_blocks[1]
 
             # per_panel[stat][kind][direction][cond_label] = mean log value
             per_panel: dict = {
@@ -2889,14 +2893,73 @@ def run_analytics(
 
             try:
                 with torch.no_grad():
+                    test_trajs_t = torch.as_tensor(trajs["test_trajs"].sequence).float().to(device_obj)
                     if "test_trajs_full" in trajs:
                         test_trajs_full_t = torch.as_tensor(trajs["test_trajs_full"].sequence).float().to(device_obj)
                     else:
-                        # Fallback: use chunked test_trajs if no full version exists.
-                        test_trajs_full_t = torch.as_tensor(trajs["test_trajs"].sequence).float().to(device_obj)
+                        test_trajs_full_t = test_trajs_t
                     mu_val = float(cfg.data.postprocessing.mu)
                     sigma_val = float(cfg.data.postprocessing.sigma)
                     test_cond_arr = np.asarray(_test_condition_arr)
+
+                    # Effective-time alignment between the predicted (delay-
+                    # embedded, partial-obs filtered) and ground-truth (raw,
+                    # full-D) tensors. Delay-embedded sample at index i uses
+                    # raw samples [i, ..., i+n_delays-1]; we treat its
+                    # "effective time" as the MOST RECENT raw sample, i.e.
+                    # raw index i+n_delays-1. So pred's T_pred effective
+                    # timesteps correspond to raw indices
+                    # [n_delays-1, n_delays, ..., n_delays-1+T_pred-1]
+                    # = [n_delays-1, ..., T_full-1] when seq_length is the
+                    # full available delay-embedded length.
+                    #
+                    # Inferring n_delays from shapes (rather than reading cfg)
+                    # so we work for both partial-obs and full-obs setups
+                    # regardless of how delay-embedding was configured. The
+                    # invariant: T_full = T_pred + (n_delays - 1).
+                    T_pred_avail = test_trajs_t.shape[1]
+                    T_full_avail = test_trajs_full_t.shape[1]
+                    delay_offset = T_full_avail - T_pred_avail
+                    if delay_offset < 0:
+                        # Time-split data or some other scenario where
+                        # test_trajs is longer than test_trajs_full. Fall
+                        # back to no alignment.
+                        delay_offset = 0
+                    print(f"  shapes: test_trajs={tuple(test_trajs_t.shape)}, "
+                          f"test_trajs_full={tuple(test_trajs_full_t.shape)}; "
+                          f"delay_offset={delay_offset} (= n_delays - 1)")
+
+                    # Raw per-area indices for GT block-restrict. J_gt
+                    # operates in the raw D_full obs space (e.g. WMTask
+                    # 128-dim hidden state), not in the encoder's
+                    # delay-embedded partial-obs space. For full-obs
+                    # setups (D_pred == D_full) the encoder's per-area
+                    # indices ARE the raw per-area indices, so we just
+                    # reuse them. For partial-obs (D_pred != D_full),
+                    # we assume an equal split of D_full into n_areas
+                    # blocks (matches WMTask BiologicalRNN N1=N2=64).
+                    # TODO: parameterize via src_eq attrs for source eqs
+                    # with unequal per-area sizes.
+                    D_pred_global = test_trajs_t.shape[-1]
+                    D_full_global = test_trajs_full_t.shape[-1]
+                    if D_pred_global == D_full_global:
+                        obs_blocks_gt = obs_blocks
+                    else:
+                        n_areas = len(obs_blocks)
+                        per_area_raw = D_full_global // n_areas
+                        if per_area_raw * n_areas != D_full_global:
+                            raise ValueError(
+                                f"D_full={D_full_global} not evenly divisible by "
+                                f"n_areas={n_areas}; cannot derive raw per-area "
+                                f"indices for GT block-restrict in partial-obs setup."
+                            )
+                        obs_blocks_gt = [
+                            slice(i * per_area_raw, (i + 1) * per_area_raw)
+                            for i in range(n_areas)
+                        ]
+                    VIS_OBS_GT, COG_OBS_GT = obs_blocks_gt[0], obs_blocks_gt[1]
+                    print(f"  GT obs_blocks (raw {D_full_global}-dim): "
+                          f"{obs_blocks_gt}")
 
                     # n_sample per condition for tractable compute
                     n_per_cond = 16
@@ -2908,50 +2971,59 @@ def run_analytics(
                         cond_label = f"c={cond_row.tolist()}"
                         cond_labels.append(cond_label)
 
-                        sub_full_t = test_trajs_full_t[idx]   # (B, T_full, D_obs)
+                        sub_pred_t = test_trajs_t[idx]                              # (B, T_pred_avail, D_pred)
+                        sub_full_t = test_trajs_full_t[idx][:, delay_offset:, :]    # (B, T_pred_avail, D_full)
                         cond_t_chunk = torch.as_tensor(cond_row).float().unsqueeze(0).repeat(len(idx), 1).to(device_obj)
 
                         # --- k-step windowing (when k_steps is set) ---
-                        # Both pred and GT operate on the SAME tensor (sub_in),
-                        # so the two terminal gramians are integrated over
-                        # identical horizons. With k_steps=None this is just
-                        # sub_full_t; with k_steps=k we slice into
-                        # non-overlapping (or strided) sub-windows of length k
-                        # and stack them into the batch dim.
-                        B0, T_full, D_obs = sub_full_t.shape
+                        # Slice BOTH pred and GT identically along the time
+                        # axis so the two terminal gramians are integrated
+                        # over identical wallclock windows. With k_steps=None
+                        # this is the no-op full-aligned trajectory; with
+                        # k_steps=k we slice into strided sub-windows and
+                        # stack them into the batch dim.
+                        B0, T_aligned, D_pred = sub_pred_t.shape
+                        D_full = sub_full_t.shape[-1]
+                        assert sub_full_t.shape[1] == T_aligned, (
+                            f"alignment broke: sub_pred_t T={T_aligned}, sub_full_t T={sub_full_t.shape[1]}"
+                        )
                         if k_steps is None:
-                            sub_in = sub_full_t
+                            pred_in = sub_pred_t
+                            gt_in = sub_full_t
                             cond_in = cond_t_chunk
                             n_windows = 1
                         else:
-                            if T_full < k_steps:
-                                print(f"  {cond_label}: T_full={T_full} < k_steps={k_steps}, skipping condition")
+                            if T_aligned < k_steps:
+                                print(f"  {cond_label}: T_aligned={T_aligned} < k_steps={k_steps}, skipping condition")
                                 cond_labels.pop()
                                 continue
-                            # Strided non-NaN windows: as many starts s with
-                            # s + k_steps <= T_full as the stride allows.
-                            n_windows = (T_full - k_steps) // stride + 1
+                            n_windows = (T_aligned - k_steps) // stride + 1
                             starts = [w * stride for w in range(n_windows)]
-                            # (B, n_windows, k_steps, D) → flatten the
-                            # (B, n_windows) dims into a single batch dim so
-                            # downstream code is unchanged.
-                            sub_in = torch.stack(
+                            pred_in = torch.stack(
+                                [sub_pred_t[:, s:s + k_steps] for s in starts], dim=1,
+                            ).reshape(B0 * n_windows, k_steps, D_pred)
+                            gt_in = torch.stack(
                                 [sub_full_t[:, s:s + k_steps] for s in starts], dim=1,
-                            ).reshape(B0 * n_windows, k_steps, D_obs)
+                            ).reshape(B0 * n_windows, k_steps, D_full)
                             cond_in = cond_t_chunk[:, None, :].expand(
                                 -1, n_windows, -1
                             ).reshape(B0 * n_windows, -1)
 
-                        B, T = sub_in.shape[0], sub_in.shape[1]
+                        B, T = pred_in.shape[0], pred_in.shape[1]
 
                         # --- Predicted dynamics Jacobian in latent dyn space ---
-                        z_full = lit_model.encode_trajectory(sub_in, cond_in)
+                        z_full = lit_model.encode_trajectory(pred_in, cond_in)
                         z_dyn, _ = lit_model._split_latent(z_full)
                         J_pred = lit_model.compute_jacobians(z_dyn, c=cond_in).double()  # (B, T, N, N)
 
                         # --- Ground-truth obs-space Jacobian via source_eq ---
-                        sub_raw = sub_in * sigma_val + mu_val
-                        J_gt = src_eq.jac(sub_raw, t=0).double()  # (B, T, D_obs, D_obs)
+                        sub_raw = gt_in * sigma_val + mu_val
+                        J_gt = src_eq.jac(sub_raw, t=0).double()  # (B, T, D_full, D_full)
+
+                        # Sanity: both should have the same time axis now.
+                        assert J_pred.shape[1] == J_gt.shape[1], (
+                            f"{sec_name} {cond_label}: pred T={J_pred.shape[1]} != gt T={J_gt.shape[1]}"
+                        )
 
                         # --- Encoder Jacobian per timestep (only for metric variant) ---
                         B_factor_pred_vis = B_factor_pred_cog = None
@@ -2963,7 +3035,7 @@ def run_analytics(
                             # row's condition (constant over T per cond group,
                             # but we tile to flat shape for the vmap call).
                             c_flat = cond_in[:, None, :].expand(B, T, -1).reshape(-1, cond_in.shape[-1])
-                            x_flat = sub_in.reshape(-1, D_obs)
+                            x_flat = pred_in.reshape(-1, D_pred)
                             # Chunk the vmap+jacrev so the autograd graph
                             # for all B*T points doesn't get materialised at
                             # once. Same OOM-class as encoder_decoder_jacobians;
@@ -2977,17 +3049,20 @@ def run_analytics(
                                 _cc = c_flat[_ji:_ji + _je_chunk]
                                 je_chunks.append(
                                     lit_model._encoder_jacobian_at(
-                                        _xc, n_dyn_total, D_obs, c_flat=_cc,
+                                        _xc, n_dyn_total, D_pred, c_flat=_cc,
                                     ).cpu()
                                 )
                                 if torch.cuda.is_available():
                                     torch.cuda.empty_cache()
-                            J_E_flat = torch.cat(je_chunks, dim=0)  # (B*T, n_dyn, D_obs)
-                            J_E = J_E_flat.reshape(B, T, n_dyn_total, D_obs).double().to(device_obj)
+                            J_E_flat = torch.cat(je_chunks, dim=0)  # (B*T, n_dyn, D_pred)
+                            J_E = J_E_flat.reshape(B, T, n_dyn_total, D_pred).double().to(device_obj)
                             # Block-restrict per source area:
                             #   vis area: J_E[:, :, latent_vis, obs_vis]  → (B,T,k_vis,64)
-                            J_E_vis = J_E[..., VIS_LAT, VIS_OBS]
-                            J_E_cog = J_E[..., COG_LAT, COG_OBS]
+                            # J_E lives in (n_dyn, D_pred) — encoder's
+                            # input space. Use the encoder's per-area
+                            # indices for the partition.
+                            J_E_vis = J_E[..., VIS_LAT, VIS_OBS_PRED]
+                            J_E_cog = J_E[..., COG_LAT, COG_OBS_PRED]
 
                             def _inv_sqrt(M: torch.Tensor) -> torch.Tensor:
                                 # M: (..., k, k) SPD → M^{-1/2} via eigh
@@ -3006,9 +3081,13 @@ def run_analytics(
                             C_factor_pred_cog = B_factor_pred_cog  # output = cog when target=vis
 
                         # --- Two directions: vis→cog and cog→vis ---
-                        for dir_label, target_lat, source_lat, target_obs, source_obs, B_f, C_f in [
-                            ("vis→cog", COG_LAT, VIS_LAT, COG_OBS, VIS_OBS, B_factor_pred_vis, C_factor_pred_vis),
-                            ("cog→vis", VIS_LAT, COG_LAT, VIS_OBS, COG_OBS, B_factor_pred_cog, C_factor_pred_cog),
+                        # target_obs_gt / source_obs_gt index into J_gt
+                        # (raw D_full obs space). Predicted side uses
+                        # target_lat / source_lat (latent space) — no
+                        # per-obs index needed for J_pred itself.
+                        for dir_label, target_lat, source_lat, target_obs_gt, source_obs_gt, B_f, C_f in [
+                            ("vis→cog", COG_LAT, VIS_LAT, COG_OBS_GT, VIS_OBS_GT, B_factor_pred_vis, C_factor_pred_vis),
+                            ("cog→vis", VIS_LAT, COG_LAT, VIS_OBS_GT, COG_OBS_GT, B_factor_pred_cog, C_factor_pred_cog),
                         ]:
                             # Predicted (latent space)
                             A_p = J_pred[..., target_lat, target_lat]
@@ -3023,9 +3102,9 @@ def run_analytics(
                                 print(f"  pred {cond_label} {dir_label} failed: {e}")
                                 pred_terminal = {}
                             # GT (obs space) — never metric-weighted (already obs)
-                            A_g = J_gt[..., target_obs, target_obs]
-                            B_g = J_gt[..., target_obs, source_obs]
-                            C_g = J_gt[..., source_obs, target_obs]
+                            A_g = J_gt[..., target_obs_gt, target_obs_gt]
+                            B_g = J_gt[..., target_obs_gt, source_obs_gt]
+                            C_g = J_gt[..., source_obs_gt, target_obs_gt]
                             try:
                                 gt_terminal = _terminal_block_summary(A_g, B_g, C_g, dt, gram_mod)
                             except Exception as e:
