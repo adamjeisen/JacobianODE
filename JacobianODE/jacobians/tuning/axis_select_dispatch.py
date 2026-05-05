@@ -305,6 +305,29 @@ def main(argv: list[str] | None = None) -> int:
         if args.next_migrate_to_json else None
     )
 
+    # 5b. When next_two_stage is set, the next sweep needs to actually
+    # run as Stage A. j-submit-two-stage adds two overrides for that
+    # purpose; without them, (a) the cell trains to the YAML's
+    # `training.trainer_params.max_epochs` instead of `stage_a_epochs`
+    # and (b) `_maybe_dispatch_stage_b` in engaging-controller skips
+    # the cull (it requires the wandb_group to end in `__stage_a` to
+    # avoid firing on non-Stage-A sweeps). Inject the same two
+    # overrides here so the chain → two-stage path actually works.
+    if two_stage_block:
+        if "stage_a_epochs" not in two_stage_block:
+            logger.error(
+                "next_two_stage missing required field 'stage_a_epochs'; "
+                "cannot configure Stage A — aborting."
+            )
+            return 1
+        import datetime
+        ts_for_group = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+        stage_a_group = f"{args.next_experiment}_{ts_for_group}__stage_a"
+        overrides.append(
+            f"training.trainer_params.max_epochs={two_stage_block['stage_a_epochs']}"
+        )
+        overrides.append(f"wandb_group={stage_a_group}")
+
     logger.info(f"next instruction:")
     logger.info(f"  experiment: {args.next_experiment}")
     logger.info(f"  overrides:  {overrides}")

@@ -287,6 +287,189 @@ class TestDryRun:
         assert doc["next_two_stage"] == {"stage_a_epochs": 20, "full_max_epochs": 100}
         assert doc["next_migrate_to"] == {"partition": "mit_normal_gpu"}
 
+    def test_two_stage_chain_injects_stage_a_overrides(self, tmp_path, monkeypatch):
+        """When --next-two-stage-json is set, the dispatcher MUST inject
+        ``training.trainer_params.max_epochs=<stage_a_epochs>`` and a
+        ``wandb_group=<exp>_<ts>__stage_a`` override into the next
+        instruction. Without these, the next sweep trains to the YAML's
+        max_epochs (typically the FULL budget) and
+        engaging-controller's _maybe_dispatch_stage_b skips the cull
+        because the wandb_group lacks the __stage_a suffix.
+
+        Regression test for the chain-dispatch bug observed
+        2026-05-05 where Stage A grids ran to walltime instead of
+        stage_a_epochs.
+        """
+        runs = _make_runs()
+        import sys, types
+        fake_wandb = types.ModuleType("wandb")
+        class _FakeAPI:
+            def projects(self, entity): return []
+            def runs(self, *a, **kw): return runs
+        fake_wandb.Api = lambda: _FakeAPI()
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        # Capture _write_and_push_instruction's call args instead of
+        # actually pushing to the jacobian-reports repo.
+        captured = {}
+
+        def _fake_write_and_push(**kwargs):
+            captured.update(kwargs)
+
+        from JacobianODE.jacobians.tuning import two_stage_cull
+        monkeypatch.setattr(
+            two_stage_cull, "_write_and_push_instruction", _fake_write_and_push
+        )
+
+        sweeps_dir = tmp_path / "sweeps"
+        (sweeps_dir / "active").mkdir(parents=True)
+        audit_out = tmp_path / "audit.json"
+
+        rc = axis_select_main([
+            "--group", "scout_group",
+            "--axis", "data.train_test_params.delay_embedding_params.n_delays",
+            "--top-k", "2",
+            "--next-experiment", "my_grid_exp",
+            "--next-two-stage-json",
+            '{"stage_a_epochs":20,"full_max_epochs":200,"cull_fraction":0.5}',
+            "--project", "WMTask_test",
+            "--sweeps-dir", str(sweeps_dir),
+            "--audit-out", str(audit_out),
+            "--log-level", "WARNING",
+        ])
+        assert rc == 0, "axis_select_main should succeed"
+
+        overrides = captured["overrides"]
+        # The axis-select override is always present
+        axis_overrides = [
+            o for o in overrides
+            if o.startswith("data.train_test_params.delay_embedding_params.n_delays=")
+        ]
+        assert len(axis_overrides) == 1, f"expected one axis override, got {overrides}"
+
+        # The Stage A epoch cap MUST be injected
+        max_epoch_overrides = [
+            o for o in overrides
+            if o == "training.trainer_params.max_epochs=20"
+        ]
+        assert len(max_epoch_overrides) == 1, (
+            f"expected `training.trainer_params.max_epochs=20` override "
+            f"to be injected when next_two_stage is set; overrides={overrides}"
+        )
+
+        # The wandb_group override MUST end in __stage_a (required by
+        # _maybe_dispatch_stage_b in engaging-controller)
+        wb_group_overrides = [o for o in overrides if o.startswith("wandb_group=")]
+        assert len(wb_group_overrides) == 1, (
+            f"expected one wandb_group override; overrides={overrides}"
+        )
+        wb_group_value = wb_group_overrides[0].split("=", 1)[1]
+        assert wb_group_value.startswith("my_grid_exp_"), (
+            f"wandb_group should start with the experiment name; got {wb_group_value}"
+        )
+        assert wb_group_value.endswith("__stage_a"), (
+            f"wandb_group MUST end in __stage_a (required by trainer.py "
+            f"and _maybe_dispatch_stage_b); got {wb_group_value}"
+        )
+
+        # two_stage block + experiment name preserved
+        assert captured["experiment"] == "my_grid_exp"
+        assert captured["two_stage"] == {
+            "stage_a_epochs": 20,
+            "full_max_epochs": 200,
+            "cull_fraction": 0.5,
+        }
+        assert captured["kind"] == "chain"
+
+    def test_chain_without_two_stage_does_not_inject_overrides(
+        self, tmp_path, monkeypatch
+    ):
+        """When --next-two-stage-json is NOT set, the dispatcher must
+        NOT inject Stage A overrides — the chain is just a single-stage
+        scout → grid handoff and the next sweep should use the YAML's
+        configured max_epochs / wandb_group as-is.
+        """
+        runs = _make_runs()
+        import sys, types
+        fake_wandb = types.ModuleType("wandb")
+        class _FakeAPI:
+            def projects(self, entity): return []
+            def runs(self, *a, **kw): return runs
+        fake_wandb.Api = lambda: _FakeAPI()
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        captured = {}
+        def _fake_write_and_push(**kwargs):
+            captured.update(kwargs)
+
+        from JacobianODE.jacobians.tuning import two_stage_cull
+        monkeypatch.setattr(
+            two_stage_cull, "_write_and_push_instruction", _fake_write_and_push
+        )
+
+        sweeps_dir = tmp_path / "sweeps"
+        (sweeps_dir / "active").mkdir(parents=True)
+        audit_out = tmp_path / "audit.json"
+
+        rc = axis_select_main([
+            "--group", "scout_group",
+            "--axis", "data.train_test_params.delay_embedding_params.n_delays",
+            "--top-k", "2",
+            "--next-experiment", "my_grid_exp",
+            "--project", "WMTask_test",
+            "--sweeps-dir", str(sweeps_dir),
+            "--audit-out", str(audit_out),
+            "--log-level", "WARNING",
+        ])
+        assert rc == 0
+        overrides = captured["overrides"]
+        assert not any(
+            o.startswith("training.trainer_params.max_epochs=") for o in overrides
+        ), f"max_epochs should NOT be overridden without next_two_stage; got {overrides}"
+        assert not any(
+            o.startswith("wandb_group=") for o in overrides
+        ), f"wandb_group should NOT be overridden without next_two_stage; got {overrides}"
+
+    def test_two_stage_missing_stage_a_epochs_aborts(self, tmp_path, monkeypatch):
+        """If --next-two-stage-json is set but lacks `stage_a_epochs`, the
+        dispatcher must abort (exit non-zero) — running with no Stage A
+        cap would silently train to the YAML's max_epochs."""
+        runs = _make_runs()
+        import sys, types
+        fake_wandb = types.ModuleType("wandb")
+        class _FakeAPI:
+            def projects(self, entity): return []
+            def runs(self, *a, **kw): return runs
+        fake_wandb.Api = lambda: _FakeAPI()
+        monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+
+        # Track whether _write_and_push_instruction got called (it must NOT)
+        write_called = []
+        from JacobianODE.jacobians.tuning import two_stage_cull
+        monkeypatch.setattr(
+            two_stage_cull, "_write_and_push_instruction",
+            lambda **kw: write_called.append(kw),
+        )
+
+        sweeps_dir = tmp_path / "sweeps"
+        (sweeps_dir / "active").mkdir(parents=True)
+
+        rc = axis_select_main([
+            "--group", "scout_group",
+            "--axis", "data.train_test_params.delay_embedding_params.n_delays",
+            "--top-k", "2",
+            "--next-experiment", "my_grid_exp",
+            "--next-two-stage-json", '{"full_max_epochs":200}',
+            "--project", "WMTask_test",
+            "--sweeps-dir", str(sweeps_dir),
+            "--log-level", "WARNING",
+        ])
+        assert rc != 0, "expected non-zero exit when stage_a_epochs missing"
+        assert write_called == [], (
+            "_write_and_push_instruction must NOT be called when "
+            "stage_a_epochs is missing"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Idempotency
