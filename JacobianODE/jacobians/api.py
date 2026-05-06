@@ -955,11 +955,13 @@ def _train_from_ragged_arrays_inner(
             area_indices, n_delays=n_delays, n_features=n_features,
         )
         OmegaConf.update(cfg, "model.encoder.area_indices", de_indices, force_add=True)
-        # OmegaConf in struct mode rejects setting unknown keys; use
-        # force_add=True so we can set dim regardless of whether the
-        # encoder yaml originally exposed it.
-        OmegaConf.update(cfg, "model.encoder.dim", n_features * n_delays, force_add=True)
-        OmegaConf.update(cfg, "model.params.dim", n_features * n_delays, force_add=True)
+        # NOTE: We previously also wrote cfg.model.encoder.dim and
+        # cfg.model.params.dim here, but neither MLP nor
+        # DirectSumCouplingEncoder accepts a `dim` kwarg — the encoder
+        # gets its size from area_indices, the dynamics MLP from
+        # input_dim/output_dim set later by the autodim logic. Adding
+        # `dim` would later raise "unexpected keyword argument 'dim'"
+        # at make_model. Just don't.
         # Persist the PCA components in the cfg under postprocessing so
         # downstream loading + roundtrip can reconstruct them. We store
         # as tensor lists since OmegaConf handles those.
