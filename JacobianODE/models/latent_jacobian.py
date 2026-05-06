@@ -1483,8 +1483,17 @@ class LitLatentJacobianODE(LitBase):
         batch = batch.type(self.dtype)
 
         # Encoder-only fast path: no dynamics, no trajectory rollout, no
-        # eigenvalue diagnostics.
-        if self.encoder_only_mode:
+        # eigenvalue diagnostics. Also taken during the encoder-warmup
+        # phase of a full-pipeline run — at that point the dynamics MLP
+        # is still random and the trajectory_step / loop_closure /
+        # eigvals diagnostics are both expensive and uninformative.
+        # Once dynamics warmup begins, validation switches to the full
+        # path (dynamics IS being trained then, even with encoder frozen).
+        in_encoder_warmup = (
+            self.encoder_warmup_epochs > 0
+            and self.current_epoch < self.encoder_warmup_epochs
+        )
+        if self.encoder_only_mode or in_encoder_warmup:
             with torch.no_grad():
                 z_full = self.encode_trajectory(batch, c)
                 mu_dyn, z_null = self._split_latent(z_full)
