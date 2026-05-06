@@ -63,7 +63,7 @@ lightning:
   # -----------------
   kl_null_weight: null           # null-space MSE penalty; null = same as kl_dyn_weight
   kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
-  reconstruction_mode: 'most_recent'  # 'uniform' | 'harmonic' | 'most_recent'
+  reconstruction_mode: 'uniform'  # 'uniform' | 'harmonic' | 'most_recent'
 
   # Number of B×T Jacobian matrices to randomly sample for eigenvalue
   # computation during validation. Reduces val cost when B*T is large.
