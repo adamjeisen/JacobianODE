@@ -134,6 +134,8 @@ def train_from_arrays(
     lightning_kwargs: Optional[dict] = None,
     n_epochs: int = 100,
     batch_size: int = 16,
+    limit_train_batches: Optional[int] = None,
+    limit_val_batches: Optional[int] = None,
     early_stopping_kwargs: Optional[dict] = None,
     accelerator: str = "auto",
     devices: Union[int, str] = "auto",
@@ -277,6 +279,14 @@ def train_from_arrays(
         Maximum number of training epochs. Early stopping may end
         training sooner.
     batch_size : int, default 16
+    limit_train_batches : int, optional
+        Cap on the number of training batches per epoch (passed to
+        Lightning Trainer). When None, falls through to the cfg
+        default (200 in JacobianODE's training.yaml).
+    limit_val_batches : int, optional
+        Cap on the number of validation batches per epoch. When None,
+        falls through to the cfg default (50 in JacobianODE's
+        training.yaml).
     early_stopping_kwargs : dict, optional
         Overrides on ``cfg.training.early_stopping.*``. Examples:
         ``{'early_stopping_patience': 5, 'percent_thresh': 0.01,
@@ -368,6 +378,8 @@ def train_from_arrays(
             condition_dim=condition_dim,
             lightning_kwargs=lightning_kwargs or {},
             n_epochs=n_epochs, batch_size=batch_size,
+            limit_train_batches=limit_train_batches,
+            limit_val_batches=limit_val_batches,
             early_stopping_kwargs=early_stopping_kwargs or {},
             accelerator=accelerator, devices=devices, seed=seed,
             save_dir=save_dir,
@@ -402,7 +414,8 @@ def _train_from_arrays_inner(
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
-    lightning_kwargs, n_epochs, batch_size, early_stopping_kwargs,
+    lightning_kwargs, n_epochs, batch_size,
+    limit_train_batches, limit_val_batches, early_stopping_kwargs,
     accelerator, devices, seed,
     save_dir, wandb_disabled,
     wandb_entity, wandb_project, wandb_group, wandb_run_name,
@@ -480,6 +493,8 @@ def _train_from_arrays_inner(
     cfg = _compose_cfg(
         encoder=encoder,
         n_features=n_features,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
         n_delays=n_delays, delay_spacing=delay_spacing,
         observed_indices=observed_indices,
         seq_length=seq_length, seq_spacing=seq_spacing,
@@ -669,7 +684,8 @@ def _compose_cfg(
     encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
-    lightning_kwargs, n_epochs, batch_size, early_stopping_kwargs,
+    lightning_kwargs, n_epochs, batch_size,
+    limit_train_batches, limit_val_batches, early_stopping_kwargs,
     accelerator, devices, seed,
     save_dir, wandb_disabled,
     wandb_entity, wandb_project, wandb_group, wandb_run_name,
@@ -703,6 +719,13 @@ def _compose_cfg(
         f"++data.postprocessing.filter_data={str(filter_data).lower()}",
         f"++training.batch_size={batch_size}",
         f"++training.trainer_params.max_epochs={n_epochs}",
+        # limit_train_batches / limit_val_batches: cap batches per
+        # epoch (passed to Lightning Trainer). When None, fall through
+        # to the cfg default (200 / 50 from training.yaml).
+        *([f"++training.trainer_params.limit_train_batches={limit_train_batches}"]
+          if limit_train_batches is not None else []),
+        *([f"++training.trainer_params.limit_val_batches={limit_val_batches}"]
+          if limit_val_batches is not None else []),
         # NB: accelerator / devices intentionally NOT passed via
         # cfg.training.trainer_params — train_model() unpacks
         # trainer_params then passes devices=... explicitly, so adding

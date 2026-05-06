@@ -127,8 +127,13 @@ logger:
   
 trainer_params:
   # limit_train_batches: 1.0
-  limit_train_batches: 500
-  limit_val_batches: 100
+  # 200 train / 50 val: tighter epoch budget than the historical
+  # 500 / 100. Most sweeps converge or early-stop within a few hundred
+  # epoch-passes, and 200 batches × 16 batch_size × 35 seq_length
+  # already covers ~110k samples per epoch at typical seq_length —
+  # plenty for SGD on the dynamics MLP.
+  limit_train_batches: 200
+  limit_val_batches: 50
   max_epochs: 1000
   accumulate_grad_batches: 4
   # strategy: 'ddp_find_unused_parameters_true'
