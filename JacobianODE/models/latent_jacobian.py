@@ -1142,6 +1142,16 @@ class LitLatentJacobianODE(LitBase):
             self.log("warmup kl_null_loss", kl_null_loss, **log_kwargs)
         if kl_dyn_loss is not None:
             self.log("warmup kl_dyn_loss", kl_dyn_loss, **log_kwargs)
+        # Also log under the train/ namespace so wandb groups these next
+        # to val/recon_loss for direct train-vs-val comparison. The
+        # "warmup *" keys above stay for back-compat with prior runs /
+        # any dashboard that watches them.
+        log_kwargs_step = dict(on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/recon_loss", recon_loss, **log_kwargs_step)
+        if kl_null_loss is not None:
+            self.log("train/kl_null_loss", kl_null_loss, **log_kwargs_step)
+        if kl_dyn_loss is not None:
+            self.log("train/kl_dyn_loss", kl_dyn_loss, **log_kwargs_step)
         return loss
 
     def _dynamics_warmup_step(self, batch, c=None):
