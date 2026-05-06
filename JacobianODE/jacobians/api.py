@@ -120,6 +120,8 @@ def train_from_arrays(
     filter_data: bool = False,
     low_pass: Optional[float] = None,
     high_pass: Optional[float] = None,
+    pre_pca_per_area: bool = False,
+    pre_pca_var_threshold: float = 0.99,
 
     # -------------------------------- model ----------------------------
     encoder: str = "latent_direct_sum_coupling",
@@ -387,6 +389,8 @@ def train_from_arrays(
             obs_noise=obs_noise, normalize=normalize,
             normalize_per_condition=normalize_per_condition,
             filter_data=filter_data, low_pass=low_pass, high_pass=high_pass,
+            pre_pca_per_area=pre_pca_per_area,
+            pre_pca_var_threshold=pre_pca_var_threshold,
             encoder=encoder, encoder_kwargs=encoder_kwargs or {},
             dynamics_kwargs=dynamics_kwargs or {},
             n_target_dims=n_target_dims,
@@ -432,6 +436,7 @@ def _train_from_arrays_inner(
     seq_length, seq_spacing, train_percent, test_percent, split_by,
     obs_noise, normalize, normalize_per_condition,
     filter_data, low_pass, high_pass,
+    pre_pca_per_area, pre_pca_var_threshold,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -703,6 +708,7 @@ def _train_from_ragged_arrays_inner(
     seq_length, seq_spacing, train_percent, test_percent, split_by,
     obs_noise, normalize, normalize_per_condition,
     filter_data, low_pass, high_pass,
+    pre_pca_per_area, pre_pca_var_threshold,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -901,6 +907,67 @@ def _train_from_ragged_arrays_inner(
     cfg.data.postprocessing.noise_scale_factor = nsf
     cfg.data.postprocessing.mu = mu
     cfg.data.postprocessing.sigma = sigma
+
+    # ---- Optional per-area PCA reduction BEFORE delay-embed --------------
+    # Shrinks each area's channel count to its 99%-variance components,
+    # which usually drops the second-stage autodim by 30-50% on neural
+    # data (per the diagnostic in mindcontrol/diagnostics/per_area_pca_pipeline).
+    if pre_pca_per_area:
+        from .data.per_area_pca import fit_per_area_pca, apply_per_area_pca
+        if area_indices is None:
+            raise ValueError(
+                "pre_pca_per_area=True requires area_indices to be set "
+                "(it operates per-area)."
+            )
+        log.info(
+            f"per-area pre-delay-embed PCA at threshold "
+            f"{pre_pca_var_threshold:.4f}..."
+        )
+        pca_fit = fit_per_area_pca(
+            padded_norm, lengths_t, area_indices,
+            threshold=pre_pca_var_threshold,
+        )
+        for ai, pca in enumerate(pca_fit.per_area):
+            log.info(
+                f"  area {ai}: n_in={pca.n_in:3d} -> n_out={pca.k:3d} "
+                f"(cum_var={pca.cum_var:.4f})"
+            )
+        log.info(
+            f"  total: {sum(p.n_in for p in pca_fit.per_area)} → {pca_fit.n_total_out} "
+            f"({pca_fit.n_total_out / sum(p.n_in for p in pca_fit.per_area):.1%} of raw)"
+        )
+        padded_norm = apply_per_area_pca(padded_norm, lengths_t, pca_fit)
+        # Local n_features (raw channel count → PCA component count).
+        n_features = pca_fit.n_total_out
+        area_indices = pca_fit.area_indices_out
+        # cfg.data.flow.dim has already been multiplied by n_delays in
+        # initialize_config (custom-data branch). Update it to the
+        # post-PCA value × n_delays so make_model builds the encoder
+        # against the right input dim.
+        cfg.data.flow.dim = n_features * n_delays
+        # Re-extend area_indices for delay embedding now that they live
+        # in the PCA-reduced space.
+        de_indices = extend_area_indices_for_delay_embedding(
+            area_indices, n_delays=n_delays, n_features=n_features,
+        )
+        OmegaConf.update(cfg, "model.encoder.area_indices", de_indices, force_add=True)
+        cfg.model.encoder.dim = n_features * n_delays
+        cfg.model.params.dim = n_features * n_delays
+        # Persist the PCA components in the cfg under postprocessing so
+        # downstream loading + roundtrip can reconstruct them. We store
+        # as tensor lists since OmegaConf handles those.
+        OmegaConf.update(
+            cfg, "data.postprocessing.pre_pca_per_area",
+            {
+                "threshold": pre_pca_var_threshold,
+                "n_total_out": pca_fit.n_total_out,
+                "area_indices_in": pca_fit.area_indices_in,
+                "area_indices_out": pca_fit.area_indices_out,
+                "cum_var": [p.cum_var for p in pca_fit.per_area],
+                "k_per_area": [p.k for p in pca_fit.per_area],
+            },
+            force_add=True,
+        )
 
     # ---- Per-trajectory delay embed --------------------------------------
     de_padded, de_lengths = delay_embed_ragged(
@@ -1279,6 +1346,7 @@ def _compose_cfg(
     seq_length, seq_spacing, train_percent, test_percent, split_by,
     obs_noise, normalize, normalize_per_condition,
     filter_data, low_pass, high_pass,
+    pre_pca_per_area, pre_pca_var_threshold,
     encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
