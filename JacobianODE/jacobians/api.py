@@ -955,8 +955,11 @@ def _train_from_ragged_arrays_inner(
             area_indices, n_delays=n_delays, n_features=n_features,
         )
         OmegaConf.update(cfg, "model.encoder.area_indices", de_indices, force_add=True)
-        cfg.model.encoder.dim = n_features * n_delays
-        cfg.model.params.dim = n_features * n_delays
+        # OmegaConf in struct mode rejects setting unknown keys; use
+        # force_add=True so we can set dim regardless of whether the
+        # encoder yaml originally exposed it.
+        OmegaConf.update(cfg, "model.encoder.dim", n_features * n_delays, force_add=True)
+        OmegaConf.update(cfg, "model.params.dim", n_features * n_delays, force_add=True)
         # Persist the PCA components in the cfg under postprocessing so
         # downstream loading + roundtrip can reconstruct them. We store
         # as tensor lists since OmegaConf handles those.
