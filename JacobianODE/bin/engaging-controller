@@ -50,7 +50,9 @@ from JacobianODE.jacobians.tuning.cell_submit import (
 # ---------------------------------------------------------------------------
 REPO_DIR = Path("/home/eisenaj/code/jacobian-reports")
 JACODE_REPO = Path("/home/eisenaj/code/JacobianODE")
+MC_REPO = Path("/home/eisenaj/code/MindControl")
 SWEEPS_DIR = Path("/orcd/data/ekmiller/001/eisenaj/JacobianODE/sweeps")
+MC_SWEEPS_DIR = Path("/orcd/data/ekmiller/001/eisenaj/MindControl/sweeps")
 STATE_DIR = Path("/home/eisenaj/.engaging-controller")
 INFLIGHT_FILE = STATE_DIR / "in_flight.json"
 LOCK_FILE = STATE_DIR / "controller.lock"
@@ -134,6 +136,19 @@ def git_pull_jacode() -> None:
         run(["git", "pull", "--rebase", "--autostash"], cwd=JACODE_REPO, check=True)
     except subprocess.CalledProcessError as e:
         log(f"git pull JacobianODE failed: {(e.stderr or '').strip()[:300]}")
+
+
+def git_pull_mindcontrol() -> None:
+    """Pull MindControl so mc-sweep code updates auto-deploy alongside
+    JacobianODE pulls. Skip silently if the repo isn't checked out yet
+    (controller stays useful for jacobian-only sweeps even before
+    MindControl is bootstrapped on this engaging account)."""
+    if not MC_REPO.exists():
+        return
+    try:
+        run(["git", "pull", "--rebase", "--autostash"], cwd=MC_REPO, check=True)
+    except subprocess.CalledProcessError as e:
+        log(f"git pull MindControl failed: {(e.stderr or '').strip()[:300]}")
 
 
 def git_status_dirty() -> bool:
@@ -665,6 +680,72 @@ def _submit_one_split(
     }
 
 
+def _submit_mc_one(instruction_path: Path, data: dict) -> dict:
+    """Hand off a ``kind: mindcontrol`` instruction to MindControl's
+    mc_sbatch CLI. Returns the metadata dict to merge into the claimed
+    instruction file.
+
+    The MindControl side (``python -m mindcontrol.cli.mc_sbatch``) does the
+    grid expansion, writes per-sweep metadata under MC_SWEEPS_DIR, submits
+    the sbatch array, and prints the array_id on stdout. We only need to
+    invoke it and capture stdout.
+    """
+    if not MC_REPO.exists():
+        raise RuntimeError(
+            f"MindControl repo not checked out at {MC_REPO}; "
+            f"clone it before submitting kind=mindcontrol instructions."
+        )
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "mindcontrol.cli.mc_sbatch",
+        str(instruction_path),
+    ]
+    proc = run(cmd, cwd=MC_REPO, check=True)
+    array_id = (proc.stdout or "").strip().splitlines()[-1].strip() if proc.stdout else ""
+    if not array_id:
+        raise RuntimeError(
+            f"mc_sbatch returned no array_id (stderr={proc.stderr!r})"
+        )
+
+    # Re-read the per-sweep expected.json that mc_sbatch wrote so we can
+    # echo wandb_group + n_cells back into the claimed instruction.
+    # mc_sbatch picks the wandb_group itself when the instruction didn't
+    # pin one, and we don't know that name from here without reading
+    # disk back. Search by array_id under MC_SWEEPS_DIR.
+    expected = None
+    if MC_SWEEPS_DIR.exists():
+        for p in sorted(MC_SWEEPS_DIR.iterdir()):
+            ej = p / "expected.json"
+            if not ej.is_file():
+                continue
+            try:
+                cand = json.loads(ej.read_text())
+            except Exception:
+                continue
+            if str(cand.get("slurm_array_id")) == array_id:
+                expected = cand
+                break
+
+    if expected is None:
+        # mc_sbatch's expected.json write is best-effort; the array submission
+        # is authoritative. Build a minimal stub so the controller can still
+        # annotate the claimed instruction.
+        expected = {
+            "wandb_group": data.get("wandb_group", "<unknown>"),
+            "n_cells": -1,
+        }
+
+    return {
+        "kind": "mindcontrol",
+        "wandb_group": expected.get("wandb_group", "<unknown>"),
+        "wandb_project": expected.get("wandb_project") or data.get("wandb_project"),
+        "slurm_array_id": array_id,
+        "slurm_submitted_at": utc_compact(),
+        "n_cells": int(expected.get("n_cells", -1)),
+        "expected_run_count": int(expected.get("n_cells", -1)),
+    }
+
+
 def process_pending_instructions(dry_run: bool) -> int:
     pending_dir = REPO_DIR / "instructions" / "pending"
     claimed_dir = REPO_DIR / "instructions" / "claimed"
@@ -688,7 +769,44 @@ def process_pending_instructions(dry_run: bool) -> int:
                 pass
             continue
 
+        kind = data.get("kind", "jacobian")
         action = data.get("action", "submit")
+
+        # --- MINDCONTROL: hand off to the MindControl-side mc_sbatch ---
+        # Mirrors the JacobianODE submit path but the orchestration logic
+        # (grid expansion, sbatch array submission) lives in MindControl
+        # to keep MindControl-specific concerns out of this controller.
+        if kind == "mindcontrol":
+            try:
+                meta = _submit_mc_one(f, data)
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or e.stdout or "")[-2000:]
+                log(f"[{f.name}] (mc) FAILED: {err.strip()[:500]}")
+                failed_dir.mkdir(parents=True, exist_ok=True)
+                target = failed_dir / f.name
+                shutil.move(str(f), str(target))
+                with target.open("a") as fh:
+                    fh.write(f"\nerror: |\n  {err}\n")
+                continue
+            except Exception as e:
+                log(f"[{f.name}] (mc) FAILED: {e}")
+                failed_dir.mkdir(parents=True, exist_ok=True)
+                target = failed_dir / f.name
+                shutil.move(str(f), str(target))
+                with target.open("a") as fh:
+                    fh.write(f"\nerror: {e}\n")
+                continue
+            data.update(meta)
+            claimed_dir.mkdir(parents=True, exist_ok=True)
+            target = claimed_dir / f.name
+            _write_yaml(target, data)
+            f.unlink()
+            log(
+                f"[{f.name}] (mc) submitted: group={meta['wandb_group']} "
+                f"array={meta['slurm_array_id']} cells={meta['n_cells']}"
+            )
+            n_processed += 1
+            continue
 
         # --- BACKFILL action: re-run only missing analytics sections ---
         if action == "backfill":
@@ -1379,6 +1497,7 @@ def main() -> int:
         # Critical: this controller script also lives in the repo (since the
         # in-repo move), so updating it requires the next cron tick to pull.
         git_pull_jacode()
+        git_pull_mindcontrol()
 
         # Audit any half-finished migrations from a prior controller crash.
         # Must run BEFORE process_pending_instructions so a freshly-submitted
