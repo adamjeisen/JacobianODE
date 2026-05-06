@@ -345,7 +345,12 @@ def train_model(
             mode=cfg.training.early_stopping.mode,
         )
 
-    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback(), LearningRateMonitor(logging_interval='epoch')]
+    callbacks = [checkpoint_callback, traj_checkpoint, early_stopping_callback, _WandbFlushCallback()]
+    # LearningRateMonitor requires a Trainer logger to write LR values to.
+    # Skip it when wandb_disabled (and no other logger is configured),
+    # otherwise Lightning raises MisconfigurationException at on_train_start.
+    if experiment_logger is not False:
+        callbacks.append(LearningRateMonitor(logging_interval='epoch'))
 
     # Optional: shadow checkpoint that freezes at a simulated smaller-
     # patience ES-trigger. Primary ES still controls when training stops;

@@ -340,6 +340,87 @@ def resolve_partial_obs_area_indices(cfg: DictConfig) -> None:
     )
 
 
+def extend_area_indices_for_delay_embedding(
+    area_indices: list[list[int]],
+    n_delays: int,
+    n_features: int,
+) -> list[list[int]]:
+    """Lift raw-observation per-area indices into delay-embedded
+    indices, matching :func:`embed_signal_torch`'s layout.
+
+    The DirectSum encoder's ``area_indices`` field expects positions in
+    the encoder's INPUT space — which, after delay embedding, is
+    ``n_features * n_delays`` dims arranged as
+    ``[d * n_features + i for d in 0..n_delays-1 for i in raw_idx]``.
+    Per ``embed_signal_torch``'s docstring: columns ``0:N`` contain the
+    most recent state, columns ``N:2N`` the next delay, and so on.
+
+    This helper exists so consumers (notebooks, downstream projects)
+    can supply ``area_indices`` in the natural raw-observation space
+    (per electrode, 0..N-1) and have them automatically extended for
+    delay embedding before being written to
+    ``cfg.model.encoder.area_indices``. The existing
+    :func:`resolve_partial_obs_area_indices` does this implicitly for
+    the partial-obs sentinel; this is the analogous helper for the
+    non-sentinel / explicit-area-list case.
+
+    Parameters
+    ----------
+    area_indices : list of lists of int
+        Per-area indices in raw obs space (each int in ``[0, n_features)``).
+        Indices may be non-contiguous and need not partition all of
+        ``range(n_features)``.
+    n_delays : int
+        Number of delay copies in the delay embedding (``>= 1``).
+    n_features : int
+        Number of raw obs features (= the trailing dim of the
+        un-delay-embedded data; used to validate that all raw indices
+        are in bounds).
+
+    Returns
+    -------
+    list of lists of int
+        Per-area indices in delay-embedded space, each int in
+        ``[0, n_features * n_delays)``. Inner lists are
+        ``len(raw_area) * n_delays`` long, ordered with the most-recent
+        copy first (matches ``embed_signal_torch``).
+
+    Raises
+    ------
+    ValueError
+        If ``n_delays < 1``, any raw index is out of ``[0, n_features)``,
+        or ``area_indices`` is empty.
+
+    Examples
+    --------
+    >>> # 4 features, 2 areas (0=visual, 1=cognitive), n_delays=3
+    >>> extend_area_indices_for_delay_embedding(
+    ...     [[0, 1], [2, 3]], n_delays=3, n_features=4
+    ... )
+    [[0, 1, 4, 5, 8, 9], [2, 3, 6, 7, 10, 11]]
+    """
+    if n_delays < 1:
+        raise ValueError(f"n_delays must be >= 1, got {n_delays}")
+    if not area_indices:
+        raise ValueError("area_indices is empty")
+    out: list[list[int]] = []
+    for area_no, raw_idx in enumerate(area_indices):
+        if not raw_idx:
+            raise ValueError(f"area {area_no}: empty index list")
+        for i in raw_idx:
+            if not (0 <= int(i) < n_features):
+                raise ValueError(
+                    f"area {area_no}: raw index {i} out of bounds "
+                    f"[0, {n_features})"
+                )
+        out.append([
+            d * n_features + int(i)
+            for d in range(n_delays)
+            for i in raw_idx
+        ])
+    return out
+
+
 def initialize_config(
     cfg: DictConfig,
     data_dim: Optional[int] = None,
@@ -420,7 +501,21 @@ def initialize_config(
                 "or pass data_dim to initialize_config(). "
                 "This should match the last axis of your data (trials x time x dim)."
             )
-        dim = cfg.data.flow.dim
+        # Match wmtask's behavior: cfg.data.flow.dim is the RAW
+        # observation dim; the encoder sees post-delay-embedding
+        # input of dim = raw * n_delays (or len(observed_indices) *
+        # n_delays for partial obs). Pre-fix this branch returned
+        # the raw dim, which was a no-op for n_delays=1 but left
+        # cfg.model.encoder.n_input under-sized for n_delays > 1
+        # (encoder rejected the actual delay-embedded input).
+        delay_params = cfg.data.train_test_params.delay_embedding_params
+        if delay_params.observed_indices == "all":
+            dim = int(cfg.data.flow.dim) * int(delay_params.n_delays)
+        else:
+            dim = (
+                len(delay_params.observed_indices)
+                * int(delay_params.n_delays)
+            )
     elif cfg.data.data_type == "wmtask":
         if cfg.data.flow.dim is None:
             raise ValueError(

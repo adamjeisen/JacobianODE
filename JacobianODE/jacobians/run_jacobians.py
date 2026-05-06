@@ -164,48 +164,30 @@ def _run_training(cfg: DictConfig) -> Optional[float]:
     )
     _src_ids = sol.get("source_id") if isinstance(sol, dict) else None
     if _normalize_per_condition and _src_ids is not None:
+        from .data.processing import postprocess_per_condition
         import numpy as _np
         src_ids_arr = _np.asarray(_src_ids)
-        unique_src = _np.unique(src_ids_arr)
         log.info(
-            f"per-condition normalization: {len(unique_src)} sources, "
-            f"sizes={[int((src_ids_arr == s).sum()) for s in unique_src]}"
+            f"per-condition normalization: {len(_np.unique(src_ids_arr))} sources, "
+            f"sizes={[int((src_ids_arr == s).sum()) for s in _np.unique(src_ids_arr)]}"
         )
-        # Allocate output container once; type matches the noisy postprocess
-        # output (np.float64 from np.random.normal addition).
-        if isinstance(values_raw, _np.ndarray):
-            values = _np.empty_like(values_raw, dtype=_np.float64)
-        else:
-            import torch as _torch
-            values = _torch.empty_like(values_raw, dtype=_torch.float64)
-        per_source_mu: list[float] = []
-        per_source_sigma: list[float] = []
-        per_source_nsf: list[float] = []
-        for s in unique_src:
-            mask = src_ids_arr == s
-            sub_raw = values_raw[mask]
-            sub_noise_ref = raw_values_noise[mask] if raw_values_noise is not None else None
-            sub_result = postprocess_data(
-                cfg, sub_raw, raw_values_to_use_for_noise=sub_noise_ref,
-            )
-            values[mask] = sub_result.values
-            per_source_mu.append(float(sub_result.mu))
-            per_source_sigma.append(float(sub_result.sigma))
-            per_source_nsf.append(float(sub_result.noise_scale_factor))
+        pc_result = postprocess_per_condition(
+            cfg, values_raw, source_id=src_ids_arr,
+            raw_values_to_use_for_noise=raw_values_noise,
+        )
+        values = pc_result.values
+        mu = pc_result.mu
+        sigma = pc_result.sigma
+        noise_scale_factor = pc_result.noise_scale_factor
+        for i, s in enumerate(pc_result.source_ids):
             log.info(
-                f"  source {int(s)}: mu={sub_result.mu:.6g}, "
-                f"sigma={sub_result.sigma:.6g}, "
-                f"noise_scale_factor={sub_result.noise_scale_factor:.6g}"
+                f"  source {s}: mu={pc_result.mu_per_source[i]:.6g}, "
+                f"sigma={pc_result.sigma_per_source[i]:.6g}, "
+                f"noise_scale_factor={pc_result.noise_scale_factor_per_source[i]:.6g}"
             )
-        # Top-level scalars are kept for back-compat with downstream code
-        # (analytics, load_run) that reads them. Use the mean across sources
-        # as a reasonable summary; per-source detail is in the lists below.
-        mu = float(_np.mean(per_source_mu))
-        sigma = float(_np.mean(per_source_sigma))
-        noise_scale_factor = float(_np.mean(per_source_nsf))
-        OmegaConf.update(cfg, "data.postprocessing.mu_per_source", per_source_mu, force_add=True)
-        OmegaConf.update(cfg, "data.postprocessing.sigma_per_source", per_source_sigma, force_add=True)
-        OmegaConf.update(cfg, "data.postprocessing.noise_scale_factor_per_source", per_source_nsf, force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.mu_per_source", pc_result.mu_per_source, force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.sigma_per_source", pc_result.sigma_per_source, force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.noise_scale_factor_per_source", pc_result.noise_scale_factor_per_source, force_add=True)
     else:
         result = postprocess_data(cfg, values_raw, raw_values_to_use_for_noise=raw_values_noise)
         values = result.values
@@ -257,149 +239,48 @@ def _run_training(cfg: DictConfig) -> Optional[float]:
     #   model.n_target_var_threshold (PCA): pick smallest k with cum_var[k-1] >= threshold.
     #   model.n_target_dim_method='fnn'   : use whitened-PCA-FNN k=1 stop-at-min instead.
     # ----------------------------------------
-    _n_target_var_thresh = OmegaConf.select(
-        cfg, "model.n_target_var_threshold", default=None
-    )
-    _n_target_dim_method = OmegaConf.select(
-        cfg, "model.n_target_dim_method", default="pca"
-    )
-    _n_target_fnn_thresh = OmegaConf.select(
-        cfg, "model.n_target_fnn_threshold", default=0.01
-    )
-    if _n_target_dim_method not in ("pca", "fnn"):
-        raise ValueError(
-            f"model.n_target_dim_method must be 'pca' or 'fnn', got "
-            f"{_n_target_dim_method!r}"
-        )
-    # DirectSumCouplingEncoder partitions the input axis into N subsystems via
-    # area_indices. With n_target_var_threshold set, we do PCA *per area* (each
-    # area's input data is decomposed independently) and pick n_target_dims for
-    # each area as the smallest k that captures the threshold of that area's
-    # variance. The total n_target_dims is the sum across areas. The FNN path
-    # below mirrors this per-area structure.
-    _is_direct_sum = (
-        str(OmegaConf.select(cfg, "model.encoder._target_", default=""))
-        .endswith("DirectSumCouplingEncoder")
-    )
-    if _n_target_dim_method == "fnn":
-        from JacobianODE.fnn.dim_estimator import fnn_dim_estimate
-        train_seq = trajs["train_trajs"].sequence
-        flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
-        flat_np = flat.cpu().numpy()
-        if _is_direct_sum:
-            area_indices = OmegaConf.to_container(
-                cfg.model.encoder.area_indices, resolve=True
+    from .training.autodim import infer_n_target_dims
+    autodim_result = infer_n_target_dims(cfg, trajs["train_trajs"].sequence)
+    if autodim_result is not None:
+        # Write back chosen dims + diagnostic stats. (The function is pure
+        # by design — it doesn't mutate cfg, so the caller controls
+        # which fields land where.)
+        cfg.model.n_target_dims = autodim_result.n_target_dims_total
+        cfg.model.params.input_dim = autodim_result.n_target_dims_total
+        cfg.model.params.output_dim = autodim_result.n_target_dims_total ** 2
+        if autodim_result.is_direct_sum:
+            cfg.model.encoder.n_target_dims_per_block = list(
+                autodim_result.n_target_dims_per_block
             )
-            n_target_per_block = []
-            for i, idxs in enumerate(area_indices):
-                n_k = int(fnn_dim_estimate(
-                    flat_np[:, idxs], threshold=_n_target_fnn_thresh,
-                ))
-                n_target_per_block.append(n_k)
-                log.info(
-                    f"  area {i}: input_dims={len(idxs)}, "
-                    f"n_target_dims (FNN)={n_k}"
+            if autodim_result.method == "fnn":
+                OmegaConf.update(
+                    cfg, "model.n_target_dims_per_block_fnn_auto",
+                    list(autodim_result.n_target_dims_per_block), force_add=True,
                 )
-            total = int(sum(n_target_per_block))
-            log.info(
-                f"DirectSum FNN-auto: n_target_dims_per_block={n_target_per_block} "
-                f"(total={total}, fnn_threshold={_n_target_fnn_thresh})"
-            )
-            cfg.model.encoder.n_target_dims_per_block = list(n_target_per_block)
-            cfg.model.n_target_dims = total
-            cfg.model.params.input_dim = total
-            cfg.model.params.output_dim = total ** 2
-            OmegaConf.update(
-                cfg, "model.n_target_dims_per_block_fnn_auto",
-                list(n_target_per_block), force_add=True,
-            )
+            else:  # pca
+                OmegaConf.update(
+                    cfg, "model.n_target_dims_per_block_pca_auto",
+                    list(autodim_result.n_target_dims_per_block), force_add=True,
+                )
+                OmegaConf.update(
+                    cfg, "model.n_target_dims_per_block_pca_cum_var",
+                    list(autodim_result.pca_cum_var), force_add=True,
+                )
         else:
-            n_target = int(fnn_dim_estimate(
-                flat_np, threshold=_n_target_fnn_thresh,
-            ))
-            log.info(
-                f"FNN-auto n_target_dims: D_embed={flat_np.shape[-1]}, "
-                f"N_samples={flat_np.shape[0]}, fnn_threshold={_n_target_fnn_thresh}, "
-                f"chose n_target_dims={n_target}"
-            )
-            cfg.model.n_target_dims = n_target
-            cfg.model.params.input_dim = n_target
-            cfg.model.params.output_dim = n_target ** 2
-            OmegaConf.update(
-                cfg, "model.n_target_dims_fnn_auto", n_target, force_add=True,
-            )
-    elif _is_direct_sum and _n_target_var_thresh is not None:
-        train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
-        flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
-        area_indices = OmegaConf.to_container(
-            cfg.model.encoder.area_indices, resolve=True
-        )
-        n_target_per_block = []
-        cum_at_pick = []
-        for i, idxs in enumerate(area_indices):
-            x_area = flat[:, idxs]
-            x_area = x_area - x_area.mean(dim=0, keepdim=True)
-            cov_a = (x_area.T @ x_area) / (x_area.shape[0] - 1)
-            eigvals_a = torch.linalg.eigvalsh(cov_a).flip(0).clamp_min(0.0)
-            explained_a = eigvals_a / eigvals_a.sum()
-            cum_var_a = explained_a.cumsum(0)
-            n_k = int((cum_var_a >= _n_target_var_thresh).float().argmax().item()) + 1
-            n_target_per_block.append(n_k)
-            cum_at_pick.append(float(cum_var_a[n_k - 1].item()))
-            log.info(
-                f"  area {i}: input_dims={len(idxs)}, n_target_dims={n_k}, "
-                f"cum_var_at_pick={cum_at_pick[-1]:.4f}"
-            )
-        total = int(sum(n_target_per_block))
-        log.info(
-            f"DirectSum PCA-auto: n_target_dims_per_block={n_target_per_block} "
-            f"(total={total}, threshold={_n_target_var_thresh})"
-        )
-        cfg.model.encoder.n_target_dims_per_block = list(n_target_per_block)
-        cfg.model.n_target_dims = total
-        cfg.model.params.input_dim = total
-        cfg.model.params.output_dim = total ** 2
-        OmegaConf.update(
-            cfg, "model.n_target_dims_per_block_pca_auto",
-            list(n_target_per_block), force_add=True,
-        )
-        OmegaConf.update(
-            cfg, "model.n_target_dims_per_block_pca_cum_var",
-            list(cum_at_pick), force_add=True,
-        )
-    elif _n_target_var_thresh is not None:
-        train_seq = trajs["train_trajs"].sequence  # (N_traj, T, D_embed)
-        flat = train_seq.reshape(-1, train_seq.shape[-1]).to(torch.float64)
-        flat -= flat.mean(dim=0, keepdim=True)
-        cov = (flat.T @ flat) / (flat.shape[0] - 1)
-        # eigh returns ascending eigvals + matching eigvecs as columns.
-        eigvals_asc, _ = torch.linalg.eigh(cov)
-        eigvals = eigvals_asc.flip(0).clamp_min(0.0)
-        explained = eigvals / eigvals.sum()
-        cum_var = explained.cumsum(0)
-        _cum = [f"{v:.4f}" for v in cum_var[: min(10, len(cum_var))].tolist()]
-        _exp = [f"{v:.4f}" for v in explained[: min(10, len(explained))].tolist()]
-        log.info(
-            f"PCA on training delay embeddings: D_embed={flat.shape[-1]}, "
-            f"N_samples={flat.shape[0]}"
-        )
-        log.info(f"  explained variance (first 10): {_exp}")
-        log.info(f"  cumulative variance (first 10): {_cum}")
-
-        n_target = int((cum_var >= _n_target_var_thresh).float().argmax().item()) + 1
-        log.info(
-            f"PCA-auto n_target_dims: threshold={_n_target_var_thresh}, "
-            f"chose n_target_dims={n_target}"
-        )
-        cfg.model.n_target_dims = n_target
-        cfg.model.params.input_dim = n_target
-        cfg.model.params.output_dim = n_target ** 2
-        OmegaConf.update(cfg, "model.n_target_dims_pca_auto", n_target, force_add=True)
-        OmegaConf.update(
-            cfg, "model.n_target_dims_pca_cum_var",
-            float(cum_var[n_target - 1].item()),
-            force_add=True,
-        )
+            if autodim_result.method == "fnn":
+                OmegaConf.update(
+                    cfg, "model.n_target_dims_fnn_auto",
+                    autodim_result.n_target_dims_total, force_add=True,
+                )
+            else:  # pca
+                OmegaConf.update(
+                    cfg, "model.n_target_dims_pca_auto",
+                    autodim_result.n_target_dims_total, force_add=True,
+                )
+                OmegaConf.update(
+                    cfg, "model.n_target_dims_pca_cum_var",
+                    float(autodim_result.pca_cum_var), force_add=True,
+                )
 
     # ----------------------------------------
     # SET UP WANDB
