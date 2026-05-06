@@ -8,10 +8,13 @@ import pytest
 import torch
 
 from JacobianODE.jacobians.data.ragged import (
+    delay_embed_ragged,
     pad_trajs_to_max,
     sliding_windows,
+    split_balanced_by_timepoints,
     truncate_chronological_balanced,
 )
+from JacobianODE.jacobians.data.splitting import embed_signal_torch
 
 
 # ---------------------------------------------------------------------------
@@ -479,3 +482,123 @@ class TestTruncateChronologicalBalanced:
             truncate_chronological_balanced(
                 trajs, T_target=2200, min_length=1000, min_kept_length=1500
             )
+
+
+# ---------------------------------------------------------------------------
+# delay_embed_ragged
+# ---------------------------------------------------------------------------
+
+class TestDelayEmbedRagged:
+    def test_per_trajectory_matches_direct_call(self):
+        """delay_embed_ragged on each trajectory must equal embed_signal_torch
+        applied to that trajectory's valid slice — no mixing across the
+        NaN boundary."""
+        torch.manual_seed(0)
+        trajs = [torch.randn(10, 3), torch.randn(15, 3), torch.randn(7, 3)]
+        padded, lengths = pad_trajs_to_max(trajs)
+        n_delays, delay_spacing = 4, 1
+        de_padded, de_lengths = delay_embed_ragged(
+            padded, lengths, n_delays=n_delays, delay_spacing=delay_spacing
+        )
+        # Lengths reduced by (n_delays - 1) per trajectory.
+        assert de_lengths.tolist() == [10 - 3, 15 - 3, 7 - 3]
+        # Per-trajectory delay-embed matches direct call.
+        for i in range(len(trajs)):
+            L_i = int(lengths[i].item())
+            L_i_de = int(de_lengths[i].item())
+            direct = embed_signal_torch(trajs[i][:L_i], n_delays, delay_spacing)
+            torch.testing.assert_close(
+                de_padded[i, :L_i_de], direct.to(de_padded.dtype),
+                rtol=1e-6, atol=1e-6,
+            )
+            # Beyond valid length: NaN.
+            if L_i_de < de_padded.shape[1]:
+                assert torch.isnan(de_padded[i, L_i_de:]).all()
+
+    def test_n_delays_one_is_no_op(self):
+        torch.manual_seed(0)
+        trajs = [torch.randn(5, 2), torch.randn(8, 2)]
+        padded, lengths = pad_trajs_to_max(trajs)
+        de, dl = delay_embed_ragged(padded, lengths, n_delays=1)
+        torch.testing.assert_close(de, padded.clone(), equal_nan=True)
+        assert dl.tolist() == lengths.tolist()
+
+    def test_short_trajectories_get_zero_de_length(self):
+        """Trajectories shorter than the embedding window should report
+        de_length=0 and contribute no valid samples."""
+        trajs = [torch.randn(2, 3), torch.randn(10, 3)]
+        padded, lengths = pad_trajs_to_max(trajs)
+        n_delays = 4  # window covers 4 samples → traj 0 (length 2) is too short
+        de, dl = delay_embed_ragged(padded, lengths, n_delays=n_delays)
+        assert dl.tolist() == [0, 7]
+        # Traj 0 entirely NaN.
+        assert torch.isnan(de[0]).all()
+
+    def test_delay_spacing(self):
+        """delay_spacing > 1 reduces lengths by (n_delays - 1) * spacing."""
+        torch.manual_seed(0)
+        trajs = [torch.randn(20, 2)]
+        padded, lengths = pad_trajs_to_max(trajs)
+        de, dl = delay_embed_ragged(padded, lengths, n_delays=3, delay_spacing=2)
+        assert dl.tolist() == [20 - 4]
+
+
+# ---------------------------------------------------------------------------
+# split_balanced_by_timepoints
+# ---------------------------------------------------------------------------
+
+class TestSplitBalancedByTimepoints:
+    def test_per_condition_balance(self):
+        """Each condition is split independently → roughly the requested
+        per-condition fractions in TIMEPOINT terms."""
+        # 10 trajs cond 0 with widely-varying lengths totalling 1000;
+        # 10 trajs cond 1 totalling 500.
+        rng = np.random.RandomState(0)
+        ls0 = rng.randint(50, 200, size=10)
+        ls0 = (ls0 * (1000 / ls0.sum())).round().astype(np.int64)
+        ls1 = rng.randint(20, 100, size=10)
+        ls1 = (ls1 * (500 / ls1.sum())).round().astype(np.int64)
+        lengths = np.concatenate([ls0, ls1])
+        source_id = np.array([0] * 10 + [1] * 10)
+        train_idx, val_idx, test_idx = split_balanced_by_timepoints(
+            lengths, source_id, train_percent=0.7, test_percent=0.15, seed=0,
+        )
+        assert sorted(np.concatenate([train_idx, val_idx, test_idx]).tolist()) == list(range(20))
+        for s in [0, 1]:
+            cond_total = lengths[source_id == s].sum()
+            tr = lengths[np.intersect1d(train_idx, np.where(source_id == s)[0])].sum()
+            va = lengths[np.intersect1d(val_idx, np.where(source_id == s)[0])].sum()
+            te = lengths[np.intersect1d(test_idx, np.where(source_id == s)[0])].sum()
+            assert abs(tr / cond_total - 0.7) < 0.15
+            assert abs(va / cond_total - 0.15) < 0.15
+            assert abs(te / cond_total - 0.15) < 0.15
+
+    def test_determinism(self):
+        ls = np.full(20, 10, dtype=np.int64)
+        src = np.zeros(20, dtype=np.int64)
+        a = split_balanced_by_timepoints(ls, src, 0.7, 0.15, seed=0)
+        b = split_balanced_by_timepoints(ls, src, 0.7, 0.15, seed=0)
+        for x, y in zip(a, b):
+            assert np.array_equal(x, y)
+
+    def test_too_few_trajectories_per_source_raises(self):
+        with pytest.raises(ValueError, match="need at least 3"):
+            split_balanced_by_timepoints(
+                np.array([10, 10]), np.array([0, 0]), 0.7, 0.15,
+            )
+
+    def test_invalid_percent_raises(self):
+        ls = np.full(10, 5, dtype=np.int64)
+        src = np.zeros(10, dtype=np.int64)
+        with pytest.raises(ValueError, match="must be in"):
+            split_balanced_by_timepoints(ls, src, train_percent=0.7, test_percent=0.5)
+
+    def test_no_leakage_at_trajectory_level(self):
+        """Each parent trajectory appears in exactly one of train/val/test."""
+        ls = np.full(30, 50, dtype=np.int64)
+        src = np.zeros(30, dtype=np.int64)
+        train_idx, val_idx, test_idx = split_balanced_by_timepoints(
+            ls, src, 0.7, 0.15, seed=42,
+        )
+        union = np.concatenate([train_idx, val_idx, test_idx])
+        assert len(union) == len(set(union.tolist())) == 30

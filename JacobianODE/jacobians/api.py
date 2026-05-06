@@ -98,6 +98,7 @@ def train_from_arrays(
     dt: float,
     *,
     # ---------------------- per-trajectory metadata ----------------------
+    lengths: Optional[Union[np.ndarray, torch.Tensor]] = None,
     condition: Optional[Union[np.ndarray, torch.Tensor]] = None,
     source_id: Optional[Union[np.ndarray, torch.Tensor]] = None,
     area_indices: Optional[list[list[int]]] = None,
@@ -172,13 +173,30 @@ def train_from_arrays(
     Parameters
     ----------
     values : np.ndarray or torch.Tensor of shape ``(N_traj, T, D)``
-        Pre-built raw, **uniform-length** trajectories. If your data is
-        ragged (variable per-trajectory length), pre-slide via
-        :func:`JacobianODE.jacobians.data.ragged.sliding_windows` before
-        calling. ``T`` is the time axis BEFORE delay embedding;
-        delay-embed will reduce it by ``n_delays - 1``.
+        Pre-built raw trajectories. ``T`` is the time axis BEFORE delay
+        embedding; delay-embed will reduce it by ``n_delays - 1``.
+
+        Two input modes:
+
+        * **Uniform** (``lengths is None``): every trajectory must be
+          fully populated with valid samples. The standard pipeline
+          (delay-embed → split → stride) is used.
+        * **Ragged** (``lengths is not None``): each ``values[i]``
+          contains ``lengths[i]`` valid samples followed by NaN padding
+          (the convention from
+          :func:`JacobianODE.jacobians.data.ragged.pad_trajs_to_max`).
+          A different pipeline runs:
+          per-trajectory delay-embed → per-condition timepoint-balanced
+          trajectory-level split → stride within each split. This
+          eliminates the leakage path where pre-strided sub-windows
+          from the same parent trajectory end up in different splits.
+          Requires ``seq_length``.
     dt : float
         Time step between observations (seconds typically).
+    lengths : np.ndarray or torch.Tensor of shape ``(N_traj,)``, optional
+        Per-trajectory valid sample count. When provided, triggers the
+        ragged pipeline (see ``values``). When None (default), every
+        trajectory is treated as fully valid.
     condition : np.ndarray or torch.Tensor of shape ``(N_traj, condition_dim)``, optional
         Per-trajectory condition vector. When provided, the encoder
         and dynamics MLP receive it as a per-sample input (for
@@ -358,7 +376,7 @@ def train_from_arrays(
     logging.basicConfig(level=log_level)
 
     try:
-        return _train_from_arrays_inner(
+        common_kwargs = dict(
             values=values, dt=dt,
             condition=condition, source_id=source_id, area_indices=area_indices,
             n_delays=n_delays, delay_spacing=delay_spacing,
@@ -391,6 +409,9 @@ def train_from_arrays(
             cfg_overrides=cfg_overrides or {},
             verbose=verbose,
         )
+        if lengths is not None:
+            return _train_from_ragged_arrays_inner(lengths=lengths, **common_kwargs)
+        return _train_from_arrays_inner(**common_kwargs)
     except Exception:
         # Mirror train(cfg)'s error_traceback diagnostics: write a
         # local file so the traceback survives even if the caller
@@ -673,6 +694,583 @@ def _train_from_arrays_inner(
         autodim_result=autodim_result,
     )
     return lit_model, result
+
+
+def _train_from_ragged_arrays_inner(
+    values, dt, *, lengths,
+    condition, source_id, area_indices,
+    n_delays, delay_spacing, observed_indices,
+    seq_length, seq_spacing, train_percent, test_percent, split_by,
+    obs_noise, normalize, normalize_per_condition,
+    filter_data, low_pass, high_pass,
+    encoder, encoder_kwargs, dynamics_kwargs,
+    n_target_dims, n_target_var_threshold, n_target_dim_method,
+    prediction_steps, condition_dim,
+    lightning_kwargs, n_epochs, batch_size,
+    limit_train_batches, limit_val_batches, early_stopping_kwargs,
+    accelerator, devices, seed,
+    save_dir, wandb_disabled,
+    wandb_entity, wandb_project, wandb_group, wandb_run_name,
+    init_from_pretrained, init_from_pretrained_strict,
+    cfg_overrides, verbose,
+) -> tuple[Any, TrainingResult]:
+    """Ragged input path: per-trajectory delay-embed → per-condition
+    timepoint-balanced trajectory split → stride within each split.
+
+    Bypasses :func:`create_dataloaders` (which expects uniform input)
+    and builds the per-split datasets / dataloaders directly. The split
+    is at the parent-trajectory level, so sub-windows from the same
+    parent never appear in different splits. Per-condition split also
+    keeps the source mix balanced across train/val/test.
+    """
+    from torch.utils.data import DataLoader, Subset
+
+    from .core.config import (
+        extend_area_indices_for_delay_embedding,
+        initialize_config,
+    )
+    from .core.reproducibility import seed_everything
+    from .data.ragged import (
+        delay_embed_ragged,
+        sliding_windows,
+        split_balanced_by_timepoints,
+    )
+    from .data.splitting import (
+        TimeSeriesDataset,
+        collate_with_optional_condition,
+    )
+    from .training.autodim import infer_n_target_dims
+    from .training.logging import log_training_info
+    from .training.model_factory import make_model
+    from .training.trainer import train_model
+    from .metrics import compute_generalized_variance
+
+    log = logging.getLogger("JacobianODE.train_from_arrays")
+
+    if filter_data:
+        # The ragged path doesn't currently route through postprocess_data's
+        # filter branch (filter_data assumes uniform-length trajectories).
+        # Surface this explicitly rather than silently dropping the filter.
+        raise NotImplementedError(
+            "filter_data=True is not yet supported on the ragged "
+            "(lengths-provided) path; pre-filter the data before calling, "
+            "or pass uniform values without `lengths`."
+        )
+
+    # ---- Validate inputs --------------------------------------------------
+    if isinstance(values, np.ndarray):
+        padded = torch.from_numpy(values)
+    elif isinstance(values, torch.Tensor):
+        padded = values
+    else:
+        padded = torch.as_tensor(values)
+    if padded.ndim != 3:
+        raise ValueError(
+            f"values must be 3-D (N_traj, T, D), got shape {tuple(padded.shape)}"
+        )
+    if isinstance(lengths, torch.Tensor):
+        lengths_t = lengths.to(torch.long).detach().cpu()
+    else:
+        lengths_t = torch.as_tensor(np.asarray(lengths), dtype=torch.long)
+    if lengths_t.shape != (padded.shape[0],):
+        raise ValueError(
+            f"lengths shape {tuple(lengths_t.shape)} != "
+            f"(N_traj={padded.shape[0]},)"
+        )
+
+    n_traj, t_max, n_features = padded.shape
+    log.info(
+        f"ragged input: N_traj={n_traj}, t_max={t_max}, D={n_features}, "
+        f"lengths range [{int(lengths_t.min())}, {int(lengths_t.max())}], "
+        f"total_valid_timepoints={int(lengths_t.sum())}"
+    )
+
+    if seq_length is None:
+        raise ValueError(
+            "seq_length is required on the ragged path (used to stride within "
+            "each split after delay-embedding)."
+        )
+
+    if condition is not None:
+        cond_arr = np.asarray(condition)
+        if cond_arr.ndim == 1:
+            cond_arr = cond_arr.reshape(-1, 1)
+        if cond_arr.ndim != 2 or cond_arr.shape[0] != n_traj:
+            raise ValueError(
+                f"condition must be 1-D (N_traj,) or 2-D (N_traj, condition_dim); "
+                f"got shape {cond_arr.shape}"
+            )
+        if condition_dim is None:
+            condition_dim = int(cond_arr.shape[-1])
+        elif condition_dim != cond_arr.shape[-1]:
+            raise ValueError(
+                f"condition_dim={condition_dim} disagrees with "
+                f"condition.shape[-1]={cond_arr.shape[-1]}"
+            )
+    else:
+        cond_arr = None
+
+    if source_id is not None:
+        src_arr = np.asarray(source_id)
+        if src_arr.ndim != 1 or src_arr.shape[0] != n_traj:
+            raise ValueError(
+                f"source_id must be 1-D length N_traj; got shape {src_arr.shape}"
+            )
+    else:
+        src_arr = None
+
+    if normalize_per_condition and src_arr is None:
+        raise ValueError(
+            "normalize_per_condition=True requires source_id to be provided"
+        )
+
+    # Use a single source for the per-condition split when no source_id is set,
+    # so the same balanced-split function still applies.
+    split_src = src_arr if src_arr is not None else np.zeros(n_traj, dtype=np.int64)
+
+    # ---- Build cfg --------------------------------------------------------
+    cfg = _compose_cfg(
+        encoder=encoder,
+        n_features=n_features,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
+        n_delays=n_delays, delay_spacing=delay_spacing,
+        observed_indices=observed_indices,
+        seq_length=seq_length, seq_spacing=seq_spacing,
+        train_percent=train_percent, test_percent=test_percent,
+        split_by=split_by,
+        obs_noise=obs_noise, normalize=normalize,
+        normalize_per_condition=normalize_per_condition,
+        filter_data=filter_data, low_pass=low_pass, high_pass=high_pass,
+        encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
+        n_target_dims=n_target_dims,
+        n_target_var_threshold=n_target_var_threshold,
+        n_target_dim_method=n_target_dim_method,
+        prediction_steps=prediction_steps,
+        condition_dim=condition_dim,
+        lightning_kwargs=lightning_kwargs,
+        n_epochs=n_epochs, batch_size=batch_size,
+        early_stopping_kwargs=early_stopping_kwargs,
+        accelerator=accelerator, devices=devices, seed=seed,
+        save_dir=save_dir,
+        wandb_disabled=wandb_disabled,
+        wandb_entity=wandb_entity, wandb_project=wandb_project,
+        wandb_group=wandb_group, wandb_run_name=wandb_run_name,
+        cfg_overrides=cfg_overrides,
+    )
+
+    if area_indices is not None:
+        de_indices = extend_area_indices_for_delay_embedding(
+            area_indices, n_delays=n_delays, n_features=n_features,
+        )
+        OmegaConf.update(cfg, "model.encoder.area_indices", de_indices, force_add=True)
+        log.info(
+            f"area_indices: extended {len(area_indices)} areas from raw "
+            f"{n_features}-D to delay-embedded {n_features * n_delays}-D"
+        )
+
+    cfg = initialize_config(cfg)
+    seed_everything(seed)
+
+    # ---- NaN-aware per-source noise + normalize on raw padded ------------
+    padded_norm, mu_per_source, sigma_per_source, nsf_per_source, src_ids_for_norm = (
+        _normalize_ragged(
+            padded, lengths_t,
+            split_src if normalize_per_condition else np.zeros(n_traj, dtype=np.int64),
+            normalize=normalize, obs_noise=obs_noise,
+        )
+    )
+    mu = float(np.mean(mu_per_source))
+    sigma = float(np.mean(sigma_per_source))
+    nsf = float(np.mean(nsf_per_source))
+
+    if normalize_per_condition:
+        log.info(
+            f"per-condition normalization: {len(src_ids_for_norm)} sources"
+        )
+        for s, m, sg, n in zip(src_ids_for_norm, mu_per_source, sigma_per_source, nsf_per_source):
+            log.info(
+                f"  source {s}: mu={m:.6g}, sigma={sg:.6g}, noise_scale_factor={n:.6g}"
+            )
+        OmegaConf.update(cfg, "data.postprocessing.mu_per_source", list(mu_per_source), force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.sigma_per_source", list(sigma_per_source), force_add=True)
+        OmegaConf.update(cfg, "data.postprocessing.noise_scale_factor_per_source", list(nsf_per_source), force_add=True)
+    else:
+        log.info(f"global normalization: mu={mu:.6g}, sigma={sigma:.6g}, noise_scale_factor={nsf:.6g}")
+
+    cfg.data.postprocessing.noise_scale_factor = nsf
+    cfg.data.postprocessing.mu = mu
+    cfg.data.postprocessing.sigma = sigma
+
+    # ---- Per-trajectory delay embed --------------------------------------
+    de_padded, de_lengths = delay_embed_ragged(
+        padded_norm, lengths_t, n_delays=n_delays, delay_spacing=delay_spacing,
+    )
+    de_padded = de_padded.to(torch.float32)
+    log.info(
+        f"delay-embedded ragged: {tuple(de_padded.shape)}, "
+        f"lengths range [{int(de_lengths.min())}, {int(de_lengths.max())}], "
+        f"total_de_timepoints={int(de_lengths.sum())}"
+    )
+
+    # ---- Per-condition timepoint-balanced trajectory split ---------------
+    log.info("per-condition timepoint-balanced trajectory split:")
+    train_idx, val_idx, test_idx = split_balanced_by_timepoints(
+        de_lengths, split_src,
+        train_percent=train_percent, test_percent=test_percent,
+        seed=seed, log=log,
+    )
+    log.info(
+        f"split sizes (trajectories): train={len(train_idx)}, "
+        f"val={len(val_idx)}, test={len(test_idx)}"
+    )
+
+    # ---- Stride within each split → uniform sub-sequences ----------------
+    train_seq = sliding_windows(
+        de_padded[train_idx], de_lengths[train_idx], seq_length, seq_spacing,
+    )
+    val_seq = sliding_windows(
+        de_padded[val_idx], de_lengths[val_idx], seq_length, seq_spacing,
+    )
+    test_seq = sliding_windows(
+        de_padded[test_idx], de_lengths[test_idx], seq_length, seq_spacing,
+    )
+    log.info(
+        f"sub-sequences (seq_length={seq_length}, seq_spacing={seq_spacing}): "
+        f"train={train_seq.shape[0]}, val={val_seq.shape[0]}, test={test_seq.shape[0]}"
+    )
+    if min(train_seq.shape[0], val_seq.shape[0], test_seq.shape[0]) == 0:
+        raise ValueError(
+            f"empty split after striding (train={train_seq.shape[0]}, "
+            f"val={val_seq.shape[0]}, test={test_seq.shape[0]}); seq_length="
+            f"{seq_length} may be too long relative to per-trajectory "
+            f"de_lengths {de_lengths.tolist()}"
+        )
+
+    # Defensive: sliding_windows respects lengths so no NaN should leak in.
+    for name, seq in [("train", train_seq), ("val", val_seq), ("test", test_seq)]:
+        if torch.isnan(seq).any():
+            raise RuntimeError(
+                f"NaN detected in {name} sub-sequences after sliding_windows; "
+                f"this indicates a bug in delay_embed_ragged / sliding_windows."
+            )
+
+    # ---- Per-window condition (tile parent's condition by # windows) ------
+    train_cond_per_seq = val_cond_per_seq = test_cond_per_seq = None
+    if cond_arr is not None:
+        train_cond_per_seq = _tile_condition_per_window(
+            cond_arr[train_idx], de_lengths[train_idx], seq_length, seq_spacing,
+        )
+        val_cond_per_seq = _tile_condition_per_window(
+            cond_arr[val_idx], de_lengths[val_idx], seq_length, seq_spacing,
+        )
+        test_cond_per_seq = _tile_condition_per_window(
+            cond_arr[test_idx], de_lengths[test_idx], seq_length, seq_spacing,
+        )
+        # Sanity: per-window cond count must match sub-sequence count
+        for name, seq, cond_seq in [
+            ("train", train_seq, train_cond_per_seq),
+            ("val", val_seq, val_cond_per_seq),
+            ("test", test_seq, test_cond_per_seq),
+        ]:
+            if cond_seq.shape[0] != seq.shape[0]:
+                raise RuntimeError(
+                    f"{name} condition tile count {cond_seq.shape[0]} != "
+                    f"sub-sequence count {seq.shape[0]} (bug in tiling)"
+                )
+
+    train_cond_t = (
+        torch.as_tensor(train_cond_per_seq, dtype=torch.float32)
+        if train_cond_per_seq is not None else None
+    )
+    val_cond_t = (
+        torch.as_tensor(val_cond_per_seq, dtype=torch.float32)
+        if val_cond_per_seq is not None else None
+    )
+    test_cond_t = (
+        torch.as_tensor(test_cond_per_seq, dtype=torch.float32)
+        if test_cond_per_seq is not None else None
+    )
+
+    train_dataset = TimeSeriesDataset(train_seq, condition=train_cond_t)
+    val_dataset = TimeSeriesDataset(val_seq, condition=val_cond_t)
+    test_dataset = TimeSeriesDataset(test_seq, condition=test_cond_t)
+
+    # ---- Build trajs dict (delay-embedded NaN-padded full trajs per split)
+    trajs: dict = {
+        "train_trajs": train_dataset,
+        "val_trajs": val_dataset,
+        "test_trajs": test_dataset,
+        "train_inds": train_idx,
+        "val_inds": val_idx,
+        "test_inds": test_idx,
+        "train_trajs_full": TimeSeriesDataset(de_padded[train_idx]),
+        "val_trajs_full": TimeSeriesDataset(de_padded[val_idx]),
+        "test_trajs_full": TimeSeriesDataset(de_padded[test_idx]),
+        "train_trajs_full_lengths": de_lengths[train_idx],
+        "val_trajs_full_lengths": de_lengths[val_idx],
+        "test_trajs_full_lengths": de_lengths[test_idx],
+    }
+    if cond_arr is not None:
+        trajs["train_condition"] = cond_arr[train_idx]
+        trajs["val_condition"] = cond_arr[val_idx]
+        trajs["test_condition"] = cond_arr[test_idx]
+
+    # ---- Generalized variance (loss-scaling denom) ------------------------
+    n_recent = OmegaConf.select(cfg, "model.n_recent_dims", default=None)
+    if n_recent is not None and n_recent < train_seq.shape[-1]:
+        gv_input = train_seq[..., :n_recent]
+    else:
+        gv_input = train_seq
+    gv = compute_generalized_variance(gv_input)
+    OmegaConf.update(cfg, "data.postprocessing.generalized_variance", gv, force_add=True)
+    log.info(f"Generalized variance det(Cov)^(1/D) = {gv:.6g}")
+
+    # ---- DataLoaders -----------------------------------------------------
+    collate_fn = collate_with_optional_condition if cond_arr is not None else None
+    num_workers = 2
+    persistent_workers = True
+    pin_memory = True
+    train_dl = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+    )
+    val_seed = int(cfg.data.flow.random_state)
+    val_perm = torch.randperm(
+        len(val_dataset), generator=torch.Generator().manual_seed(val_seed)
+    )
+    val_dataset_perm = Subset(val_dataset, val_perm.tolist())
+    val_dl = DataLoader(
+        val_dataset_perm,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+    )
+    test_dl = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
+        collate_fn=collate_fn,
+    )
+
+    # ---- Autodim PCA / FNN ------------------------------------------------
+    autodim_result = None
+    if n_target_dims is None:
+        autodim_result = infer_n_target_dims(cfg, train_seq)
+        if autodim_result is not None:
+            cfg.model.n_target_dims = autodim_result.n_target_dims_total
+            cfg.model.params.input_dim = autodim_result.n_target_dims_total
+            cfg.model.params.output_dim = autodim_result.n_target_dims_total ** 2
+            if autodim_result.is_direct_sum:
+                cfg.model.encoder.n_target_dims_per_block = list(
+                    autodim_result.n_target_dims_per_block
+                )
+
+    # ---- Run name --------------------------------------------------------
+    if wandb_run_name is not None:
+        name = wandb_run_name
+    else:
+        try:
+            from .training.logging import make_run_info
+            name, derived_project = make_run_info(cfg)
+            if not cfg.get("wandb_project"):
+                cfg.wandb_project = derived_project
+        except Exception as e:
+            log.warning(f"make_run_info failed: {e}; using fallback name")
+            name = "train_from_arrays"
+
+    # ---- Build model ------------------------------------------------------
+    lit_model = make_model(
+        cfg, dt, eq=None,
+        mu=mu, sigma=sigma,
+        noise_scale_factor=nsf,
+        generalized_variance=gv,
+        verbose=verbose,
+    )
+
+    if init_from_pretrained is not None:
+        _load_pretrained_into_litmodel(
+            lit_model, init_from_pretrained, strict=init_from_pretrained_strict,
+        )
+
+    log_training_info(train_dl, trajs, lit_model, log=log)
+
+    # ---- Train -----------------------------------------------------------
+    trainer = train_model(cfg, lit_model, train_dl, val_dl, name=name)
+
+    best_ckpt = None
+    for cb in getattr(trainer, "callbacks", []):
+        if hasattr(cb, "best_model_path") and cb.best_model_path:
+            best_ckpt = cb.best_model_path
+            break
+
+    result = TrainingResult(
+        trainer=trainer,
+        cfg=cfg,
+        trajs=trajs,
+        train_dataloader=train_dl,
+        val_dataloader=val_dl,
+        test_dataloader=test_dl,
+        best_ckpt_path=best_ckpt,
+        mu=mu,
+        sigma=sigma,
+        autodim_result=autodim_result,
+    )
+    return lit_model, result
+
+
+def _normalize_ragged(
+    padded: torch.Tensor,
+    lengths: torch.Tensor,
+    source_id: np.ndarray,
+    *,
+    normalize: bool,
+    obs_noise: float,
+    scale_noise: bool = True,
+) -> tuple[torch.Tensor, list[float], list[float], list[float], list[int]]:
+    """NaN-aware per-source obs-noise + z-score on a ragged padded tensor.
+
+    For each unique value in ``source_id``, computes
+    ``noise_scale_factor`` and ``(mu, sigma)`` from VALID samples only
+    (i.e. ``padded[i, :lengths[i]]`` for trajectories ``i`` in that
+    source), adds Gaussian noise of std ``obs_noise * nsf`` to the
+    valid samples (when ``obs_noise > 0``), then z-score normalizes.
+    NaN-padded entries stay NaN.
+
+    To get global (single-source) behavior, pass ``source_id`` as a
+    constant array; the function computes a single ``(mu, sigma, nsf)``.
+    """
+    src_arr = np.asarray(source_id)
+    out = padded.clone().to(torch.float32)
+    per_mu: list[float] = []
+    per_sigma: list[float] = []
+    per_nsf: list[float] = []
+    src_ids: list[int] = []
+    for s in np.unique(src_arr):
+        traj_idxs = np.where(src_arr == s)[0]
+        # Concatenate all valid samples for this source for stat computation.
+        valid_chunks = []
+        for i in traj_idxs:
+            L_i = int(lengths[i].item())
+            if L_i > 0:
+                valid_chunks.append(padded[i, :L_i].to(torch.float32))
+        if not valid_chunks:
+            raise ValueError(
+                f"_normalize_ragged: source {s!r} has zero valid samples"
+            )
+        valid_concat = torch.cat(valid_chunks, dim=0)  # (T_valid, D)
+
+        if scale_noise and obs_noise > 0:
+            nsf = float(
+                torch.linalg.norm(valid_concat, dim=-1).mean().item()
+                / np.sqrt(valid_concat.shape[-1])
+            )
+        else:
+            nsf = 1.0
+
+        # Optionally inject noise into each trajectory's valid region.
+        # Recompute mu/sigma POST-noise (matches postprocess_data
+        # convention which normalizes after adding noise).
+        if obs_noise > 0:
+            std = obs_noise * nsf
+            for i in traj_idxs:
+                L_i = int(lengths[i].item())
+                if L_i > 0:
+                    out[i, :L_i] = padded[i, :L_i].to(torch.float32) + (
+                        torch.randn(L_i, padded.shape[-1], dtype=torch.float32) * std
+                    )
+            # Recollect post-noise valid samples for stats.
+            valid_chunks = [out[i, :int(lengths[i].item())] for i in traj_idxs]
+            valid_concat = torch.cat(valid_chunks, dim=0)
+
+        if normalize:
+            mu = float(valid_concat.mean().item())
+            sigma = float(valid_concat.std().item())
+        else:
+            mu = 0.0
+            sigma = 1.0
+
+        # Apply z-score to valid samples only.
+        if normalize:
+            for i in traj_idxs:
+                L_i = int(lengths[i].item())
+                if L_i > 0:
+                    if obs_noise > 0:
+                        # noise already in `out`
+                        out[i, :L_i] = (out[i, :L_i] - mu) / sigma
+                    else:
+                        out[i, :L_i] = (padded[i, :L_i].to(torch.float32) - mu) / sigma
+
+        per_mu.append(mu)
+        per_sigma.append(sigma)
+        per_nsf.append(nsf)
+        src_ids.append(int(s))
+
+    return out, per_mu, per_sigma, per_nsf, src_ids
+
+
+def _tile_condition_per_window(
+    cond_for_split: np.ndarray,
+    de_lengths_for_split: torch.Tensor,
+    seq_length: int,
+    seq_spacing: int,
+) -> np.ndarray:
+    """For each parent trajectory in a split, repeat its condition vector
+    once per sub-window that :func:`sliding_windows` will emit for that
+    trajectory. Used to align the per-window conditions in the
+    TimeSeriesDataset with the windows that ``sliding_windows`` produces
+    in trajectory-then-window order.
+
+    Parameters
+    ----------
+    cond_for_split : np.ndarray of shape ``(N_split, condition_dim)``
+        Per-parent-trajectory condition vectors for one split (already
+        indexed by ``train_idx`` / ``val_idx`` / ``test_idx``).
+    de_lengths_for_split : torch.Tensor of shape ``(N_split,)``
+        Per-parent-trajectory delay-embedded valid lengths for one
+        split.
+    seq_length, seq_spacing : int
+        Same values passed to :func:`sliding_windows`.
+
+    Returns
+    -------
+    np.ndarray of shape ``(K_total_windows, condition_dim)``
+        Tiled per-window conditions in the same order
+        :func:`sliding_windows` emits them.
+    """
+    cond = np.asarray(cond_for_split)
+    if cond.ndim == 1:
+        cond = cond.reshape(-1, 1)
+    if isinstance(de_lengths_for_split, torch.Tensor):
+        de_lengths_arr = de_lengths_for_split.detach().cpu().numpy().astype(np.int64)
+    else:
+        de_lengths_arr = np.asarray(de_lengths_for_split, dtype=np.int64)
+    if cond.shape[0] != de_lengths_arr.shape[0]:
+        raise ValueError(
+            f"_tile_condition_per_window: cond shape {cond.shape} disagrees "
+            f"with de_lengths shape {de_lengths_arr.shape}"
+        )
+    pieces = []
+    for i, L_i in enumerate(de_lengths_arr):
+        if L_i < seq_length:
+            continue
+        n_windows = (int(L_i) - seq_length) // seq_spacing + 1
+        if n_windows > 0:
+            pieces.append(np.repeat(cond[i:i + 1], n_windows, axis=0))
+    if not pieces:
+        return np.zeros((0, cond.shape[1]), dtype=cond.dtype)
+    return np.concatenate(pieces, axis=0)
 
 
 def _compose_cfg(
