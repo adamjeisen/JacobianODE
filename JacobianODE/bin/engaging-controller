@@ -1214,7 +1214,17 @@ def _maybe_dispatch_chain(group: str) -> None:
 def reap_completed_analyses(inflight: dict) -> int:
     n_reaped = 0
     for group in list(inflight.keys()):
+        # Skip the mindcontrol-side bookkeeping keys — those have a
+        # different shape (no slurm_job_id) and are reaped by
+        # reap_completed_mc_reports, not here.
+        if group.startswith("mc_"):
+            continue
         info = inflight[group]
+        if not isinstance(info, dict) or "slurm_job_id" not in info:
+            # Defensive: any other top-level key that isn't a jacobian
+            # sweep entry (e.g. legacy state, future additions) gets
+            # skipped instead of crashing.
+            continue
         job_id = info["slurm_job_id"]
         if _slurm_job_alive(job_id):
             continue
