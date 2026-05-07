@@ -1303,6 +1303,12 @@ def _mc_array_state(array_id: str) -> dict:
         terminal state.
       * ``n_total`` (int): total tasks visible.
       * ``n_completed`` (int): tasks in COMPLETED state.
+      * ``n_succeeded`` (int): tasks in COMPLETED or TIMEOUT — TIMEOUT
+        means the cell made progress + hit the SLURM walltime cap, which
+        is a normal exit for our long training runs (early stopping
+        often doesn't fire within the cap). The user has explicitly
+        asked that TIMEOUT count as a successful "done" state for
+        report-dispatch purposes.
       * ``n_running`` (int): tasks in PENDING / RUNNING / REQUEUED.
       * ``counts`` (dict[str, int]): full breakdown.
       * ``summary`` (str): "3xCOMPLETED 1xFAILED" for logging.
@@ -1318,8 +1324,10 @@ def _mc_array_state(array_id: str) -> dict:
             if s:
                 counts[s] = counts.get(s, 0) + 1
     NON_TERMINAL = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED"}
+    SUCCESS_STATES = {"COMPLETED", "TIMEOUT"}
     n_total = sum(counts.values())
     n_completed = counts.get("COMPLETED", 0)
+    n_succeeded = sum(counts.get(s, 0) for s in SUCCESS_STATES)
     n_running = sum(counts.get(s, 0) for s in NON_TERMINAL)
     all_terminal = n_total > 0 and n_running == 0
     summary = (
@@ -1330,6 +1338,7 @@ def _mc_array_state(array_id: str) -> dict:
         "all_terminal": all_terminal,
         "n_total": n_total,
         "n_completed": n_completed,
+        "n_succeeded": n_succeeded,
         "n_running": n_running,
         "counts": counts,
         "summary": summary,
@@ -1384,12 +1393,13 @@ def dispatch_pending_mc_reports(inflight: dict) -> int:
     hasn't been dispatched yet, submit ``mc-report submit`` and track in
     ``inflight['mc_reports']``.
 
-    Strict gate: we require ``n_completed == n_total`` before
-    dispatching. If the array is terminal but partially failed, we park
-    it in ``inflight['mc_reports_skipped']`` so the user can decide
-    whether to ``mc-report submit --sweep-dir <name>`` manually with
-    whatever data did make it. This mirrors the JacobianODE-side
-    convention that an analysis only runs on a clean done-sentinel.
+    Gate: dispatch when every task is in {COMPLETED, TIMEOUT}.
+    TIMEOUT counts as a successful walltime exit — the cell made
+    progress + hit the SLURM cap (a normal outcome for these long
+    training runs). FAILED / CANCELLED / OUT_OF_MEMORY / NODE_FAIL etc.
+    still skip and get parked in ``inflight['mc_reports_skipped']`` so
+    the user can decide whether to manually dispatch on the partial
+    data.
     """
     inflight.setdefault("mc_reports", {})
     inflight.setdefault("mc_reports_done", [])
@@ -1409,22 +1419,24 @@ def dispatch_pending_mc_reports(inflight: dict) -> int:
         st = _mc_array_state(array_id)
         if not st["all_terminal"]:
             continue
-        if st["n_completed"] != st["n_total"]:
+        if st["n_succeeded"] != st["n_total"]:
             log(f"[mc-report {sweep_name}] array {array_id} terminal but "
-                f"only {st['n_completed']}/{st['n_total']} COMPLETED "
-                f"({st['summary']}) — skipping auto-dispatch. Run "
-                f"mc-report manually if a partial report is wanted.")
+                f"only {st['n_succeeded']}/{st['n_total']} succeeded "
+                f"(COMPLETED+TIMEOUT) — skipping auto-dispatch. "
+                f"counts={st['summary']}. Run mc-report manually if a "
+                f"partial report is wanted.")
             inflight["mc_reports_skipped"][sweep_name] = {
                 "array_id": array_id,
                 "array_summary": st["summary"],
                 "n_completed": st["n_completed"],
+                "n_succeeded": st["n_succeeded"],
                 "n_total": st["n_total"],
                 "skipped_at": utc_iso(),
             }
             continue
         log(f"[mc-report {sweep_name}] array {array_id} all "
-            f"{st['n_total']}/{st['n_total']} COMPLETED — dispatching "
-            f"mc-report")
+            f"{st['n_succeeded']}/{st['n_total']} COMPLETED+TIMEOUT — "
+            f"dispatching mc-report (counts={st['summary']})")
         try:
             report_job_id = _submit_mc_report_compute(sweep_name)
         except (subprocess.CalledProcessError, RuntimeError) as e:
@@ -1439,6 +1451,7 @@ def dispatch_pending_mc_reports(inflight: dict) -> int:
             "array_id": array_id,
             "array_summary": st["summary"],
             "n_completed": st["n_completed"],
+            "n_succeeded": st["n_succeeded"],
             "n_total": st["n_total"],
         }
         log(f"[mc-report {sweep_name}] submitted as {report_job_id}")
@@ -1691,7 +1704,10 @@ def update_status_overview(inflight: dict) -> bool:
         st = _mc_array_state(str(data["slurm_array_id"]))
         if not st["all_terminal"]:
             train_status = "active"
-        elif st["n_completed"] == st["n_total"]:
+        elif st["n_succeeded"] == st["n_total"]:
+            # All cells either finished cleanly or hit the walltime cap
+            # (TIMEOUT counts as a successful exit — the cell made
+            # progress, the SLURM cap just bounded compute).
             train_status = "completed"
         else:
             train_status = "incomplete"
@@ -1701,6 +1717,7 @@ def update_status_overview(inflight: dict) -> bool:
                 "array_id": data["slurm_array_id"],
                 "n_total": st["n_total"],
                 "n_completed": st["n_completed"],
+                "n_succeeded": st["n_succeeded"],
                 "n_running": st["n_running"],
                 "summary": st["summary"],
             },
