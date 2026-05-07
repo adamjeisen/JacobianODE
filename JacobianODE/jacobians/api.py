@@ -970,6 +970,54 @@ def _train_from_ragged_arrays_inner(
             f"({pca_fit.n_total_out / sum(p.n_in for p in pca_fit.per_area):.1%} of raw)"
         )
         padded_norm = apply_per_area_pca(padded_norm, lengths_t, pca_fit)
+
+        # ---- Restore arithmetic-mean unit variance after pre-PCA --------
+        # Per-area PCA concentrates total per-area variance (≈ n_in_area
+        # after the upstream global z-score) into the kept k_i dims. Mean
+        # per-dim variance after pre-PCA is therefore (n_in / k) × the
+        # input mean — for our LFP setup ~13×, which inflates the MSE
+        # recon floor from 0.01 (= 1 - second-stage threshold) to ~0.13.
+        # Restore arithmetic-mean E[Var[d,d]] = 1 with one global scalar
+        # per source (mirroring _normalize_ragged's convention) so the
+        # encoder sees unit-mean-variance input regardless of the pre-PCA
+        # threshold. Saves the scale into cfg for inference round-tripping.
+        sigma_post_pca_per_source: list[float] = []
+        if normalize_per_condition:
+            src_ids_iter = src_ids_for_norm
+            split_src_arr = np.asarray(split_src)
+        else:
+            src_ids_iter = [0]
+            split_src_arr = np.zeros(padded_norm.shape[0], dtype=np.int64)
+        for s in src_ids_iter:
+            traj_idxs = np.where(split_src_arr == s)[0]
+            valid_chunks = []
+            for i in traj_idxs:
+                L_i = int(lengths_t[i].item())
+                if L_i > 0:
+                    valid_chunks.append(padded_norm[i, :L_i])
+            if not valid_chunks:
+                sigma_post_pca_per_source.append(1.0)
+                continue
+            valid_concat = torch.cat(valid_chunks, dim=0)   # (sum_L, n_total_out)
+            sigma_s = float(valid_concat.std().item())      # global scalar per source
+            sigma_post_pca_per_source.append(sigma_s)
+            for i in traj_idxs:
+                L_i = int(lengths_t[i].item())
+                if L_i > 0:
+                    padded_norm[i, :L_i] = padded_norm[i, :L_i] / sigma_s
+        log.info(
+            f"  post-pre-PCA arith-mean rescale: "
+            f"sigma_per_source={sigma_post_pca_per_source}"
+        )
+        OmegaConf.update(
+            cfg, "data.postprocessing.sigma_post_pca_per_source",
+            list(sigma_post_pca_per_source), force_add=True,
+        )
+        OmegaConf.update(
+            cfg, "data.postprocessing.sigma_post_pca",
+            float(np.mean(sigma_post_pca_per_source)), force_add=True,
+        )
+
         # Local n_features (raw channel count → PCA component count).
         n_features = pca_fit.n_total_out
         area_indices = pca_fit.area_indices_out
