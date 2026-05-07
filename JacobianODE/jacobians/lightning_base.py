@@ -1004,8 +1004,11 @@ class LitBase(L.LightningModule):
             self.log(f"train jac norm", jac_norm, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
         self.log(f"train l1 norm", l1_loss, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
 
-        if self.teacher_forcing_annealing:
-            self.log(f"alpha teacher forcing", self.alpha_teacher_forcing, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
+        # Log α regardless of teacher_forcing_annealing — the value can be
+        # held constant or steered externally (TeacherForcingLR reads it to
+        # gate LR), and seeing a flat curve at the initial value is the
+        # right diagnostic to confirm "no annealing happening".
+        self.log(f"alpha teacher forcing", self.alpha_teacher_forcing, on_step=on_step, on_epoch=on_epoch, sync_dist=sync_dist)
 
         # Log Jacobian metrics
         if self.eq is not None and jacs_pred is not None:

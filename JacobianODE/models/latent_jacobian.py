@@ -1824,8 +1824,11 @@ class LitLatentJacobianODE(LitBase):
         if kl_dyn_loss is not None:
             self.log("train/kl_dyn_loss", kl_dyn_loss, **log_kwargs)
 
-        if self.teacher_forcing_annealing:
-            self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs)
+        # Log α even when teacher_forcing_annealing=False — the value may
+        # still be steered by an external scheduler (e.g. TeacherForcingLR
+        # reads it to gate LR), and a flat curve at the initial value is
+        # the right diagnostic to confirm "no annealing happening".
+        self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs)
 
         self._log_lyapunov_comparison(batch, "train", c=c, **log_kwargs)
         self._log_latent_utilization(batch, "train", c=c, **log_kwargs)
