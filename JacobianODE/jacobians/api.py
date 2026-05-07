@@ -120,6 +120,7 @@ def train_from_arrays(
     filter_data: bool = False,
     low_pass: Optional[float] = None,
     high_pass: Optional[float] = None,
+    post_filter_downsample: int = 1,
     pre_pca_per_area: bool = False,
     pre_pca_var_threshold: float = 0.99,
 
@@ -389,6 +390,7 @@ def train_from_arrays(
             obs_noise=obs_noise, normalize=normalize,
             normalize_per_condition=normalize_per_condition,
             filter_data=filter_data, low_pass=low_pass, high_pass=high_pass,
+            post_filter_downsample=post_filter_downsample,
             pre_pca_per_area=pre_pca_per_area,
             pre_pca_var_threshold=pre_pca_var_threshold,
             encoder=encoder, encoder_kwargs=encoder_kwargs or {},
@@ -436,6 +438,7 @@ def _train_from_arrays_inner(
     seq_length, seq_spacing, train_percent, test_percent, split_by,
     obs_noise, normalize, normalize_per_condition,
     filter_data, low_pass, high_pass,
+    post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
@@ -529,6 +532,7 @@ def _train_from_arrays_inner(
         obs_noise=obs_noise, normalize=normalize,
         normalize_per_condition=normalize_per_condition,
         filter_data=filter_data, low_pass=low_pass, high_pass=high_pass,
+        post_filter_downsample=post_filter_downsample,
         pre_pca_per_area=pre_pca_per_area,
         pre_pca_var_threshold=pre_pca_var_threshold,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
@@ -710,6 +714,7 @@ def _train_from_ragged_arrays_inner(
     seq_length, seq_spacing, train_percent, test_percent, split_by,
     obs_noise, normalize, normalize_per_condition,
     filter_data, low_pass, high_pass,
+    post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
@@ -845,6 +850,7 @@ def _train_from_ragged_arrays_inner(
         obs_noise=obs_noise, normalize=normalize,
         normalize_per_condition=normalize_per_condition,
         filter_data=filter_data, low_pass=low_pass, high_pass=high_pass,
+        post_filter_downsample=post_filter_downsample,
         pre_pca_per_area=pre_pca_per_area,
         pre_pca_var_threshold=pre_pca_var_threshold,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
@@ -918,6 +924,41 @@ def _train_from_ragged_arrays_inner(
             OmegaConf.update(cfg, "data.postprocessing.low_pass", float(low_pass), force_add=True)
         if high_pass is not None:
             OmegaConf.update(cfg, "data.postprocessing.high_pass", float(high_pass), force_add=True)
+
+    # ---- Optional stride decimation AFTER filter, BEFORE normalize -------
+    # Pairs with filter_data: filter the high-frequency content out, then
+    # decimate by stride. Caller is responsible for picking a low_pass
+    # below the new Nyquist (=fs/(2 × post_filter_downsample)) to avoid
+    # aliasing — we don't auto-lower the cutoff.
+    #
+    # Updates the local dt + lengths_t so downstream sees the lower
+    # effective rate. cfg.data.postprocessing.post_filter_downsample is
+    # saved for inference round-tripping.
+    if post_filter_downsample is not None and post_filter_downsample > 1:
+        if not filter_data:
+            log.warning(
+                f"post_filter_downsample={post_filter_downsample} but "
+                f"filter_data=False — pure stride decimation will alias."
+            )
+        log.info(
+            f"post-filter decimation by {post_filter_downsample} "
+            f"(stride sampling — assumes filtering already band-limited)..."
+        )
+        # Stride along time axis. ceil(L / N) = (L + N - 1) // N.
+        padded = padded[:, ::post_filter_downsample, :].contiguous()
+        new_lengths = (lengths_t + post_filter_downsample - 1) // post_filter_downsample
+        lengths_t = new_lengths.to(torch.long)
+        new_dt = float(dt) * post_filter_downsample
+        log.info(
+            f"  effective dt = {new_dt:.6g} s (= {1/new_dt:.0f} Hz), "
+            f"new t_max = {padded.shape[1]}, "
+            f"valid lengths range [{int(lengths_t.min())}, {int(lengths_t.max())}]"
+        )
+        dt = new_dt
+        OmegaConf.update(
+            cfg, "data.postprocessing.post_filter_downsample",
+            int(post_filter_downsample), force_add=True,
+        )
 
     # ---- NaN-aware per-source noise + normalize on (filtered) padded -----
     padded_norm, mu_per_source, sigma_per_source, nsf_per_source, src_ids_for_norm = (
@@ -1440,6 +1481,7 @@ def _compose_cfg(
     seq_length, seq_spacing, train_percent, test_percent, split_by,
     obs_noise, normalize, normalize_per_condition,
     filter_data, low_pass, high_pass,
+    post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
     encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
