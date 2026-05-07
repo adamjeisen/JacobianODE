@@ -1012,6 +1012,25 @@ class LitLatentJacobianODE(LitBase):
                 z_pred_flat = z_pred_crop.reshape(z_pred_crop.shape[0], -1)
                 z_true_flat = z_true_crop.reshape(z_true_crop.shape[0], -1)
                 metric_vals['latent_pred_r2'] = r2_score(z_true_flat, z_pred_flat)
+                # Latent-space MASE components — for "dynamics-only" MASE
+                # that factors out the obs-space reconstruction floor. The
+                # numerator is MAE between predicted and encoded-true latent
+                # in dyn subspace; the persistence baseline is the MAE of
+                # the encoded-true latent's own time-difference (i.e. how
+                # much z moves per step on its own). Ratio-of-means
+                # aggregation across batches is done by the val-epoch hook,
+                # so we store the raw MAE components here.
+                metric_vals['latent_model_mae'] = torch.mean(
+                    torch.abs(z_pred_crop - z_true_crop)
+                )
+                if z_true_crop.shape[-2] > 1:
+                    metric_vals['latent_persistence_mae'] = torch.mean(
+                        torch.abs(z_true_crop[..., 1:, :] - z_true_crop[..., :-1, :])
+                    )
+                else:
+                    metric_vals['latent_persistence_mae'] = torch.tensor(
+                        0.0, device=z_true_crop.device
+                    )
 
         if return_decoded:
             return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
@@ -1641,6 +1660,20 @@ class LitLatentJacobianODE(LitBase):
         self._val_one_step_persistence_maes.append(
             one_step_ret['metric_vals']['persistence_mae'].float().item()
         )
+        # Latent-space MASE components — "dynamics-only" MASE that
+        # factors out the obs-space reconstruction floor. See trajectory
+        # _model_step where these are computed; the val-epoch hook does
+        # ratio-of-means to produce val/one_step_mase_latent.
+        if not hasattr(self, '_val_one_step_latent_model_maes'):
+            self._val_one_step_latent_model_maes = []
+            self._val_one_step_latent_persistence_maes = []
+        if 'latent_model_mae' in one_step_ret['metric_vals']:
+            self._val_one_step_latent_model_maes.append(
+                one_step_ret['metric_vals']['latent_model_mae'].float().item()
+            )
+            self._val_one_step_latent_persistence_maes.append(
+                one_step_ret['metric_vals']['latent_persistence_mae'].float().item()
+            )
 
         # Fast eigenvalue fraction (C3 diagnostic) — first val batch per
         # epoch only. torch.linalg.eigvals on general matrices can spike

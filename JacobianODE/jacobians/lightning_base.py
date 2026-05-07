@@ -954,6 +954,19 @@ class LitBase(L.LightningModule):
             self._val_one_step_model_maes = []
             self._val_one_step_persistence_maes = []
 
+        # Latent-space one-step MASE — same ratio-of-means but in dyn
+        # subspace, so reconstruction floor doesn't enter either side
+        # of the ratio. Pure dynamics quality. Logged as
+        # val/one_step_mase_latent next to val/one_step_mase.
+        if (hasattr(self, '_val_one_step_latent_model_maes')
+                and self._val_one_step_latent_model_maes):
+            lat_avg_model_mae = sum(self._val_one_step_latent_model_maes) / len(self._val_one_step_latent_model_maes)
+            lat_avg_persist_mae = sum(self._val_one_step_latent_persistence_maes) / len(self._val_one_step_latent_persistence_maes)
+            one_step_mase_latent = lat_avg_model_mae / max(lat_avg_persist_mae, 1e-8)
+            self.log("val/one_step_mase_latent", one_step_mase_latent, sync_dist=True)
+            self._val_one_step_latent_model_maes = []
+            self._val_one_step_latent_persistence_maes = []
+
         # Fast eigenvalue fraction (C3 diagnostic)
         if hasattr(self, '_val_eig_too_fast') and self._val_eig_total:
             total_too_fast = sum(self._val_eig_too_fast)
