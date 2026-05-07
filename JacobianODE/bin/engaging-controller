@@ -1295,29 +1295,45 @@ def _list_claimed_mc_instructions() -> list[tuple[Path, dict]]:
     return out
 
 
-def _mc_array_terminal(array_id: str) -> tuple[bool, str]:
-    """Check whether all tasks in a SLURM array are in a terminal state.
+def _mc_array_state(array_id: str) -> dict:
+    """Inspect a SLURM array's tasks via sacct.
 
-    Returns (all_terminal, summary_string). summary_string is a brief
-    condensation of state counts ("3xCOMPLETED 1xFAILED") for logging.
+    Returns a dict with:
+      * ``all_terminal`` (bool): True iff every visible task is in a
+        terminal state.
+      * ``n_total`` (int): total tasks visible.
+      * ``n_completed`` (int): tasks in COMPLETED state.
+      * ``n_running`` (int): tasks in PENDING / RUNNING / REQUEUED.
+      * ``counts`` (dict[str, int]): full breakdown.
+      * ``summary`` (str): "3xCOMPLETED 1xFAILED" for logging.
     """
     out = run(
         ["sacct", "-j", str(array_id), "-n", "-X", "--format=State", "-P"],
         check=False,
     ).stdout.strip()
-    if not out:
-        return False, "<no sacct rows>"
-    states = [line.split()[0].rstrip("+") if line else "" for line in out.splitlines()]
-    states = [s for s in states if s]   # drop blanks
-    if not states:
-        return False, "<empty>"
-    NON_TERMINAL = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED"}
-    all_terminal = all(s not in NON_TERMINAL for s in states)
     counts: dict[str, int] = {}
-    for s in states:
-        counts[s] = counts.get(s, 0) + 1
-    summary = " ".join(f"{n}x{s}" for s, n in sorted(counts.items()))
-    return all_terminal, summary
+    if out:
+        for line in out.splitlines():
+            s = line.split()[0].rstrip("+") if line else ""
+            if s:
+                counts[s] = counts.get(s, 0) + 1
+    NON_TERMINAL = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED"}
+    n_total = sum(counts.values())
+    n_completed = counts.get("COMPLETED", 0)
+    n_running = sum(counts.get(s, 0) for s in NON_TERMINAL)
+    all_terminal = n_total > 0 and n_running == 0
+    summary = (
+        " ".join(f"{n}x{s}" for s, n in sorted(counts.items()))
+        if counts else "<no sacct rows>"
+    )
+    return {
+        "all_terminal": all_terminal,
+        "n_total": n_total,
+        "n_completed": n_completed,
+        "n_running": n_running,
+        "counts": counts,
+        "summary": summary,
+    }
 
 
 def _submit_mc_report_compute(sweep_dir_name: str) -> str:
@@ -1363,12 +1379,21 @@ def _publish_mc_report(sweep_dir_name: str) -> bool:
 
 
 def dispatch_pending_mc_reports(inflight: dict) -> int:
-    """For each claimed mc instruction whose SLURM array is fully terminal
-    and whose report hasn't been dispatched yet, submit `mc-report submit`
-    and track in `inflight['mc_reports']`.
+    """For each claimed mc instruction whose SLURM array tasks have ALL
+    COMPLETED (no FAILED / CANCELLED / TIMEOUT / OOM), and whose report
+    hasn't been dispatched yet, submit ``mc-report submit`` and track in
+    ``inflight['mc_reports']``.
+
+    Strict gate: we require ``n_completed == n_total`` before
+    dispatching. If the array is terminal but partially failed, we park
+    it in ``inflight['mc_reports_skipped']`` so the user can decide
+    whether to ``mc-report submit --sweep-dir <name>`` manually with
+    whatever data did make it. This mirrors the JacobianODE-side
+    convention that an analysis only runs on a clean done-sentinel.
     """
     inflight.setdefault("mc_reports", {})
     inflight.setdefault("mc_reports_done", [])
+    inflight.setdefault("mc_reports_skipped", {})
     n_new = 0
     for path, data in _list_claimed_mc_instructions():
         sweep_name = data.get("wandb_group")
@@ -1378,18 +1403,33 @@ def dispatch_pending_mc_reports(inflight: dict) -> int:
             continue
         if sweep_name in inflight["mc_reports_done"]:
             continue
-        array_id = str(data["slurm_array_id"])
-        all_term, summary = _mc_array_terminal(array_id)
-        if not all_term:
+        if sweep_name in inflight["mc_reports_skipped"]:
             continue
-        log(f"[mc-report {sweep_name}] array {array_id} terminal: {summary} "
-            f"— dispatching mc-report")
+        array_id = str(data["slurm_array_id"])
+        st = _mc_array_state(array_id)
+        if not st["all_terminal"]:
+            continue
+        if st["n_completed"] != st["n_total"]:
+            log(f"[mc-report {sweep_name}] array {array_id} terminal but "
+                f"only {st['n_completed']}/{st['n_total']} COMPLETED "
+                f"({st['summary']}) — skipping auto-dispatch. Run "
+                f"mc-report manually if a partial report is wanted.")
+            inflight["mc_reports_skipped"][sweep_name] = {
+                "array_id": array_id,
+                "array_summary": st["summary"],
+                "n_completed": st["n_completed"],
+                "n_total": st["n_total"],
+                "skipped_at": utc_iso(),
+            }
+            continue
+        log(f"[mc-report {sweep_name}] array {array_id} all "
+            f"{st['n_total']}/{st['n_total']} COMPLETED — dispatching "
+            f"mc-report")
         try:
             report_job_id = _submit_mc_report_compute(sweep_name)
         except (subprocess.CalledProcessError, RuntimeError) as e:
             err = (getattr(e, "stderr", None) or str(e))[-2000:]
             log(f"[mc-report {sweep_name}] submit FAILED: {err.strip()[:500]}")
-            # Park in done-list so we don't keep retrying every cycle.
             inflight["mc_reports_done"].append(sweep_name)
             continue
         inflight["mc_reports"][sweep_name] = {
@@ -1397,7 +1437,9 @@ def dispatch_pending_mc_reports(inflight: dict) -> int:
             "dispatched_at": utc_iso(),
             "instruction_path": str(path),
             "array_id": array_id,
-            "array_summary": summary,
+            "array_summary": st["summary"],
+            "n_completed": st["n_completed"],
+            "n_total": st["n_total"],
         }
         log(f"[mc-report {sweep_name}] submitted as {report_job_id}")
         n_new += 1
@@ -1633,6 +1675,59 @@ def update_status_overview(inflight: dict) -> bool:
 
     if pending_instructions:
         overview["pending_instructions"] = pending_instructions
+
+    # ---- Mindcontrol sweeps + reports ------------------------------------
+    # Parallel to the jacobian-side `sweeps` dict above. Each claimed
+    # mc instruction becomes one entry in `mc_sweeps`, keyed by
+    # wandb_group, with current SLURM array state + report state.
+    mc_sweeps: dict[str, dict] = {}
+    mc_reports = (inflight.get("mc_reports") or {})
+    mc_reports_done = set(inflight.get("mc_reports_done") or [])
+    mc_reports_skipped = (inflight.get("mc_reports_skipped") or {})
+    for path, data in _list_claimed_mc_instructions():
+        sweep_name = data.get("wandb_group")
+        if not sweep_name:
+            continue
+        st = _mc_array_state(str(data["slurm_array_id"]))
+        if not st["all_terminal"]:
+            train_status = "active"
+        elif st["n_completed"] == st["n_total"]:
+            train_status = "completed"
+        else:
+            train_status = "incomplete"
+        entry: dict = {
+            "status": train_status,
+            "training_slurm": {
+                "array_id": data["slurm_array_id"],
+                "n_total": st["n_total"],
+                "n_completed": st["n_completed"],
+                "n_running": st["n_running"],
+                "summary": st["summary"],
+            },
+            "n_cells": int(data.get("n_cells", -1)),
+            "wandb_project": data.get("wandb_project"),
+            "instruction_file": Path(path).name,
+        }
+        if sweep_name in mc_reports:
+            entry["report"] = {
+                "status": "running",
+                "report_job_id": mc_reports[sweep_name]["report_job_id"],
+                "dispatched_at": mc_reports[sweep_name]["dispatched_at"],
+            }
+        elif sweep_name in mc_reports_done:
+            entry["report"] = {"status": "done"}
+        elif sweep_name in mc_reports_skipped:
+            entry["report"] = {
+                "status": "skipped",
+                "reason": "training array not all-COMPLETED",
+                **{k: mc_reports_skipped[sweep_name][k]
+                   for k in ("n_completed", "n_total", "skipped_at")},
+            }
+        else:
+            entry["report"] = {"status": "pending" if train_status != "active" else "waiting_on_training"}
+        mc_sweeps[sweep_name] = entry
+    if mc_sweeps:
+        overview["mc_sweeps"] = mc_sweeps
 
     # Always write so the dashboard shows a fresh heartbeat timestamp.
     # The diff is just one line (last_updated) on no-change cycles.
