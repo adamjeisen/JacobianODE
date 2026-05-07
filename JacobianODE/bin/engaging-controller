@@ -1269,6 +1269,174 @@ def reap_completed_analyses(inflight: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
+# (6b) Auto-dispatch + reap of mc-report compute jobs for completed mc-sweeps
+# ---------------------------------------------------------------------------
+# mc-sweep cells don't write their own done sentinel — they just complete
+# the SLURM array task and exit. We detect "all cells finished" by polling
+# sacct on the array id from the claimed instruction.
+
+def _list_claimed_mc_instructions() -> list[tuple[Path, dict]]:
+    claimed_dir = REPO_DIR / "instructions" / "claimed"
+    if not claimed_dir.exists():
+        return []
+    out = []
+    for p in sorted(claimed_dir.iterdir()):
+        if p.suffix != ".yaml":
+            continue
+        try:
+            data = _read_yaml(p)
+        except Exception:
+            continue
+        if data.get("kind") != "mindcontrol":
+            continue
+        if not data.get("slurm_array_id"):
+            continue
+        out.append((p, data))
+    return out
+
+
+def _mc_array_terminal(array_id: str) -> tuple[bool, str]:
+    """Check whether all tasks in a SLURM array are in a terminal state.
+
+    Returns (all_terminal, summary_string). summary_string is a brief
+    condensation of state counts ("3xCOMPLETED 1xFAILED") for logging.
+    """
+    out = run(
+        ["sacct", "-j", str(array_id), "-n", "-X", "--format=State", "-P"],
+        check=False,
+    ).stdout.strip()
+    if not out:
+        return False, "<no sacct rows>"
+    states = [line.split()[0].rstrip("+") if line else "" for line in out.splitlines()]
+    states = [s for s in states if s]   # drop blanks
+    if not states:
+        return False, "<empty>"
+    NON_TERMINAL = {"PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED"}
+    all_terminal = all(s not in NON_TERMINAL for s in states)
+    counts: dict[str, int] = {}
+    for s in states:
+        counts[s] = counts.get(s, 0) + 1
+    summary = " ".join(f"{n}x{s}" for s, n in sorted(counts.items()))
+    return all_terminal, summary
+
+
+def _submit_mc_report_compute(sweep_dir_name: str) -> str:
+    """Submit `mc-report submit --sweep-dir <name>` (mc_report.py allocates
+    the actual sbatch). Returns the report compute job id (the sbatch id
+    that mc_report just created).
+    """
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "mindcontrol.cli.mc_report", "submit",
+        "--sweep-dir", sweep_dir_name,
+    ]
+    out = run(cmd, cwd=MC_REPO, check=True).stdout
+    # mc_report.py prints "submitted: <job_id>  log -> ..." on success
+    job_id = ""
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if line.startswith("submitted:"):
+            tail = line.split(":", 1)[1].strip()
+            job_id = tail.split()[0]
+            break
+    if not job_id:
+        raise RuntimeError(
+            f"mc-report submit returned no job id (stdout={out!r})"
+        )
+    return job_id
+
+
+def _publish_mc_report(sweep_dir_name: str) -> bool:
+    """Run `mc-report publish --sweep-dir <name>`. Returns True on success."""
+    cmd = [
+        UV, "run", "--no-sync", "python", "-m",
+        "mindcontrol.cli.mc_report", "publish",
+        "--sweep-dir", sweep_dir_name,
+    ]
+    try:
+        run(cmd, cwd=MC_REPO, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"[mc-report publish {sweep_dir_name}] FAILED: "
+            f"{(e.stderr or '').strip()[:300]}")
+        return False
+
+
+def dispatch_pending_mc_reports(inflight: dict) -> int:
+    """For each claimed mc instruction whose SLURM array is fully terminal
+    and whose report hasn't been dispatched yet, submit `mc-report submit`
+    and track in `inflight['mc_reports']`.
+    """
+    inflight.setdefault("mc_reports", {})
+    inflight.setdefault("mc_reports_done", [])
+    n_new = 0
+    for path, data in _list_claimed_mc_instructions():
+        sweep_name = data.get("wandb_group")
+        if not sweep_name:
+            continue
+        if sweep_name in inflight["mc_reports"]:
+            continue
+        if sweep_name in inflight["mc_reports_done"]:
+            continue
+        array_id = str(data["slurm_array_id"])
+        all_term, summary = _mc_array_terminal(array_id)
+        if not all_term:
+            continue
+        log(f"[mc-report {sweep_name}] array {array_id} terminal: {summary} "
+            f"— dispatching mc-report")
+        try:
+            report_job_id = _submit_mc_report_compute(sweep_name)
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            err = (getattr(e, "stderr", None) or str(e))[-2000:]
+            log(f"[mc-report {sweep_name}] submit FAILED: {err.strip()[:500]}")
+            # Park in done-list so we don't keep retrying every cycle.
+            inflight["mc_reports_done"].append(sweep_name)
+            continue
+        inflight["mc_reports"][sweep_name] = {
+            "report_job_id": report_job_id,
+            "dispatched_at": utc_iso(),
+            "instruction_path": str(path),
+            "array_id": array_id,
+            "array_summary": summary,
+        }
+        log(f"[mc-report {sweep_name}] submitted as {report_job_id}")
+        n_new += 1
+    return n_new
+
+
+def reap_completed_mc_reports(inflight: dict) -> int:
+    """For each in-flight mc-report compute job, if it's terminal and
+    COMPLETED, run mc-report publish to push the rendered report into
+    jacobian-reports. Move sweep_name from mc_reports → mc_reports_done.
+    """
+    inflight.setdefault("mc_reports", {})
+    inflight.setdefault("mc_reports_done", [])
+    n_reaped = 0
+    for sweep_name in list(inflight["mc_reports"].keys()):
+        info = inflight["mc_reports"][sweep_name]
+        job_id = info["report_job_id"]
+        if _slurm_job_alive(job_id):
+            continue
+        succeeded = _slurm_job_succeeded(job_id)
+        if not succeeded:
+            log(f"[mc-report reap {sweep_name}] sbatch {job_id} did not "
+                f"COMPLETE — not publishing")
+            inflight["mc_reports_done"].append(sweep_name)
+            del inflight["mc_reports"][sweep_name]
+            n_reaped += 1
+            continue
+        ok = _publish_mc_report(sweep_name)
+        if ok:
+            log(f"[mc-report reap {sweep_name}] OK → published")
+        else:
+            log(f"[mc-report reap {sweep_name}] publish FAILED")
+        inflight["mc_reports_done"].append(sweep_name)
+        del inflight["mc_reports"][sweep_name]
+        n_reaped += 1
+    return n_reaped
+
+
+# ---------------------------------------------------------------------------
 # (7) Status overview
 # ---------------------------------------------------------------------------
 def _scan_sweep_state(sweep_subdir: str) -> list[str]:
@@ -1527,10 +1695,19 @@ def main() -> int:
         inflight = load_inflight()
         n_disp = dispatch_pending_analyses(inflight)
         n_reaped = reap_completed_analyses(inflight)
+        # Mindcontrol parallel: auto-dispatch + reap mc-report compute jobs
+        # for any mc-sweep whose SLURM array has finished. Separate keys
+        # in inflight (mc_reports / mc_reports_done) so this never collides
+        # with the jacobian path's group-keyed dict.
+        n_mc_disp = dispatch_pending_mc_reports(inflight)
+        n_mc_reaped = reap_completed_mc_reports(inflight)
         save_inflight(inflight)
         if n_disp or n_reaped:
             log(f"analyses: dispatched={n_disp}  reaped={n_reaped}  "
                 f"in_flight_total={len(inflight)}")
+        if n_mc_disp or n_mc_reaped:
+            log(f"mc-reports: dispatched={n_mc_disp}  reaped={n_mc_reaped}  "
+                f"in_flight={len(inflight.get('mc_reports', {}))}")
 
         changed = update_status_overview(inflight)
         if changed:
