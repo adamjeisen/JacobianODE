@@ -1531,17 +1531,24 @@ class LitLatentJacobianODE(LitBase):
 
             if log_metrics:
                 log_kwargs = dict(sync_dist=True, add_dataloader_idx=False)
-                # For encoder-only mode, the checkpoint monitor and the
-                # sweep selector both track "trajectory val_loss". Log the
-                # PURE RECONSTRUCTION loss as that metric (not the KL-
-                # inflated composite) so ModelCheckpoint saves the
-                # recon-best checkpoint and best_traj_loss ranking picks
-                # the recon-best run. The composite is still what's
-                # optimised in training — we just rank on recon.
-                monitor_loss = val_recon_loss if val_recon_loss is not None else total_loss
-                self.log("mean val loss", monitor_loss, sync_dist=True)
-                self.log("trajectory val_loss", monitor_loss, sync_dist=True)
-                self.log("val/trajectory_loss", monitor_loss, **log_kwargs)
+                # The "mean val loss" / "trajectory val_loss" aliases are
+                # what ModelCheckpoint, the sweep selector, and load_run's
+                # argmin-over-history all read. For an encoder-only run
+                # (no dynamics ever), aliasing them to recon is correct —
+                # recon IS the target metric. But for a FULL-PIPELINE run
+                # currently in encoder warmup, doing the same alias would
+                # log tiny recon-loss values during warmup epochs and full
+                # trajectory-loss values post-warmup; argmin would always
+                # land on a warmup epoch. So during encoder warmup of a
+                # full-pipeline run, we skip those aliases entirely and
+                # only log the recon/KL diagnostics; wandb history has no
+                # "mean val loss" entry for those epochs, so argmin
+                # naturally restricts to post-warmup.
+                if self.encoder_only_mode:
+                    monitor_loss = val_recon_loss if val_recon_loss is not None else total_loss
+                    self.log("mean val loss", monitor_loss, sync_dist=True)
+                    self.log("trajectory val_loss", monitor_loss, sync_dist=True)
+                    self.log("val/trajectory_loss", monitor_loss, **log_kwargs)
                 self.log("val/total_loss", total_loss, **log_kwargs)
                 if val_recon_loss is not None:
                     self.log("val/recon_loss", val_recon_loss, **log_kwargs)
