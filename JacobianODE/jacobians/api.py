@@ -877,7 +877,49 @@ def _train_from_ragged_arrays_inner(
     cfg = initialize_config(cfg)
     seed_everything(seed)
 
-    # ---- NaN-aware per-source noise + normalize on raw padded ------------
+    # ---- Optional NaN-aware filtfilt on the per-trajectory valid region --
+    # ORDER: filter BEFORE normalization. Reason: a low-pass filter
+    # changes the variance distribution (typically removes high-freq
+    # content with ~uniform variance across dims), and we want sigma to
+    # reflect what the encoder actually sees. Filtering after normalize
+    # would make sigma reflect the un-filtered (wider-bandwidth) signal,
+    # so the post-filter input would have non-unit variance again.
+    #
+    # The ragged-padded shape (NaN-padded between trajectories) breaks
+    # naive scipy.signal.filtfilt at trajectory boundaries — NaNs would
+    # propagate through every output sample. We loop per-trajectory and
+    # only filter the valid prefix [:lengths[i]].
+    if filter_data:
+        from .data.filtering import filter_data as _filt
+        log.info(
+            f"filter_data=True (low_pass={low_pass}, high_pass={high_pass}) — "
+            f"applying per-trajectory zero-phase Butterworth (filtfilt) "
+            f"BEFORE normalization..."
+        )
+        padded_filt = padded.clone().to(torch.float32)
+        n_filtered = 0
+        for i in range(padded.shape[0]):
+            L_i = int(lengths_t[i].item())
+            if L_i <= 8:    # below filter init transient — leave as-is
+                continue
+            chunk = padded[i, :L_i].cpu().numpy()
+            chunk_filt = _filt(
+                chunk, low_pass=low_pass, high_pass=high_pass,
+                dt=dt, bidirectional=True,    # filtfilt
+            )
+            padded_filt[i, :L_i] = torch.from_numpy(
+                np.ascontiguousarray(chunk_filt)
+            ).to(padded_filt.dtype)
+            n_filtered += 1
+        padded = padded_filt
+        log.info(f"  filtered {n_filtered}/{padded.shape[0]} trajectories")
+        OmegaConf.update(cfg, "data.postprocessing.filter_data", True, force_add=True)
+        if low_pass is not None:
+            OmegaConf.update(cfg, "data.postprocessing.low_pass", float(low_pass), force_add=True)
+        if high_pass is not None:
+            OmegaConf.update(cfg, "data.postprocessing.high_pass", float(high_pass), force_add=True)
+
+    # ---- NaN-aware per-source noise + normalize on (filtered) padded -----
     padded_norm, mu_per_source, sigma_per_source, nsf_per_source, src_ids_for_norm = (
         _normalize_ragged(
             padded, lengths_t,
@@ -906,40 +948,6 @@ def _train_from_ragged_arrays_inner(
     cfg.data.postprocessing.noise_scale_factor = nsf
     cfg.data.postprocessing.mu = mu
     cfg.data.postprocessing.sigma = sigma
-
-    # ---- Optional NaN-aware filtfilt on the per-trajectory valid region --
-    # The ragged-padded shape (NaN-padded between trajectories) breaks
-    # naive scipy.signal.filtfilt at trajectory boundaries — NaNs would
-    # propagate through every output sample. We loop per-trajectory and
-    # only filter the valid prefix [:lengths[i]].
-    if filter_data:
-        from .data.filtering import filter_data as _filt
-        log.info(
-            f"filter_data=True (low_pass={low_pass}, high_pass={high_pass}) — "
-            f"applying per-trajectory zero-phase Butterworth (filtfilt)..."
-        )
-        padded_norm_filt = padded_norm.clone()
-        n_filtered = 0
-        for i in range(padded_norm.shape[0]):
-            L_i = int(lengths_t[i].item())
-            if L_i <= 8:    # below filter init transient — leave as-is
-                continue
-            chunk = padded_norm[i, :L_i].cpu().numpy()
-            chunk_filt = _filt(
-                chunk, low_pass=low_pass, high_pass=high_pass,
-                dt=dt, bidirectional=True,    # filtfilt
-            )
-            padded_norm_filt[i, :L_i] = torch.from_numpy(
-                np.ascontiguousarray(chunk_filt)
-            ).to(padded_norm_filt.dtype)
-            n_filtered += 1
-        padded_norm = padded_norm_filt
-        log.info(f"  filtered {n_filtered}/{padded_norm.shape[0]} trajectories")
-        OmegaConf.update(cfg, "data.postprocessing.filter_data", True, force_add=True)
-        if low_pass is not None:
-            OmegaConf.update(cfg, "data.postprocessing.low_pass", float(low_pass), force_add=True)
-        if high_pass is not None:
-            OmegaConf.update(cfg, "data.postprocessing.high_pass", float(high_pass), force_add=True)
 
     # ---- Optional per-area PCA reduction BEFORE delay-embed --------------
     # Shrinks each area's channel count to its 99%-variance components,
