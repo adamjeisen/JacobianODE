@@ -7,7 +7,13 @@ flow:
 postprocessing:
   obs_noise: 0
   filter_data: false
-  low_pass: 10
+  # low_pass / high_pass defaults are null. The ragged training path
+  # raises a clear ValueError if filter_data=true is passed without at
+  # least one of these set; the legacy non-ragged path treats null as
+  # "skip that side of the bandpass". Avoid setting non-null defaults
+  # here so a typo'd `filter_data: true` doesn't silently apply some
+  # arbitrary cutoff.
+  low_pass: null
   high_pass: null
   normalize: false
   # Metadata fields populated at runtime by postprocess_data / run_jacobians.
