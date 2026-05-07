@@ -1152,6 +1152,11 @@ class LitLatentJacobianODE(LitBase):
             self.log("train/kl_null_loss", kl_null_loss, **log_kwargs_step)
         if kl_dyn_loss is not None:
             self.log("train/kl_dyn_loss", kl_dyn_loss, **log_kwargs_step)
+        # _warmup_step bypasses log_training_metrics, so α never showed
+        # up in wandb across warmup epochs. Mirror it here so the curve
+        # is continuous from epoch 0 (α stays at its initial value during
+        # warmup since update_alpha_teacher_forcing isn't called either).
+        self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs_step)
         return loss
 
     def _dynamics_warmup_step(self, batch, c=None):
