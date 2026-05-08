@@ -134,7 +134,7 @@ def train_from_arrays(
     n_target_dim_method: str = "pca",
     prediction_steps: int = 30,
     condition_dim: Optional[int] = None,
-    n_dynamics_per_source: int = 1,
+    per_source_dynamics: bool = False,
     section_condition_values: Optional[list] = None,
 
     # ------------------------------ training ---------------------------
@@ -397,7 +397,7 @@ def train_from_arrays(
             pre_pca_per_area=pre_pca_per_area,
             pre_pca_var_threshold=pre_pca_var_threshold,
             whiten_after_pre_pca=whiten_after_pre_pca,
-            n_dynamics_per_source=n_dynamics_per_source,
+            per_source_dynamics=per_source_dynamics,
             section_condition_values=section_condition_values,
             encoder=encoder, encoder_kwargs=encoder_kwargs or {},
             dynamics_kwargs=dynamics_kwargs or {},
@@ -447,7 +447,7 @@ def _train_from_arrays_inner(
     post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
     whiten_after_pre_pca,
-    n_dynamics_per_source, section_condition_values,
+    per_source_dynamics, section_condition_values,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -544,7 +544,7 @@ def _train_from_arrays_inner(
         pre_pca_per_area=pre_pca_per_area,
         pre_pca_var_threshold=pre_pca_var_threshold,
         whiten_after_pre_pca=whiten_after_pre_pca,
-        n_dynamics_per_source=n_dynamics_per_source,
+        per_source_dynamics=per_source_dynamics,
         section_condition_values=section_condition_values,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
         n_target_dims=n_target_dims,
@@ -728,7 +728,7 @@ def _train_from_ragged_arrays_inner(
     post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
     whiten_after_pre_pca,
-    n_dynamics_per_source, section_condition_values,
+    per_source_dynamics, section_condition_values,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -867,7 +867,7 @@ def _train_from_ragged_arrays_inner(
         pre_pca_per_area=pre_pca_per_area,
         pre_pca_var_threshold=pre_pca_var_threshold,
         whiten_after_pre_pca=whiten_after_pre_pca,
-        n_dynamics_per_source=n_dynamics_per_source,
+        per_source_dynamics=per_source_dynamics,
         section_condition_values=section_condition_values,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
         n_target_dims=n_target_dims,
@@ -1556,7 +1556,7 @@ def _compose_cfg(
     post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
     whiten_after_pre_pca,
-    n_dynamics_per_source, section_condition_values,
+    per_source_dynamics, section_condition_values,
     encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -1640,19 +1640,14 @@ def _compose_cfg(
     if condition_dim is not None:
         overrides.append(f"++model.encoder.condition_dim={condition_dim}")
         overrides.append(f"++model.params.condition_dim={condition_dim}")
-    if n_dynamics_per_source is not None and int(n_dynamics_per_source) > 1:
-        if section_condition_values is None:
+    if per_source_dynamics:
+        if section_condition_values is None or len(section_condition_values) < 2:
             raise ValueError(
-                "n_dynamics_per_source > 1 requires section_condition_values "
-                "(one float per sub-MLP)."
+                "per_source_dynamics=True requires section_condition_values "
+                "with ≥2 entries (one float per source — also defines the "
+                "number of dynamics MLPs to build)."
             )
-        if len(section_condition_values) != int(n_dynamics_per_source):
-            raise ValueError(
-                f"n_dynamics_per_source={n_dynamics_per_source} but "
-                f"section_condition_values has length {len(section_condition_values)} — "
-                f"they must match."
-            )
-        overrides.append(f"++model.n_dynamics_per_source={int(n_dynamics_per_source)}")
+        overrides.append("++model.per_source_dynamics=true")
         overrides.append(
             "++model.section_condition_values="
             + "[" + ",".join(repr(float(v)) for v in section_condition_values) + "]"

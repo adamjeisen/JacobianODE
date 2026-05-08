@@ -163,9 +163,10 @@ def test_smoke_direct_sum_with_area_indices(tiny_data, tmp_path):
 
 
 def test_smoke_per_source_dynamics(tiny_data, tmp_path):
-    """``n_dynamics_per_source > 1`` should wire two parallel dynamics
-    MLPs that the model wraps via PerSourceDynamicsMLP and routes by
-    condition value. Tests cfg threading + make_model wrap path."""
+    """``per_source_dynamics=True`` should wire one dynamics MLP per
+    entry in section_condition_values, wrapped via PerSourceDynamicsMLP
+    and routed by condition value. Tests cfg threading + make_model
+    wrap path."""
     from JacobianODE.models.per_source_dynamics import PerSourceDynamicsMLP
 
     values = tiny_data  # (20, 40, 4)
@@ -193,7 +194,7 @@ def test_smoke_per_source_dynamics(tiny_data, tmp_path):
         n_target_var_threshold=0.99,
         prediction_steps=3,
         normalize_per_condition=True,
-        n_dynamics_per_source=2,
+        per_source_dynamics=True,
         section_condition_values=[-1.0, 1.0],
         n_epochs=2,
         batch_size=8,
@@ -210,21 +211,21 @@ def test_smoke_per_source_dynamics(tiny_data, tmp_path):
     assert isinstance(lit_model.model, PerSourceDynamicsMLP)
     assert lit_model.model.n_sources == 2
     # cfg should carry the per-source flags
-    assert int(result.cfg.model.n_dynamics_per_source) == 2
+    assert bool(result.cfg.model.per_source_dynamics) is True
     sec_vals = list(result.cfg.model.section_condition_values)
     assert sec_vals == [-1.0, 1.0]
 
 
 def test_per_source_dynamics_misconfig_errors(tiny_data, tmp_path):
-    """``n_dynamics_per_source > 1`` without section_condition_values must
-    raise; mismatched lengths must raise."""
+    """``per_source_dynamics=True`` without section_condition_values must
+    raise; with <2 entries must raise."""
     values = tiny_data
     dt = 0.05
 
     with pytest.raises(ValueError, match="section_condition_values"):
         train_from_arrays(
             values, dt,
-            n_dynamics_per_source=2,
+            per_source_dynamics=True,
             section_condition_values=None,
             encoder="latent_additive_coupling",
             n_epochs=1, batch_size=4,
@@ -232,11 +233,11 @@ def test_per_source_dynamics_misconfig_errors(tiny_data, tmp_path):
             wandb_disabled=True,
         )
 
-    with pytest.raises(ValueError, match="must match|length"):
+    with pytest.raises(ValueError, match="≥2|section_condition_values"):
         train_from_arrays(
             values, dt,
-            n_dynamics_per_source=2,
-            section_condition_values=[-1.0, 0.0, 1.0],  # length 3 ≠ 2
+            per_source_dynamics=True,
+            section_condition_values=[0.0],  # only 1 entry
             encoder="latent_additive_coupling",
             n_epochs=1, batch_size=4,
             save_dir=str(tmp_path),

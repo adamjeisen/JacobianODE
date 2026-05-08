@@ -54,39 +54,39 @@ def make_model(
     # Instantiate the Jacobian model from config
     jac_model = instantiate(cfg.model.params)
 
-    # Optional: per-source dynamics. Builds N copies of the dynamics MLP
-    # and wraps them so each sample is hard-routed to one sub-MLP based
-    # on its condition. See JacobianODE.models.per_source_dynamics for
-    # the rationale (regime imbalance: awake-vs-anesthesia LFP, etc.).
-    n_per_source = OmegaConf.select(
-        cfg, "model.n_dynamics_per_source", default=1
-    )
-    if n_per_source is not None and int(n_per_source) > 1:
-        n_per_source = int(n_per_source)
+    # Optional: per-source dynamics. Builds one dynamics MLP per source
+    # (count = len(section_condition_values)) and wraps them so each
+    # sample is hard-routed to its source's sub-MLP. See
+    # JacobianODE.models.per_source_dynamics for the rationale (regime
+    # imbalance: awake-vs-anesthesia LFP, etc.).
+    use_per_source = bool(OmegaConf.select(
+        cfg, "model.per_source_dynamics", default=False
+    ))
+    if use_per_source:
         section_vals_raw = OmegaConf.select(
             cfg, "model.section_condition_values", default=None
         )
         if section_vals_raw is None:
             raise ValueError(
-                "model.n_dynamics_per_source > 1 requires "
-                "model.section_condition_values (one float per sub-MLP)."
+                "model.per_source_dynamics=True requires "
+                "model.section_condition_values (one float per source)."
             )
         section_vals = list(OmegaConf.to_container(section_vals_raw, resolve=True))
-        if len(section_vals) != n_per_source:
+        if len(section_vals) < 2:
             raise ValueError(
-                f"model.n_dynamics_per_source={n_per_source} but "
-                f"model.section_condition_values has length {len(section_vals)} — "
-                f"they must match."
+                f"model.section_condition_values must have ≥2 entries when "
+                f"per_source_dynamics=True (got {section_vals})."
             )
         from JacobianODE.models.per_source_dynamics import PerSourceDynamicsMLP
+        n_sources = len(section_vals)
         # Build n-1 additional copies (we already have one in jac_model).
         sub_mlps = [jac_model] + [
-            instantiate(cfg.model.params) for _ in range(n_per_source - 1)
+            instantiate(cfg.model.params) for _ in range(n_sources - 1)
         ]
         jac_model = PerSourceDynamicsMLP(sub_mlps, section_vals)
         if verbose:
             logger.info(
-                f"per-source dynamics: {n_per_source} sub-MLPs, routing "
+                f"per-source dynamics: {n_sources} sub-MLPs, routing "
                 f"by nearest-neighbor in {section_vals}"
             )
 

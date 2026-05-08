@@ -20,10 +20,11 @@ shared representation; the dynamics is regime-specific.
 
 Usage at the cfg level
 ----------------------
-Set ``cfg.model.n_dynamics_per_source > 1`` and provide
+Set ``cfg.model.per_source_dynamics=True`` and provide
 ``cfg.model.section_condition_values`` (a list of floats matching the
 dataset's ``section_condition_values``). ``make_model`` builds
-``n_dynamics_per_source`` copies of the dynamics MLP and wraps them.
+``len(section_condition_values)`` copies of the dynamics MLP and
+wraps them.
 """
 
 from __future__ import annotations
