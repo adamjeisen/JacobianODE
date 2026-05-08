@@ -1666,6 +1666,25 @@ class LitLatentJacobianODE(LitBase):
                     self.log("mean val loss", monitor_loss, sync_dist=True)
                     self.log("trajectory val_loss", monitor_loss, sync_dist=True)
                     self.log("val/trajectory_loss", monitor_loss, **log_kwargs)
+                else:
+                    # Full-pipeline encoder-warmup branch. We don't want
+                    # argmin-over-history to pick warmup epochs as best
+                    # (they only see recon, not the trajectory loss the
+                    # full-pipeline run actually optimizes), but
+                    # ModelCheckpoint(monitor='mean val loss') / sweep
+                    # selectors still need the key to EXIST every epoch
+                    # or they raise MisconfigurationException at
+                    # on_train_epoch_end. Log +inf during warmup: the
+                    # key is present (no crash), and inf is always
+                    # worse than any post-warmup value under mode='min',
+                    # so neither ModelCheckpoint nor argmin selectors
+                    # ever land on a warmup epoch.
+                    inf_sentinel = torch.tensor(
+                        float("inf"), device=batch.device, dtype=batch.dtype,
+                    )
+                    self.log("mean val loss", inf_sentinel, sync_dist=True)
+                    self.log("trajectory val_loss", inf_sentinel, sync_dist=True)
+                    self.log("val/trajectory_loss", inf_sentinel, **log_kwargs)
                 self.log("val/total_loss", total_loss, **log_kwargs)
                 if val_recon_loss is not None:
                     self.log("val/recon_loss", val_recon_loss, **log_kwargs)
