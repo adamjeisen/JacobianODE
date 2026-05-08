@@ -994,18 +994,28 @@ class LitLatentJacobianODE(LitBase):
                 z_true_padded = self._pad_to_full_dim(z_true_crop)
                 decoded_true = self.decode_trajectory(z_true_padded, c_windows)
 
+            # Compute both losses always so both are logged side-by-side
+            # — lets us compare a `decoded_only_pred_loss=True` run
+            # against `=False` runs on the same metric. The unused
+            # branch is cheap (one extra weighted MSE/MAE; the heavy
+            # decoded_pred / decoded_true tensors are already in hand).
+            loss_obs = self._weighted_obs_loss(
+                obs_targets, decoded_pred, mode=effective_mode,
+            )
+            loss_decoded = self._weighted_obs_loss(
+                decoded_true, decoded_pred, mode=effective_mode,
+            )
+
             if self.decoded_only_pred_loss:
-                loss = self._weighted_obs_loss(
-                    decoded_true, decoded_pred, mode=effective_mode,
-                )
+                loss = loss_decoded
             else:
-                loss = self._weighted_obs_loss(
-                    obs_targets, decoded_pred, mode=effective_mode,
-                )
+                loss = loss_obs
 
             # Metrics — when most_recent mode, evaluate on index 0 only so
             # that the unsupervised chaotic tail doesn't corrupt diagnostics.
             metric_vals = {}
+            metric_vals['pred_loss_obs'] = loss_obs.detach()
+            metric_vals['pred_loss_decoded'] = loss_decoded.detach()
             if effective_mode == 'most_recent':
                 d = self._n_recent_dims
                 if d is not None:
