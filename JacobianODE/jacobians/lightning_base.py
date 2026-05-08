@@ -967,6 +967,34 @@ class LitBase(L.LightningModule):
             self._val_one_step_latent_model_maes = []
             self._val_one_step_latent_persistence_maes = []
 
+        # dynamics_only_one_step_mase — obs-space numerator with the
+        # reconstruction floor cancelled (decode-vs-decode), same
+        # |x_t - x_{t+1}| persistence baseline as the standard MASE.
+        # Reuses the persistence_mae list aggregated above (see
+        # _val_one_step_persistence_maes_for_dyn_only mirror).
+        if (hasattr(self, '_val_one_step_dyn_only_model_maes')
+                and self._val_one_step_dyn_only_model_maes):
+            dyn_avg_model_mae = sum(self._val_one_step_dyn_only_model_maes) / len(self._val_one_step_dyn_only_model_maes)
+            dyn_avg_persist_mae = sum(self._val_one_step_dyn_only_persist_maes) / len(self._val_one_step_dyn_only_persist_maes)
+            one_step_mase_dyn_only = dyn_avg_model_mae / max(dyn_avg_persist_mae, 1e-8)
+            self.log("val/dynamics_only_one_step_mase", one_step_mase_dyn_only, sync_dist=True)
+            self._val_one_step_dyn_only_model_maes = []
+            self._val_one_step_dyn_only_persist_maes = []
+
+        # decoder_corrected_one_step_mase — same numerator as the
+        # standard MASE (|decode(f(z_t)) - x_{t+1}|), but baseline is
+        # decoded persistence (|decode(z_t) - x_{t+1}|) so the metric
+        # quantifies how much the dynamics adds on top of decoded
+        # current-state.
+        if (hasattr(self, '_val_one_step_dec_corr_model_maes')
+                and self._val_one_step_dec_corr_model_maes):
+            dec_avg_model_mae = sum(self._val_one_step_dec_corr_model_maes) / len(self._val_one_step_dec_corr_model_maes)
+            dec_avg_persist_mae = sum(self._val_one_step_dec_corr_persist_maes) / len(self._val_one_step_dec_corr_persist_maes)
+            one_step_mase_dec_corr = dec_avg_model_mae / max(dec_avg_persist_mae, 1e-8)
+            self.log("val/decoder_corrected_one_step_mase", one_step_mase_dec_corr, sync_dist=True)
+            self._val_one_step_dec_corr_model_maes = []
+            self._val_one_step_dec_corr_persist_maes = []
+
         # Fast eigenvalue fraction (C3 diagnostic)
         if hasattr(self, '_val_eig_too_fast') and self._val_eig_total:
             total_too_fast = sum(self._val_eig_too_fast)

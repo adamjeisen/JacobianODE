@@ -1032,6 +1032,50 @@ class LitLatentJacobianODE(LitBase):
                         0.0, device=z_true_crop.device
                     )
 
+                # Two obs-space MASE variants that triangulate the
+                # reconstruction-vs-dynamics decomposition:
+                #
+                #  dynamics_only_one_step_mase
+                #     = mean |decode(f(z_t)) - decode(z_{t+1})|
+                #     / mean |x_t - x_{t+1}|
+                #     numerator removes the obs-space reconstruction
+                #     floor by comparing two decoded quantities; same
+                #     persistence baseline as standard MASE.
+                #
+                #  decoder_corrected_one_step_mase
+                #     = mean |decode(f(z_t)) - x_{t+1}|
+                #     / mean |decode(z_t) - x_{t+1}|
+                #     same numerator as standard MASE; baseline is
+                #     "decoded current latent vs next obs" — i.e. how
+                #     well decoded persistence does. Ratios how much the
+                #     dynamics adds over the decoder-baseline-prediction.
+                #
+                # Both reuse `decode(z_true_crop)` once.
+                z_true_padded = self._pad_to_full_dim(z_true_crop)
+                decoded_true = self.decode_trajectory(z_true_padded, c_windows)
+                if effective_mode == 'most_recent' and self._n_recent_dims is not None:
+                    decoded_true = decoded_true[..., :self._n_recent_dims]
+                dec_true_m = (
+                    decoded_true.reshape(decoded_true.shape[0], decoded_true.shape[1], -1)
+                    if decoded_true.dim() > 3 else decoded_true
+                )
+                metric_vals['dynamics_only_model_mae'] = torch.mean(
+                    torch.abs(dec_m - dec_true_m)
+                )
+                # decoder_corrected baseline: decoded prev vs actual next
+                if dec_true_m.dim() == 3 and dec_true_m.shape[-2] > 1:
+                    metric_vals['decoder_corrected_persistence_mae'] = torch.mean(
+                        torch.abs(dec_true_m[:, :-1] - obs_m[:, 1:])
+                    )
+                elif dec_true_m.dim() == 2 and dec_true_m.shape[-2] > 1:
+                    metric_vals['decoder_corrected_persistence_mae'] = torch.mean(
+                        torch.abs(dec_true_m[:-1] - obs_m[1:])
+                    )
+                else:
+                    metric_vals['decoder_corrected_persistence_mae'] = torch.tensor(
+                        0.0, device=dec_true_m.device
+                    )
+
         if return_decoded:
             return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
         else:
@@ -1673,6 +1717,31 @@ class LitLatentJacobianODE(LitBase):
             )
             self._val_one_step_latent_persistence_maes.append(
                 one_step_ret['metric_vals']['latent_persistence_mae'].float().item()
+            )
+        # dynamics_only_one_step_mase + decoder_corrected_one_step_mase
+        # (see trajectory_model_step for definitions).
+        if not hasattr(self, '_val_one_step_dyn_only_model_maes'):
+            self._val_one_step_dyn_only_model_maes = []
+            self._val_one_step_dyn_only_persist_maes = []
+            self._val_one_step_dec_corr_model_maes = []
+            self._val_one_step_dec_corr_persist_maes = []
+        if 'dynamics_only_model_mae' in one_step_ret['metric_vals']:
+            # dynamics_only: numerator = |decode(f(z_t)) - decode(z_{t+1})|,
+            # baseline = standard persistence_mae (|x_t - x_{t+1}|).
+            self._val_one_step_dyn_only_model_maes.append(
+                one_step_ret['metric_vals']['dynamics_only_model_mae'].float().item()
+            )
+            self._val_one_step_dyn_only_persist_maes.append(
+                one_step_ret['metric_vals']['persistence_mae'].float().item()
+            )
+            # decoder_corrected: numerator = standard model_mae
+            # (|decode(f(z_t)) - x_{t+1}|), baseline = decoded persistence
+            # (|decode(z_t) - x_{t+1}|).
+            self._val_one_step_dec_corr_model_maes.append(
+                one_step_ret['metric_vals']['model_mae'].float().item()
+            )
+            self._val_one_step_dec_corr_persist_maes.append(
+                one_step_ret['metric_vals']['decoder_corrected_persistence_mae'].float().item()
             )
 
         # Fast eigenvalue fraction (C3 diagnostic) — first val batch per
