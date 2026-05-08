@@ -162,6 +162,88 @@ def test_smoke_direct_sum_with_area_indices(tiny_data, tmp_path):
     assert result.autodim_result.is_direct_sum is True
 
 
+def test_smoke_per_source_dynamics(tiny_data, tmp_path):
+    """``n_dynamics_per_source > 1`` should wire two parallel dynamics
+    MLPs that the model wraps via PerSourceDynamicsMLP and routes by
+    condition value. Tests cfg threading + make_model wrap path."""
+    from JacobianODE.models.per_source_dynamics import PerSourceDynamicsMLP
+
+    values = tiny_data  # (20, 40, 4)
+    dt = 0.05
+    n_traj = values.shape[0]
+    condition = np.empty((n_traj, 1), dtype=np.float32)
+    condition[: n_traj // 2] = -1.0
+    condition[n_traj // 2:] = 1.0
+    source_id = np.array(
+        [0] * (n_traj // 2) + [1] * (n_traj - n_traj // 2), dtype=np.int64
+    )
+
+    lit_model, result = train_from_arrays(
+        values, dt,
+        condition=condition,
+        source_id=source_id,
+        n_delays=2,
+        seq_length=20,
+        seq_spacing=5,
+        encoder="latent_additive_coupling",
+        encoder_kwargs={"hidden_dim": 32, "n_coupling_layers": 4},
+        # Shrink dynamics MLP — default hidden=[256, 1024, 2048, 2048]
+        # × 2 sub-MLPs OOMs the Pascal-GPU CI environment in qr().
+        dynamics_kwargs={"hidden_dim": [64, 64], "num_layers": 2},
+        n_target_var_threshold=0.99,
+        prediction_steps=3,
+        normalize_per_condition=True,
+        n_dynamics_per_source=2,
+        section_condition_values=[-1.0, 1.0],
+        n_epochs=2,
+        batch_size=8,
+        save_dir=str(tmp_path),
+        wandb_disabled=True,
+        lightning_kwargs={"jacobianODEint_kwargs": {"traj_init_steps": 5,
+                                                    "inner_path": "line",
+                                                    "inner_N": 20,
+                                                    "interp_pts": 4}},
+        early_stopping_kwargs={"early_stopping_patience": 100, "min_epochs": 0},
+    )
+    assert isinstance(result, TrainingResult)
+    # Model's underlying dynamics should be the wrapper, not the raw MLP.
+    assert isinstance(lit_model.model, PerSourceDynamicsMLP)
+    assert lit_model.model.n_sources == 2
+    # cfg should carry the per-source flags
+    assert int(result.cfg.model.n_dynamics_per_source) == 2
+    sec_vals = list(result.cfg.model.section_condition_values)
+    assert sec_vals == [-1.0, 1.0]
+
+
+def test_per_source_dynamics_misconfig_errors(tiny_data, tmp_path):
+    """``n_dynamics_per_source > 1`` without section_condition_values must
+    raise; mismatched lengths must raise."""
+    values = tiny_data
+    dt = 0.05
+
+    with pytest.raises(ValueError, match="section_condition_values"):
+        train_from_arrays(
+            values, dt,
+            n_dynamics_per_source=2,
+            section_condition_values=None,
+            encoder="latent_additive_coupling",
+            n_epochs=1, batch_size=4,
+            save_dir=str(tmp_path),
+            wandb_disabled=True,
+        )
+
+    with pytest.raises(ValueError, match="must match|length"):
+        train_from_arrays(
+            values, dt,
+            n_dynamics_per_source=2,
+            section_condition_values=[-1.0, 0.0, 1.0],  # length 3 ≠ 2
+            encoder="latent_additive_coupling",
+            n_epochs=1, batch_size=4,
+            save_dir=str(tmp_path),
+            wandb_disabled=True,
+        )
+
+
 def test_validation_input_shape_errors(tiny_data, tmp_path):
     """Bad inputs raise ValueError with helpful messages."""
     values = tiny_data

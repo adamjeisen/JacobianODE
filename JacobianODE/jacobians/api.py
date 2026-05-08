@@ -123,6 +123,7 @@ def train_from_arrays(
     post_filter_downsample: int = 1,
     pre_pca_per_area: bool = False,
     pre_pca_var_threshold: float = 0.99,
+    whiten_after_pre_pca: bool = False,
 
     # -------------------------------- model ----------------------------
     encoder: str = "latent_direct_sum_coupling",
@@ -133,6 +134,8 @@ def train_from_arrays(
     n_target_dim_method: str = "pca",
     prediction_steps: int = 30,
     condition_dim: Optional[int] = None,
+    n_dynamics_per_source: int = 1,
+    section_condition_values: Optional[list] = None,
 
     # ------------------------------ training ---------------------------
     lightning_kwargs: Optional[dict] = None,
@@ -393,6 +396,9 @@ def train_from_arrays(
             post_filter_downsample=post_filter_downsample,
             pre_pca_per_area=pre_pca_per_area,
             pre_pca_var_threshold=pre_pca_var_threshold,
+            whiten_after_pre_pca=whiten_after_pre_pca,
+            n_dynamics_per_source=n_dynamics_per_source,
+            section_condition_values=section_condition_values,
             encoder=encoder, encoder_kwargs=encoder_kwargs or {},
             dynamics_kwargs=dynamics_kwargs or {},
             n_target_dims=n_target_dims,
@@ -440,6 +446,8 @@ def _train_from_arrays_inner(
     filter_data, low_pass, high_pass,
     post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
+    whiten_after_pre_pca,
+    n_dynamics_per_source, section_condition_values,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -535,6 +543,9 @@ def _train_from_arrays_inner(
         post_filter_downsample=post_filter_downsample,
         pre_pca_per_area=pre_pca_per_area,
         pre_pca_var_threshold=pre_pca_var_threshold,
+        whiten_after_pre_pca=whiten_after_pre_pca,
+        n_dynamics_per_source=n_dynamics_per_source,
+        section_condition_values=section_condition_values,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
         n_target_dims=n_target_dims,
         n_target_var_threshold=n_target_var_threshold,
@@ -716,6 +727,8 @@ def _train_from_ragged_arrays_inner(
     filter_data, low_pass, high_pass,
     post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
+    whiten_after_pre_pca,
+    n_dynamics_per_source, section_condition_values,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -853,6 +866,9 @@ def _train_from_ragged_arrays_inner(
         post_filter_downsample=post_filter_downsample,
         pre_pca_per_area=pre_pca_per_area,
         pre_pca_var_threshold=pre_pca_var_threshold,
+        whiten_after_pre_pca=whiten_after_pre_pca,
+        n_dynamics_per_source=n_dynamics_per_source,
+        section_condition_values=section_condition_values,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
         n_target_dims=n_target_dims,
         n_target_var_threshold=n_target_var_threshold,
@@ -1019,6 +1035,62 @@ def _train_from_ragged_arrays_inner(
             f"({pca_fit.n_total_out / sum(p.n_in for p in pca_fit.per_area):.1%} of raw)"
         )
         padded_norm = apply_per_area_pca(padded_norm, lengths_t, pca_fit)
+
+        # ---- Optional per-dim whitening after pre-PCA ----------------------
+        # When True, divides each output dim by its own std so every kept
+        # PC has var ≈ 1 going into delay-embed. Trade-off vs the
+        # default arithmetic-mean rescale below: whitening flattens the
+        # PCA's eigenvalue hierarchy (low-eigenvalue PCs get amplified
+        # to unit scale), which equalizes per-dim gradient pressure on
+        # the encoder but loses the natural variance ordering. The
+        # downstream arith-mean rescale becomes a no-op when whitening
+        # is on (mean per-dim var is exactly 1).
+        if whiten_after_pre_pca:
+            log.info(
+                f"whiten_after_pre_pca=True — per-dim z-score after pre-PCA"
+            )
+            if normalize_per_condition:
+                src_ids_w = src_ids_for_norm
+                split_src_w = np.asarray(split_src)
+            else:
+                src_ids_w = [0]
+                split_src_w = np.zeros(padded_norm.shape[0], dtype=np.int64)
+            sigma_whiten_per_source: list[list[float]] = []
+            for s in src_ids_w:
+                traj_idxs = np.where(split_src_w == s)[0]
+                valid_chunks = []
+                for i in traj_idxs:
+                    L_i = int(lengths_t[i].item())
+                    if L_i > 0:
+                        valid_chunks.append(padded_norm[i, :L_i])
+                if not valid_chunks:
+                    sigma_whiten_per_source.append(
+                        [1.0] * padded_norm.shape[-1]
+                    )
+                    continue
+                valid_concat = torch.cat(valid_chunks, dim=0).to(torch.float64)
+                per_dim_std = (
+                    valid_concat.std(dim=0).clamp_min(1e-8).to(padded_norm.dtype)
+                )
+                sigma_whiten_per_source.append([float(x) for x in per_dim_std])
+                for i in traj_idxs:
+                    L_i = int(lengths_t[i].item())
+                    if L_i > 0:
+                        padded_norm[i, :L_i] = padded_norm[i, :L_i] / per_dim_std
+            std_min = min(min(s) for s in sigma_whiten_per_source)
+            std_max = max(max(s) for s in sigma_whiten_per_source)
+            log.info(
+                f"  per-source per-dim std range across all sources/dims: "
+                f"[{std_min:.4g}, {std_max:.4g}]"
+            )
+            OmegaConf.update(
+                cfg, "data.postprocessing.whiten_after_pre_pca", True,
+                force_add=True,
+            )
+            OmegaConf.update(
+                cfg, "data.postprocessing.sigma_whiten_per_source",
+                sigma_whiten_per_source, force_add=True,
+            )
 
         # ---- Restore arithmetic-mean unit variance after pre-PCA --------
         # Per-area PCA concentrates total per-area variance (≈ n_in_area
@@ -1483,6 +1555,8 @@ def _compose_cfg(
     filter_data, low_pass, high_pass,
     post_filter_downsample,
     pre_pca_per_area, pre_pca_var_threshold,
+    whiten_after_pre_pca,
+    n_dynamics_per_source, section_condition_values,
     encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -1566,6 +1640,23 @@ def _compose_cfg(
     if condition_dim is not None:
         overrides.append(f"++model.encoder.condition_dim={condition_dim}")
         overrides.append(f"++model.params.condition_dim={condition_dim}")
+    if n_dynamics_per_source is not None and int(n_dynamics_per_source) > 1:
+        if section_condition_values is None:
+            raise ValueError(
+                "n_dynamics_per_source > 1 requires section_condition_values "
+                "(one float per sub-MLP)."
+            )
+        if len(section_condition_values) != int(n_dynamics_per_source):
+            raise ValueError(
+                f"n_dynamics_per_source={n_dynamics_per_source} but "
+                f"section_condition_values has length {len(section_condition_values)} — "
+                f"they must match."
+            )
+        overrides.append(f"++model.n_dynamics_per_source={int(n_dynamics_per_source)}")
+        overrides.append(
+            "++model.section_condition_values="
+            + "[" + ",".join(repr(float(v)) for v in section_condition_values) + "]"
+        )
     if save_dir is not None:
         overrides.append(f"++training.logger.save_dir={save_dir}")
     if wandb_entity is not None:
