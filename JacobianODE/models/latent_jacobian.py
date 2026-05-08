@@ -983,39 +983,61 @@ class LitLatentJacobianODE(LitBase):
             #     obs-space reconstruction floor in the gradient signal
             #     to f). The encoder rec loss separately anchors D and E
             #     to obs space, so this is safe.
-            #   - the dynamics_only / decoder_corrected MASE metrics in
-            #     the no_grad block below.
+            #   - the dynamics_only / decoder_corrected MASE metrics
+            #     and pred_loss_obs / pred_loss_decoded comparison logs.
             # No-grad'ing both encoder-of-x_{t+1} and decoder-of-z_{t+1}
-            # follows the BYOL/SimSiam target-network convention: stops
-            # the encoder from "drifting to make the target match the
-            # prediction" and keeps the decoder from collapsing both
-            # branches together.
-            with torch.no_grad():
-                z_true_padded = self._pad_to_full_dim(z_true_crop)
-                decoded_true = self.decode_trajectory(z_true_padded, c_windows)
+            # follows the BYOL/SimSiam target-network convention.
+            #
+            # Only compute decoded_true when actually needed:
+            #   - training + flag on: needed for the loss
+            #   - validation: always needed (for both-loss logging +
+            #     dynamics_only / decoder_corrected MASE metrics)
+            # Skipping it during training when the flag is off saves a
+            # full decoder forward + MAE call per training step (~30%
+            # of trajectory_model_step time on the production configs).
+            in_validation = not self.training
+            need_decoded_true = self.decoded_only_pred_loss or in_validation
+            decoded_true = None
+            if need_decoded_true:
+                with torch.no_grad():
+                    z_true_padded = self._pad_to_full_dim(z_true_crop)
+                    decoded_true = self.decode_trajectory(z_true_padded, c_windows)
 
-            # Compute both losses always so both are logged side-by-side
-            # — lets us compare a `decoded_only_pred_loss=True` run
-            # against `=False` runs on the same metric. The unused
-            # branch is cheap (one extra weighted MSE/MAE; the heavy
-            # decoded_pred / decoded_true tensors are already in hand).
-            loss_obs = self._weighted_obs_loss(
-                obs_targets, decoded_pred, mode=effective_mode,
-            )
-            loss_decoded = self._weighted_obs_loss(
-                decoded_true, decoded_pred, mode=effective_mode,
-            )
-
+            # Compute the loss(es) actually needed. During validation we
+            # also compute the unused branch so pred_loss_obs and
+            # pred_loss_decoded can be plotted side-by-side regardless
+            # of the flag. During training only the chosen target's
+            # loss is computed.
+            loss_obs = None
+            loss_decoded = None
             if self.decoded_only_pred_loss:
+                loss_decoded = self._weighted_obs_loss(
+                    decoded_true, decoded_pred, mode=effective_mode,
+                )
                 loss = loss_decoded
+                if in_validation:
+                    loss_obs = self._weighted_obs_loss(
+                        obs_targets, decoded_pred, mode=effective_mode,
+                    )
             else:
+                loss_obs = self._weighted_obs_loss(
+                    obs_targets, decoded_pred, mode=effective_mode,
+                )
                 loss = loss_obs
+                if in_validation:
+                    loss_decoded = self._weighted_obs_loss(
+                        decoded_true, decoded_pred, mode=effective_mode,
+                    )
 
             # Metrics — when most_recent mode, evaluate on index 0 only so
             # that the unsupervised chaotic tail doesn't corrupt diagnostics.
             metric_vals = {}
-            metric_vals['pred_loss_obs'] = loss_obs.detach()
-            metric_vals['pred_loss_decoded'] = loss_decoded.detach()
+            # Both-loss logging is val-only (per spec). During training
+            # the unused branch isn't computed.
+            if loss_obs is not None:
+                metric_vals['pred_loss_obs'] = loss_obs.detach()
+            if loss_decoded is not None:
+                metric_vals['pred_loss_decoded'] = loss_decoded.detach()
             if effective_mode == 'most_recent':
                 d = self._n_recent_dims
                 if d is not None:
@@ -1095,35 +1117,39 @@ class LitLatentJacobianODE(LitBase):
                 #     dynamics adds over the decoder-baseline-prediction.
                 #
                 # Reuses `decoded_true` already computed above for the
-                # decoded_only_pred_loss target.
-                if effective_mode == 'most_recent' and self._n_recent_dims is not None:
-                    decoded_true_for_metrics = decoded_true[..., :self._n_recent_dims]
-                else:
-                    decoded_true_for_metrics = decoded_true
-                dec_true_m = (
-                    decoded_true_for_metrics.reshape(
-                        decoded_true_for_metrics.shape[0],
-                        decoded_true_for_metrics.shape[1], -1,
+                # decoded_only_pred_loss target. decoded_true is None
+                # during training when decoded_only_pred_loss=False —
+                # skip these val-only metrics in that case (val_step
+                # accumulators are gated on the keys' presence anyway).
+                if decoded_true is not None:
+                    if effective_mode == 'most_recent' and self._n_recent_dims is not None:
+                        decoded_true_for_metrics = decoded_true[..., :self._n_recent_dims]
+                    else:
+                        decoded_true_for_metrics = decoded_true
+                    dec_true_m = (
+                        decoded_true_for_metrics.reshape(
+                            decoded_true_for_metrics.shape[0],
+                            decoded_true_for_metrics.shape[1], -1,
+                        )
+                        if decoded_true_for_metrics.dim() > 3
+                        else decoded_true_for_metrics
                     )
-                    if decoded_true_for_metrics.dim() > 3
-                    else decoded_true_for_metrics
-                )
-                metric_vals['dynamics_only_model_mae'] = torch.mean(
-                    torch.abs(dec_m - dec_true_m)
-                )
-                # decoder_corrected baseline: decoded prev vs actual next
-                if dec_true_m.dim() == 3 and dec_true_m.shape[-2] > 1:
-                    metric_vals['decoder_corrected_persistence_mae'] = torch.mean(
-                        torch.abs(dec_true_m[:, :-1] - obs_m[:, 1:])
+                    metric_vals['dynamics_only_model_mae'] = torch.mean(
+                        torch.abs(dec_m - dec_true_m)
                     )
-                elif dec_true_m.dim() == 2 and dec_true_m.shape[-2] > 1:
-                    metric_vals['decoder_corrected_persistence_mae'] = torch.mean(
-                        torch.abs(dec_true_m[:-1] - obs_m[1:])
-                    )
-                else:
-                    metric_vals['decoder_corrected_persistence_mae'] = torch.tensor(
-                        0.0, device=dec_true_m.device
-                    )
+                    # decoder_corrected baseline: decoded prev vs actual next
+                    if dec_true_m.dim() == 3 and dec_true_m.shape[-2] > 1:
+                        metric_vals['decoder_corrected_persistence_mae'] = torch.mean(
+                            torch.abs(dec_true_m[:, :-1] - obs_m[:, 1:])
+                        )
+                    elif dec_true_m.dim() == 2 and dec_true_m.shape[-2] > 1:
+                        metric_vals['decoder_corrected_persistence_mae'] = torch.mean(
+                            torch.abs(dec_true_m[:-1] - obs_m[1:])
+                        )
+                    else:
+                        metric_vals['decoder_corrected_persistence_mae'] = torch.tensor(
+                            0.0, device=dec_true_m.device
+                        )
 
         if return_decoded:
             return {'loss': loss, 'metric_vals': metric_vals, 'outputs': z_pred, 'decoded': decoded_pred, 'targets': obs_targets}
