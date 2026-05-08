@@ -1258,17 +1258,23 @@ class LitLatentJacobianODE(LitBase):
         # to val/recon_loss for direct train-vs-val comparison. The
         # "warmup *" keys above stay for back-compat with prior runs /
         # any dashboard that watches them.
-        log_kwargs_step = dict(on_step=True, on_epoch=True, sync_dist=True)
-        self.log("train/recon_loss", recon_loss, **log_kwargs_step)
+        # Must match the kwargs used by log_training_metrics (the
+        # post-warmup logging path) — Lightning raises
+        # MisconfigurationException if the same key is logged with
+        # different args across calls in a run, which fires on the
+        # warmup→full transition at epoch == encoder_warmup_epochs.
+        # log_training_metrics defaults to on_step=False, on_epoch=True.
+        log_kwargs_train = dict(on_step=False, on_epoch=True, sync_dist=True)
+        self.log("train/recon_loss", recon_loss, **log_kwargs_train)
         if kl_null_loss is not None:
-            self.log("train/kl_null_loss", kl_null_loss, **log_kwargs_step)
+            self.log("train/kl_null_loss", kl_null_loss, **log_kwargs_train)
         if kl_dyn_loss is not None:
-            self.log("train/kl_dyn_loss", kl_dyn_loss, **log_kwargs_step)
+            self.log("train/kl_dyn_loss", kl_dyn_loss, **log_kwargs_train)
         # _warmup_step bypasses log_training_metrics, so α never showed
         # up in wandb across warmup epochs. Mirror it here so the curve
         # is continuous from epoch 0 (α stays at its initial value during
         # warmup since update_alpha_teacher_forcing isn't called either).
-        self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs_step)
+        self.log("train/alpha_teacher_forcing", self.alpha_teacher_forcing, **log_kwargs_train)
         return loss
 
     def _dynamics_warmup_step(self, batch, c=None):
