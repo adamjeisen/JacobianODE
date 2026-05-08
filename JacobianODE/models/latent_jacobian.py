@@ -91,6 +91,15 @@ class LitLatentJacobianODE(LitBase):
         # averaging dilutes the "genuinely hard" prediction signal by 1/n_delays).
         # Default True so new sweeps get the matched behaviour without opt-in.
         trajectory_loss_most_recent=True,
+        # When True, the trajectory prediction loss compares decoded
+        # predictions to DECODED encoder ground truth (D(f(z_t)) vs
+        # D(z_{t+1})) instead of raw observations (D(f(z_t)) vs x_{t+1}).
+        # Cancels the obs-space reconstruction floor in the gradient
+        # signal to f, so the dynamics model isn't pulled toward
+        # directions that try (and fail) to compensate for decoder
+        # error. Decoder remains anchored to obs-space via the
+        # separate _reconstruction_loss term, which is unchanged.
+        decoded_only_pred_loss=False,
         # When True, training and validation skip ALL dynamics-related work
         # (trajectory rollout, loop closure, latent prediction, Jacobian /
         # eigenvalue diagnostics) and use only reconstruction + KL losses.
@@ -160,6 +169,7 @@ class LitLatentJacobianODE(LitBase):
             )
         self.reconstruction_mode = reconstruction_mode
         self.trajectory_loss_most_recent = trajectory_loss_most_recent
+        self.decoded_only_pred_loss = decoded_only_pred_loss
         self.encoder_only_mode = encoder_only_mode
         if reconstruction_mode == 'harmonic':
             obs_dim = encoder.n_latent
@@ -965,9 +975,33 @@ class LitLatentJacobianODE(LitBase):
                 reconstruction_mode if reconstruction_mode is not None
                 else self.reconstruction_mode
             )
-            loss = self._weighted_obs_loss(
-                obs_targets, decoded_pred, mode=effective_mode,
-            )
+
+            # Decoded encoder ground truth — D(z_{t+1}) — computed once
+            # under no_grad so it serves as a stop-grad'd target. Used by:
+            #   - the trajectory loss when decoded_only_pred_loss=True
+            #     (target = D(z_{t+1}) instead of x_{t+1}, cancels the
+            #     obs-space reconstruction floor in the gradient signal
+            #     to f). The encoder rec loss separately anchors D and E
+            #     to obs space, so this is safe.
+            #   - the dynamics_only / decoder_corrected MASE metrics in
+            #     the no_grad block below.
+            # No-grad'ing both encoder-of-x_{t+1} and decoder-of-z_{t+1}
+            # follows the BYOL/SimSiam target-network convention: stops
+            # the encoder from "drifting to make the target match the
+            # prediction" and keeps the decoder from collapsing both
+            # branches together.
+            with torch.no_grad():
+                z_true_padded = self._pad_to_full_dim(z_true_crop)
+                decoded_true = self.decode_trajectory(z_true_padded, c_windows)
+
+            if self.decoded_only_pred_loss:
+                loss = self._weighted_obs_loss(
+                    decoded_true, decoded_pred, mode=effective_mode,
+                )
+            else:
+                loss = self._weighted_obs_loss(
+                    obs_targets, decoded_pred, mode=effective_mode,
+                )
 
             # Metrics — when most_recent mode, evaluate on index 0 only so
             # that the unsupervised chaotic tail doesn't corrupt diagnostics.
@@ -1050,14 +1084,19 @@ class LitLatentJacobianODE(LitBase):
                 #     well decoded persistence does. Ratios how much the
                 #     dynamics adds over the decoder-baseline-prediction.
                 #
-                # Both reuse `decode(z_true_crop)` once.
-                z_true_padded = self._pad_to_full_dim(z_true_crop)
-                decoded_true = self.decode_trajectory(z_true_padded, c_windows)
+                # Reuses `decoded_true` already computed above for the
+                # decoded_only_pred_loss target.
                 if effective_mode == 'most_recent' and self._n_recent_dims is not None:
-                    decoded_true = decoded_true[..., :self._n_recent_dims]
+                    decoded_true_for_metrics = decoded_true[..., :self._n_recent_dims]
+                else:
+                    decoded_true_for_metrics = decoded_true
                 dec_true_m = (
-                    decoded_true.reshape(decoded_true.shape[0], decoded_true.shape[1], -1)
-                    if decoded_true.dim() > 3 else decoded_true
+                    decoded_true_for_metrics.reshape(
+                        decoded_true_for_metrics.shape[0],
+                        decoded_true_for_metrics.shape[1], -1,
+                    )
+                    if decoded_true_for_metrics.dim() > 3
+                    else decoded_true_for_metrics
                 )
                 metric_vals['dynamics_only_model_mae'] = torch.mean(
                     torch.abs(dec_m - dec_true_m)
