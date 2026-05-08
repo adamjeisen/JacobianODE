@@ -136,6 +136,7 @@ def train_from_arrays(
     condition_dim: Optional[int] = None,
     per_source_dynamics: bool = False,
     section_condition_values: Optional[list] = None,
+    decoded_only_pred_loss: bool = False,
 
     # ------------------------------ training ---------------------------
     lightning_kwargs: Optional[dict] = None,
@@ -399,6 +400,7 @@ def train_from_arrays(
             whiten_after_pre_pca=whiten_after_pre_pca,
             per_source_dynamics=per_source_dynamics,
             section_condition_values=section_condition_values,
+            decoded_only_pred_loss=decoded_only_pred_loss,
             encoder=encoder, encoder_kwargs=encoder_kwargs or {},
             dynamics_kwargs=dynamics_kwargs or {},
             n_target_dims=n_target_dims,
@@ -448,6 +450,7 @@ def _train_from_arrays_inner(
     pre_pca_per_area, pre_pca_var_threshold,
     whiten_after_pre_pca,
     per_source_dynamics, section_condition_values,
+    decoded_only_pred_loss,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -546,6 +549,7 @@ def _train_from_arrays_inner(
         whiten_after_pre_pca=whiten_after_pre_pca,
         per_source_dynamics=per_source_dynamics,
         section_condition_values=section_condition_values,
+        decoded_only_pred_loss=decoded_only_pred_loss,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
         n_target_dims=n_target_dims,
         n_target_var_threshold=n_target_var_threshold,
@@ -729,6 +733,7 @@ def _train_from_ragged_arrays_inner(
     pre_pca_per_area, pre_pca_var_threshold,
     whiten_after_pre_pca,
     per_source_dynamics, section_condition_values,
+    decoded_only_pred_loss,
     encoder, encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -869,6 +874,7 @@ def _train_from_ragged_arrays_inner(
         whiten_after_pre_pca=whiten_after_pre_pca,
         per_source_dynamics=per_source_dynamics,
         section_condition_values=section_condition_values,
+        decoded_only_pred_loss=decoded_only_pred_loss,
         encoder_kwargs=encoder_kwargs, dynamics_kwargs=dynamics_kwargs,
         n_target_dims=n_target_dims,
         n_target_var_threshold=n_target_var_threshold,
@@ -1557,6 +1563,7 @@ def _compose_cfg(
     pre_pca_per_area, pre_pca_var_threshold,
     whiten_after_pre_pca,
     per_source_dynamics, section_condition_values,
+    decoded_only_pred_loss,
     encoder_kwargs, dynamics_kwargs,
     n_target_dims, n_target_var_threshold, n_target_dim_method,
     prediction_steps, condition_dim,
@@ -1652,6 +1659,9 @@ def _compose_cfg(
             "++model.section_condition_values="
             + "[" + ",".join(repr(float(v)) for v in section_condition_values) + "]"
         )
+    overrides.append(
+        f"++model.decoded_only_pred_loss={str(bool(decoded_only_pred_loss)).lower()}"
+    )
     if save_dir is not None:
         overrides.append(f"++training.logger.save_dir={save_dir}")
     if wandb_entity is not None:
