@@ -382,6 +382,13 @@ def train_from_arrays(
 
     logging.basicConfig(level=log_level)
 
+    # Match the Hydra entry point (run_jacobians.py:103): enable TF32 matmul
+    # on Tensor-Core GPUs. ~30-50% speedup on A100/H100 with negligible
+    # precision impact. Set on the *outer* function so both the uniform-length
+    # inner (_train_from_arrays_inner) and the ragged inner
+    # (_train_from_ragged_arrays_inner) paths get it.
+    torch.set_float32_matmul_precision("high")
+
     try:
         common_kwargs = dict(
             values=values, dt=dt,
@@ -477,12 +484,6 @@ def _train_from_arrays_inner(
     from .metrics import compute_generalized_variance
 
     log = logging.getLogger("JacobianODE.train_from_arrays")
-
-    # Match the Hydra entry point (run_jacobians.py:103): enable TF32 matmul
-    # on Tensor-Core GPUs. ~30-50% speedup on A100/H100 with negligible
-    # precision impact. Without this, MindControl's train_from_arrays path
-    # silently misses out on the speedup that run_jacobians.py gets.
-    torch.set_float32_matmul_precision("high")
 
     # ---- Validate inputs --------------------------------------------------
     values_arr = np.asarray(values) if not isinstance(values, np.ndarray) else values
