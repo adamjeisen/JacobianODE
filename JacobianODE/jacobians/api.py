@@ -478,6 +478,12 @@ def _train_from_arrays_inner(
 
     log = logging.getLogger("JacobianODE.train_from_arrays")
 
+    # Match the Hydra entry point (run_jacobians.py:103): enable TF32 matmul
+    # on Tensor-Core GPUs. ~30-50% speedup on A100/H100 with negligible
+    # precision impact. Without this, MindControl's train_from_arrays path
+    # silently misses out on the speedup that run_jacobians.py gets.
+    torch.set_float32_matmul_precision("high")
+
     # ---- Validate inputs --------------------------------------------------
     values_arr = np.asarray(values) if not isinstance(values, np.ndarray) else values
     if values_arr.ndim != 3:
