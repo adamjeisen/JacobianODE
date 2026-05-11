@@ -85,7 +85,7 @@ def log(msg: str) -> None:
     print(f"[{utc_iso()}] {msg}", flush=True)
 
 
-CONTROLLER_HOST = "login006"  # pin to one login node to avoid NFS cache races
+CONTROLLER_HOST = "login008"  # pin to one login node to avoid NFS cache races
 
 
 def acquire_lock():
