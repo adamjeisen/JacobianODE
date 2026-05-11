@@ -62,7 +62,11 @@ class LitLatentJacobianODE(LitBase):
         jac_window_stride=None,
         true_lyapunov_exponents=None,
         reconstruction_loss_weight=1.0,
-        latent_prediction_loss_weight=0.0,
+        # Default 1.0 to match the JacobianODE Hydra convention
+        # (conf/training/training.yaml). Direct Python instantiation that
+        # used to silently get LPL=0 will now train this term — flip to 0.0
+        # explicitly for legacy fixed-encoder behavior.
+        latent_prediction_loss_weight=1.0,
         jac_consistency_weight=0.0,
         fnn_weight=0.0,
         fnn_normalize=False,
