@@ -64,6 +64,12 @@ lightning:
   kl_null_weight: null           # null-space MSE penalty; null = same as kl_dyn_weight
   kl_dyn_weight: 0.0            # dynamic subspace KL divergence (smoothness regularizer)
   reconstruction_mode: 'uniform'  # 'uniform' | 'harmonic' | 'most_recent'
+  # Split-mode loss: train decoder/encoder on full-window reconstruction (above),
+  # but evaluate the trajectory-prediction loss only on the most recent slice
+  # (forecast-relevant) so the prediction signal isn't diluted by 1/n_delays
+  # over slices that overlap with teacher-forced / encoded-clean input.
+  # Mirrors validation, which hardcodes 'most_recent' for val/trajectory_loss.
+  trajectory_loss_most_recent: true
 
   # Number of B×T Jacobian matrices to randomly sample for eigenvalue
   # computation during validation. Reduces val cost when B*T is large.
