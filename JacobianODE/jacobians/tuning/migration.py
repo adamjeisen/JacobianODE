@@ -443,35 +443,60 @@ def _synthesize_state_from_squeue(expected: dict) -> dict:
     ``_is_clean_for_migration`` reads: ``last_slurm_state``,
     ``slurm_job_ids``, ``classification``, ``migrated``.
 
-    We query *all* our PENDING tasks (across partitions) once, then
-    cross-reference with ``expected.slurm_arrays``. Cells whose task_id
-    appears in the pending set get last_slurm_state="PENDING"; others
-    get last_slurm_state=None (so they're skipped by the gate but
-    migrate_one would re-check via _squeue_state anyway).
+    Implementation: one squeue call enumerates *all* of the user's alive
+    tasks (any state), parsed into a ``{task_id: state}`` map. Each cell
+    in ``expected.slurm_arrays`` is then classified:
+
+    * task_id in the alive map → ``last_slurm_state`` = that state
+      ("PENDING", "RUNNING", "CONFIGURING", ...).
+    * task_id absent → cell is no longer alive (completed or scancelled
+      etc.). We set ``last_slurm_state="COMPLETED"`` and ``classification
+      ="done_external"`` so ``_is_clean_for_migration`` filters it out
+      via the *terminal classification* and *not_pending* gates,
+      preventing the migration loop from wasting its budget on cells it
+      can't migrate.
+
     ``migrated`` is read from ``expected.partition_per_cell`` — if a
     cell is already on mit_normal_gpu, mark it migrated=1 to prevent
     double-migration.
     """
     try:
         out = subprocess.run(
-            ["squeue", "-u", _slurm_user(), "-h", "-t", "PD", "-r", "-o", "%i"],
+            ["squeue", "-u", _slurm_user(), "-h", "-r", "-o", "%i %T"],
             check=False, capture_output=True, text=True, timeout=15,
         ).stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         out = ""
-    pending = {line.strip() for line in out.splitlines() if line.strip()}
+    alive: dict[str, str] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            alive[parts[0]] = parts[1].upper()
 
     pcp = expected.get("partition_per_cell", {}) or {}
     runs = {}
     for k, task_id in (expected.get("slurm_arrays") or {}).items():
-        is_pending = task_id in pending
+        live_state = alive.get(task_id)
         already_migrated = pcp.get(k) == "mit_normal_gpu"
-        runs[str(k)] = {
-            "slurm_job_ids": [task_id],
-            "last_slurm_state": "PENDING" if is_pending else None,
-            "classification": "",
-            "migrated": 1 if already_migrated else 0,
-        }
+        if live_state is None:
+            # Not in squeue: cell is no longer alive. Mark terminal so
+            # _is_clean_for_migration filters it out cheaply.
+            runs[str(k)] = {
+                "slurm_job_ids": [task_id],
+                "last_slurm_state": "COMPLETED",
+                "classification": "done_external",
+                "migrated": 1 if already_migrated else 0,
+            }
+        else:
+            runs[str(k)] = {
+                "slurm_job_ids": [task_id],
+                "last_slurm_state": live_state,
+                "classification": "",
+                "migrated": 1 if already_migrated else 0,
+            }
     return {"runs": runs}
 
 
