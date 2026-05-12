@@ -296,16 +296,20 @@ def migrate_one(
     # original cpus/mem/timeout from expected["slurm"] — the MIT_NORMAL_GPU
     # *constant* uses JacobianODE defaults (4 cpus / 16GB / 180min) that
     # don't fit MC cells (typically 2 cpus / 128GB / 360min). Mismatch
-    # would OOM at runtime or hit walltime early. Always pin to H200
-    # since mit_normal_gpu also has L40S (48GB) nodes that OOM on the
-    # heavier cells (nd >= 15).
+    # would OOM at runtime or hit walltime early. We also inherit gres
+    # from the original sweep's spec (so cells that requested a specific
+    # GPU type keep that constraint). For the common case of "gpu:1"
+    # (any GPU), this allows SLURM to schedule onto either H200 (80GB)
+    # or L40S (48GB) — light cells fit fine on L40S; heavier ones may
+    # OOM there, but the visibility outweighs locking ourselves out of
+    # all L40S slots.
     if is_mc:
         sweep_slurm = expected.get("slurm", {}) or {}
         mit_spec = PartitionSpec(
             partition="mit_normal_gpu",
             account="mit_amf_advanced_gpu",
             qos="mit_amf_advanced_gpu",
-            gres="gpu:h200:1",
+            gres=str(sweep_slurm.get("gres", "gpu:1")),
             cpus_per_task=int(sweep_slurm.get("cpus_per_task", 4)),
             mem=str(sweep_slurm.get("mem", "16GB")),
             timeout_min=int(sweep_slurm.get("timeout_min", 180)),
