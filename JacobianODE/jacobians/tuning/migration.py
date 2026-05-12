@@ -292,16 +292,35 @@ def migrate_one(
         })
         return False
 
-    # 3. sbatch new task on mit
+    # 3. sbatch new task on mit. For MC sweeps, inherit the sweep's
+    # original cpus/mem/timeout from expected["slurm"] — the MIT_NORMAL_GPU
+    # *constant* uses JacobianODE defaults (4 cpus / 16GB / 180min) that
+    # don't fit MC cells (typically 2 cpus / 128GB / 360min). Mismatch
+    # would OOM at runtime or hit walltime early. Always pin to H200
+    # since mit_normal_gpu also has L40S (48GB) nodes that OOM on the
+    # heavier cells (nd >= 15).
+    if is_mc:
+        sweep_slurm = expected.get("slurm", {}) or {}
+        mit_spec = PartitionSpec(
+            partition="mit_normal_gpu",
+            account="mit_amf_advanced_gpu",
+            qos="mit_amf_advanced_gpu",
+            gres="gpu:h200:1",
+            cpus_per_task=int(sweep_slurm.get("cpus_per_task", 4)),
+            mem=str(sweep_slurm.get("mem", "16GB")),
+            timeout_min=int(sweep_slurm.get("timeout_min", 180)),
+        )
+    else:
+        mit_spec = MIT_NORMAL_GPU
     try:
         if is_mc:
             new_task = submit_mc_cell(
-                expected, run_idx, MIT_NORMAL_GPU, sweeps_dir,
+                expected, run_idx, mit_spec, sweeps_dir,
                 job_name_prefix="mc_migrated",
             )
         else:
             new_task = submit_cell(
-                expected, run_idx, MIT_NORMAL_GPU, sweeps_dir,
+                expected, run_idx, mit_spec, sweeps_dir,
                 job_name_prefix="jacobian_migrated",
             )
     except subprocess.CalledProcessError as e:
@@ -329,7 +348,7 @@ def migrate_one(
     try:
         _atomic_update_json(
             expected_path,
-            lambda doc: _apply_migration(doc, run_idx, new_task, MIT_NORMAL_GPU),
+            lambda doc: _apply_migration(doc, run_idx, new_task, mit_spec),
         )
     except Exception as e:
         logger.error(
