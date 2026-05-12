@@ -1807,12 +1807,26 @@ def main() -> int:
         # Dynamic migration step. Runs AFTER monitor so the next monitor
         # cycle picks up the new task IDs and doesn't trigger spurious
         # retries on the scancel'd old tasks.
+        #
+        # Called twice — once for JacobianODE-native sweeps (read from
+        # SWEEPS_DIR/active/), once for MindControl mc-sweeps (read from
+        # MC_SWEEPS_DIR/active/). Each call queries count_running_mit_jobs()
+        # itself, so the global QOS budget (MIT_BUDGET=4) is naturally
+        # shared: by the time the second call runs, any cells migrated by
+        # the first will already be counted as RUNNING/PENDING on
+        # mit_normal_gpu and reduce the available budget.
         try:
             mig_summary = process_migrations(SWEEPS_DIR)
             if mig_summary["migrated"] or mig_summary["attempted"]:
-                log(f"[migration] cycle: {mig_summary}")
+                log(f"[migration jode] cycle: {mig_summary}")
         except Exception as e:
-            log(f"[migration] process_migrations raised: {e}")
+            log(f"[migration jode] process_migrations raised: {e}")
+        try:
+            mig_summary_mc = process_migrations(MC_SWEEPS_DIR)
+            if mig_summary_mc["migrated"] or mig_summary_mc["attempted"]:
+                log(f"[migration mc] cycle: {mig_summary_mc}")
+        except Exception as e:
+            log(f"[migration mc] process_migrations raised: {e}")
 
         inflight = load_inflight()
         n_disp = dispatch_pending_analyses(inflight)

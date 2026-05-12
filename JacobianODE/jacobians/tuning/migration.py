@@ -35,6 +35,7 @@ from .cell_submit import (
     OU_BCS_NORMAL,
     PartitionSpec,
     submit_cell,
+    submit_mc_cell,
 )
 
 logger = logging.getLogger(__name__)
@@ -243,6 +244,7 @@ def migrate_one(
     The function is idempotent at journal-entry granularity: if it crashes
     mid-execution, ``audit_journals`` reconciles on next controller startup.
     """
+    is_mc = expected.get("kind") == "mc"
     journal = _journal_path(sweeps_dir, group)
     old_task = expected.get("slurm_arrays", {}).get(str(run_idx))
     if not old_task:
@@ -261,11 +263,15 @@ def migrate_one(
         "stage": "scancel_initiated",
     })
 
-    # 2. scancel old (use bare jobid for arrays — splits "12345_3" -> "12345")
-    bare_jobid = old_task.split("_")[0]
+    # 2. scancel old. For JacobianODE-native sweeps each cell is its own
+    # standalone job, so the bare jobid (no array suffix) works fine; we
+    # split off any "_N" defensively. For MC sweeps the cell is one task
+    # of a shared array (e.g. "13794466_17"), and bare-jobid scancel would
+    # kill the WHOLE array — we must use the full task_id.
+    scancel_target = old_task if is_mc else old_task.split("_")[0]
     try:
         subprocess.run(
-            ["scancel", bare_jobid], check=True,
+            ["scancel", scancel_target], check=True,
             capture_output=True, text=True, timeout=10,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -288,10 +294,16 @@ def migrate_one(
 
     # 3. sbatch new task on mit
     try:
-        new_task = submit_cell(
-            expected, run_idx, MIT_NORMAL_GPU, sweeps_dir,
-            job_name_prefix="jacobian_migrated",
-        )
+        if is_mc:
+            new_task = submit_mc_cell(
+                expected, run_idx, MIT_NORMAL_GPU, sweeps_dir,
+                job_name_prefix="mc_migrated",
+            )
+        else:
+            new_task = submit_cell(
+                expected, run_idx, MIT_NORMAL_GPU, sweeps_dir,
+                job_name_prefix="jacobian_migrated",
+            )
     except subprocess.CalledProcessError as e:
         logger.error(
             f"[migrate fail] {group}/r{run_idx} sbatch on mit failed: "
@@ -423,6 +435,46 @@ def _select_candidates(
     return candidates
 
 
+def _synthesize_state_from_squeue(expected: dict) -> dict:
+    """Build a state-shaped dict from a single squeue query.
+
+    Used for MC sweeps (kind == "mc"), which have no monitor to write
+    state.json. The synthesized state populates only the fields that
+    ``_is_clean_for_migration`` reads: ``last_slurm_state``,
+    ``slurm_job_ids``, ``classification``, ``migrated``.
+
+    We query *all* our PENDING tasks (across partitions) once, then
+    cross-reference with ``expected.slurm_arrays``. Cells whose task_id
+    appears in the pending set get last_slurm_state="PENDING"; others
+    get last_slurm_state=None (so they're skipped by the gate but
+    migrate_one would re-check via _squeue_state anyway).
+    ``migrated`` is read from ``expected.partition_per_cell`` — if a
+    cell is already on mit_normal_gpu, mark it migrated=1 to prevent
+    double-migration.
+    """
+    try:
+        out = subprocess.run(
+            ["squeue", "-u", _slurm_user(), "-h", "-t", "PD", "-r", "-o", "%i"],
+            check=False, capture_output=True, text=True, timeout=15,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        out = ""
+    pending = {line.strip() for line in out.splitlines() if line.strip()}
+
+    pcp = expected.get("partition_per_cell", {}) or {}
+    runs = {}
+    for k, task_id in (expected.get("slurm_arrays") or {}).items():
+        is_pending = task_id in pending
+        already_migrated = pcp.get(k) == "mit_normal_gpu"
+        runs[str(k)] = {
+            "slurm_job_ids": [task_id],
+            "last_slurm_state": "PENDING" if is_pending else None,
+            "classification": "",
+            "migrated": 1 if already_migrated else 0,
+        }
+    return {"runs": runs}
+
+
 def process_sweep_migrations(
     expected_path: Path, sweeps_dir: Path, budget: int,
 ) -> tuple[int, int]:
@@ -440,16 +492,21 @@ def process_sweep_migrations(
     if not group:
         return 0, 0
 
-    state_path = expected_path.with_name(f"{group}.state.json")
-    if not state_path.is_file():
-        # No monitor state yet → cannot tell which cells are PENDING. Skip
-        # this cycle — monitor will write state.json shortly.
-        return 0, 0
-    try:
-        state = json.loads(state_path.read_text())
-    except Exception as e:
-        logger.warning(f"[migration {group}] state.json parse fail: {e}")
-        return 0, 0
+    is_mc = expected.get("kind") == "mc"
+    if is_mc:
+        # MC sweeps have no monitor → no state.json. Synthesize from squeue.
+        state = _synthesize_state_from_squeue(expected)
+    else:
+        state_path = expected_path.with_name(f"{group}.state.json")
+        if not state_path.is_file():
+            # No monitor state yet → cannot tell which cells are PENDING. Skip
+            # this cycle — monitor will write state.json shortly.
+            return 0, 0
+        try:
+            state = json.loads(state_path.read_text())
+        except Exception as e:
+            logger.warning(f"[migration {group}] state.json parse fail: {e}")
+            return 0, 0
 
     candidates = _select_candidates(expected, state, max_count=budget)
     if not candidates:

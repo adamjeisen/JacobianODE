@@ -164,3 +164,67 @@ def submit_cell(
         f"on partition={partition.partition}"
     )
     return jid
+
+
+def build_mc_run_cmd(
+    mc_repo: str,
+    instruction_path: str,
+    cell_index: int,
+    uv: str = UV_PATH,
+) -> str:
+    """Build the wrapped run command for a MindControl cell.
+
+    Mirrors the wrap built in ``mindcontrol/cli/mc_sbatch.py``, but with a
+    fixed ``--cell-index`` instead of ``$SLURM_ARRAY_TASK_ID`` since
+    migrated cells run as standalone (non-array) sbatch jobs.
+    """
+    parts = [
+        "cd", mc_repo, "&&",
+        "OPENBLAS_NUM_THREADS=4", "HDF5_USE_FILE_LOCKING=FALSE",
+        uv, "run", "--no-sync",
+        "python", "-m", "mindcontrol.sweep_cell",
+        "--instruction-path", instruction_path,
+        "--cell-index", str(cell_index),
+    ]
+    return " ".join(parts)
+
+
+def submit_mc_cell(
+    expected: dict,
+    run_idx: int,
+    partition: PartitionSpec,
+    sweeps_dir: Path,
+    job_name_prefix: str = "mc_migrated",
+) -> str:
+    """Submit a single MindControl sweep cell as a one-off sbatch job.
+
+    Parallel to :func:`submit_cell` but for MC sweeps. Reads MC-specific
+    fields from ``expected["mc"]`` (instruction_path, mc_repo, uv).
+    Returns the SLURM job id (bare, no array suffix). Raises on sbatch
+    failure.
+
+    See JacobianODE/docs/mc_migration_plan.md for the migration design.
+    """
+    mc = expected["mc"]
+    instruction_path = mc["instruction_path"]
+    mc_repo = mc["mc_repo"]
+    uv = mc.get("uv", UV_PATH)
+    group = expected["wandb"]["group"]
+
+    wrap_cmd = build_mc_run_cmd(mc_repo, instruction_path, run_idx, uv=uv)
+
+    log_dir = sweeps_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    job_name = f"{job_name_prefix}_{group[:40]}_r{run_idx}"
+    sbatch_args = build_sbatch_args(partition, job_name, log_dir, wrap_cmd)
+
+    result = subprocess.run(
+        sbatch_args, check=True, capture_output=True, text=True,
+    )
+    jid = result.stdout.strip()
+    logger.info(
+        f"submit_mc_cell {group}/cell_index={run_idx} -> SLURM job {jid} "
+        f"on partition={partition.partition}"
+    )
+    return jid
