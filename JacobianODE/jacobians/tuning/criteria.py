@@ -25,7 +25,14 @@ class DiagnosticMetrics:
 
     Attributes:
         one_step_mase: Mean one-step MASE (teacher-forced).  A value < 1
-            means the model beats the persistence baseline.
+            means the model beats the (raw) persistence baseline.
+        decoder_corrected_one_step_mase: One-step MASE using
+            decoded-persistence as the baseline (i.e., the dynamics model's
+            value-add ON TOP OF the encoder-decoder reconstruction floor).
+            Preferred for C1 when present — the raw one_step_mase
+            conflates encoder-decoder reconstruction error with dynamics
+            error, which can spuriously fail strong dynamics models with
+            imperfect autoencoders. ``None`` when not logged (legacy runs).
         loop_closure_loss: Mean loop closure MSE (None for NeuralODE).
         fast_eigenvalue_fraction: Fraction of eigenvalues with real part < -1/dt.
         trajectory_val_loss: Trajectory validation loss (used for final ranking).
@@ -35,6 +42,7 @@ class DiagnosticMetrics:
     loop_closure_loss: Optional[float]
     fast_eigenvalue_fraction: float
     trajectory_val_loss: float
+    decoder_corrected_one_step_mase: Optional[float] = None
 
 
 def compute_all_diagnostics(
@@ -197,8 +205,16 @@ def compute_all_diagnostics(
 def fails_one_step_criterion(metrics: DiagnosticMetrics) -> bool:
     """C1: Does the model fail the one-step MASE criterion?
 
-    A model fails if its one-step MASE exceeds 1.0, meaning it is worse
-    than the persistence baseline (predicting the previous value).
+    Prefers ``decoder_corrected_one_step_mase`` when available — that
+    metric uses *decoded persistence* (decode(encode(x_t)) → x_{t+1}) as
+    the baseline, so it isolates dynamics-model quality from autoencoder
+    reconstruction error. A model fails if this MASE exceeds 1.0,
+    meaning the dynamics model is worse than just decoding the last
+    encoded state (i.e., the dynamics term adds no value beyond what
+    the autoencoder already provides).
+
+    For runs that lack the corrected metric (legacy runs), falls back to
+    raw ``one_step_mase`` against raw persistence.
 
     Args:
         metrics: Diagnostic metrics for the model.
@@ -206,6 +222,8 @@ def fails_one_step_criterion(metrics: DiagnosticMetrics) -> bool:
     Returns:
         True if the model FAILS (should be excluded).
     """
+    if metrics.decoder_corrected_one_step_mase is not None:
+        return metrics.decoder_corrected_one_step_mase > 1.0
     return metrics.one_step_mase > 1.0
 
 
@@ -329,8 +347,16 @@ def diagnostics_from_wandb(
     if "val/fast_eigenvalue_fraction" in row.index and pd.notna(row.get("val/fast_eigenvalue_fraction")):
         fast_eig_frac = float(row["val/fast_eigenvalue_fraction"])
 
+    decoder_corrected: Optional[float] = None
+    if (
+        "val/decoder_corrected_one_step_mase" in row.index
+        and pd.notna(row.get("val/decoder_corrected_one_step_mase"))
+    ):
+        decoder_corrected = float(row["val/decoder_corrected_one_step_mase"])
+
     return DiagnosticMetrics(
         one_step_mase=float(row["val/one_step_mase"]),
+        decoder_corrected_one_step_mase=decoder_corrected,
         loop_closure_loss=loop_closure_loss,
         fast_eigenvalue_fraction=fast_eig_frac,
         trajectory_val_loss=float(m.loc[best_idx]),
