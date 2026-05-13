@@ -36,10 +36,12 @@ from figures.style import COLORS, apply_style, save_fig, sem  # noqa: E402
 
 
 SERIES_SPEC = [
-    # (npz_key, display label, color, marker)
-    ("pred_batch_burnin", "Predicted (batch + burn-in)", COLORS["pred_batch"], "o"),
-    ("pred_full",         "Predicted (full trajectory)", COLORS["pred_full"],  "s"),
-    ("empirical_full",    "Empirical (true Jacobian)",   COLORS["empirical"],  "D"),
+    # (npz_key, display label, color, marker, linestyle)
+    # Both JacobianODE series share the pink (model role); differentiated
+    # by linestyle. Empirical (true Jacobian) is the charcoal ground-truth.
+    ("pred_batch_burnin", "Predicted (batch + burn-in)", COLORS["pred_batch"], "o", ":"),
+    ("pred_full",         "Predicted (full trajectory)", COLORS["pred_full"],  "s", "-"),
+    ("empirical_full",    "Empirical (true Jacobian)",   COLORS["empirical"],  "D", "-"),
 ]
 
 
@@ -71,7 +73,7 @@ def plot_lyapunov(
 
     fig, ax = plt.subplots(figsize=(width_in, height_in))
 
-    for key, label, color, marker in SERIES_SPEC:
+    for key, label, color, marker, linestyle in SERIES_SPEC:
         if key not in data or not data[key].size:
             continue
         arr = data[key]  # (n_samples, n_lyaps)
@@ -79,7 +81,7 @@ def plot_lyapunov(
         err = sem(arr, axis=0)
         ax.errorbar(
             x_idx, mean[:n_lyaps], yerr=err[:n_lyaps],
-            fmt=marker + "-", color=color, label=label,
+            marker=marker, linestyle=linestyle, color=color, label=label,
             capsize=2.5, capthick=0.8, elinewidth=0.8,
             zorder=3,
         )
@@ -89,19 +91,7 @@ def plot_lyapunov(
     ax.set_ylabel("Lyapunov exponent")
     ax.set_xticks(x_idx)
     ax.legend(frameon=False, loc="best")
-
-    # Surface useful metadata in the title (if present).
-    title_bits = []
-    if "group" in data.files:
-        # numpy can return 0-d arrays for scalars; cast through .item()
-        title_bits.append(str(data["group"].item() if data["group"].ndim == 0 else data["group"][0])[:60])
-    if "run_id" in data.files:
-        title_bits.append(f"run={data['run_id'].item() if data['run_id'].ndim == 0 else data['run_id']}")
-    if "loop_closure_weight" in data.files:
-        lc = data["loop_closure_weight"].item()
-        title_bits.append(f"λ_LC={lc:g}")
-    if title_bits:
-        ax.set_title("  •  ".join(title_bits), fontsize=plt.rcParams["axes.titlesize"] - 1)
+    # No title: filename / output dir encode the (group, run) metadata.
 
     fig.tight_layout()
     saved = save_fig(fig, fig_name, out_dir)

@@ -28,19 +28,26 @@ COL_WIDTH_PAPER = 3.5
 TWO_COL_WIDTH_PAPER = 7.0
 
 
-# Role → hex. Pick colorblind-safe combos (Okabe-Ito-derived).
+# Role → hex. Borrowed from ChaoticConsciousness Fig 4 + S2: pink for the
+# model output (JacobianODE) and charcoal for ground-truth references.
+# All three Lyapunov series use these two roles — the two JacobianODE
+# series (batch+burnin, full trajectory) share the same pink and are
+# differentiated by linestyle in plot.py.
+JACODE_PINK = "#e12d8a"
+GROUND_CHARCOAL = "#3a3a3a"
+
 COLORS = {
     # Lyapunov-spectrum series
-    "pred_batch": "#1f77b4",   # blue   — predicted (batch + burn-in)
-    "pred_full":  "#ff7f0e",   # orange — predicted (full trajectory)
-    "empirical":  "#2ca02c",   # green  — empirical (true Jacobian)
+    "pred_batch": JACODE_PINK,
+    "pred_full":  JACODE_PINK,
+    "empirical":  GROUND_CHARCOAL,
     # Generic semantic
-    "true":       "#000000",   # black  — reserved for ground-truth references
-    "model":      "#1f77b4",   # blue
-    "baseline":   "#7f7f7f",   # gray
-    # Sweep-axis encoding
-    "nt99":       "#1f77b4",
-    "nt95":       "#d62728",
+    "model":      JACODE_PINK,        # JacobianODE / model outputs
+    "true":       GROUND_CHARCOAL,    # ground-truth references
+    "baseline":   "#bbbbbb",          # light gray (persistence-style)
+    # Sweep-axis encoding (chill pastel pair, also from ChaoticConsciousness)
+    "nt99":       "#809BCE",          # soft blue
+    "nt95":       "#e12d8a",          # JacobianODE pink
 }
 
 
