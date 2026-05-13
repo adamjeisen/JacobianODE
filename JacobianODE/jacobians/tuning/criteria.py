@@ -43,6 +43,14 @@ class DiagnosticMetrics:
     fast_eigenvalue_fraction: float
     trajectory_val_loss: float
     decoder_corrected_one_step_mase: Optional[float] = None
+    # Per-run dynamic-subspace dimension. For latent models with PCA
+    # autodim, n_target_dims varies between runs (each picks its own
+    # latent dim from the variance threshold). C2 threshold is
+    # sqrt(n_dyn), so it should be evaluated per-run, not against a
+    # single sweep-wide scalar. ``None`` when not known (legacy runs);
+    # fails_loop_closure_criterion + plot_sweep_overview both fall back
+    # to a scalar argument in that case.
+    n_dyn: Optional[int] = None
 
 
 def compute_all_diagnostics(
@@ -247,7 +255,11 @@ def fails_loop_closure_criterion(
     """
     if metrics.loop_closure_loss is None:
         return False
-    return metrics.loop_closure_loss > math.sqrt(loop_closure_n_dims)
+    # Prefer per-run n_dyn when known (each cell's PCA-autodim picks its
+    # own dynamic-subspace dimension, so the threshold differs per cell).
+    # Fall back to the scalar arg for legacy runs that don't carry n_dyn.
+    n = metrics.n_dyn if metrics.n_dyn is not None else loop_closure_n_dims
+    return metrics.loop_closure_loss > math.sqrt(n)
 
 
 def fails_eigenvalue_criterion(
@@ -354,10 +366,23 @@ def diagnostics_from_wandb(
     ):
         decoder_corrected = float(row["val/decoder_corrected_one_step_mase"])
 
+    # Per-run dynamic-subspace dim, read from the run's config. This
+    # may vary across runs in a PCA-autodim sweep, so capturing it
+    # per-run lets C2 use the right sqrt(n_dyn) threshold per cell.
+    n_dyn: Optional[int] = None
+    try:
+        cfg_model = run.config.get("model") or {}
+        ntd = cfg_model.get("n_target_dims")
+        if ntd is not None:
+            n_dyn = int(ntd)
+    except Exception:
+        pass
+
     return DiagnosticMetrics(
         one_step_mase=float(row["val/one_step_mase"]),
         decoder_corrected_one_step_mase=decoder_corrected,
         loop_closure_loss=loop_closure_loss,
         fast_eigenvalue_fraction=fast_eig_frac,
         trajectory_val_loss=float(m.loc[best_idx]),
+        n_dyn=n_dyn,
     )

@@ -255,13 +255,47 @@ def plot_sweep_overview(
 ) -> plt.Figure:
     """4-panel bar chart of sweep selection criteria.
 
-    ``n_dyn`` is the dimensionality of the loop-closure space (the
-    dynamic subspace, ``n_target_dims``, for latent models with a
-    subspace split; equal to ``n_latent`` otherwise). The C2 threshold
-    drawn on panel (0, 1) is ``sqrt(n_dyn)``.
+    ``n_dyn`` is the *fallback* dynamic-subspace dim used when an
+    individual run doesn't carry its own per-run ``n_dyn`` on its
+    DiagnosticMetrics (legacy data). When metrics DO carry per-run
+    ``n_dyn``, the C2 panel plots the **ratio** ``LC_loss / sqrt(n_dyn)``
+    so the C2 pass-fail threshold is always at y=1 — important for
+    PCA-autodim sweeps where each cell has a different ``n_dyn`` and
+    therefore a different absolute LC threshold.
+
+    The C1 panel uses ``decoder_corrected_one_step_mase`` when present
+    (isolates dynamics-model error from autoencoder reconstruction
+    error); falls back to raw ``one_step_mase`` otherwise.
     """
-    one_step_mases = [m.one_step_mase for m in all_diagnostics]
-    loop_closure_losses = [m.loop_closure_loss for m in all_diagnostics]
+    # Per-cell MASE: prefer decoder-corrected (matches the C1 selection
+    # criterion). Fall back to raw one_step_mase for cells that lack it.
+    one_step_mases = [
+        m.decoder_corrected_one_step_mase if m.decoder_corrected_one_step_mase is not None
+        else m.one_step_mase
+        for m in all_diagnostics
+    ]
+    mase_labels_corrected = all(
+        m.decoder_corrected_one_step_mase is not None for m in all_diagnostics
+    )
+    # Per-cell LC ratio when per-run n_dyn is known on every cell.
+    # When a cell is missing n_dyn (legacy), fall back to the scalar arg.
+    all_have_n_dyn = all(m.n_dyn is not None for m in all_diagnostics)
+    if all_have_n_dyn:
+        lc_metric = [
+            (m.loop_closure_loss / math.sqrt(m.n_dyn))
+            if m.loop_closure_loss is not None else float("nan")
+            for m in all_diagnostics
+        ]
+        lc_ylabel = r"LC loss / $\sqrt{n_{\mathrm{dyn}}}$"
+        lc_title = "C2: Loop Closure (per-run threshold)"
+        lc_thresh_y = 1.0
+        lc_thresh_label = r"$\sqrt{n_{\mathrm{dyn}}}$ threshold (ratio = 1)"
+    else:
+        lc_metric = [m.loop_closure_loss for m in all_diagnostics]
+        lc_ylabel = "Loop closure loss"
+        lc_title = "C2: Loop Closure"
+        lc_thresh_y = math.sqrt(n_dyn)
+        lc_thresh_label = f"sqrt(n_dyn)={math.sqrt(n_dyn):.2f}"
     eig_fracs = [m.fast_eigenvalue_fraction for m in all_diagnostics]
     traj_losses = [m.trajectory_val_loss for m in all_diagnostics]
 
@@ -283,21 +317,23 @@ def plot_sweep_overview(
     axes[0, 0].set_xticks(x_pos)
     axes[0, 0].set_xticklabels(x_labels, rotation=45, ha="right")
     axes[0, 0].set_ylabel("MASE")
-    axes[0, 0].set_title("C1: One-step MASE")
+    axes[0, 0].set_title(
+        "C1: Decoder-corrected one-step MASE" if mase_labels_corrected
+        else "C1: One-step MASE"
+    )
     axes[0, 0].set_yscale("log")
     axes[0, 0].legend(fontsize=8)
 
-    # C2: loop closure loss
-    axes[0, 1].bar(x_pos, loop_closure_losses, color=colors)
+    # C2: loop closure (ratio LC_loss / sqrt(n_dyn) when per-run n_dyn known)
+    axes[0, 1].bar(x_pos, lc_metric, color=colors)
     if result.best_index is not None:
-        axes[0, 1].bar(result.best_index, loop_closure_losses[result.best_index],
+        axes[0, 1].bar(result.best_index, lc_metric[result.best_index],
                        color="gold", edgecolor="black", linewidth=2, label="Selected")
-    axes[0, 1].axhline(y=np.sqrt(n_dyn), color="k", linestyle="--", lw=1,
-                       label=f"sqrt(n_dyn)={np.sqrt(n_dyn):.2f}")
+    axes[0, 1].axhline(y=lc_thresh_y, color="k", linestyle="--", lw=1, label=lc_thresh_label)
     axes[0, 1].set_xticks(x_pos)
     axes[0, 1].set_xticklabels(x_labels, rotation=45, ha="right")
-    axes[0, 1].set_ylabel("Loop closure loss")
-    axes[0, 1].set_title("C2: Loop Closure")
+    axes[0, 1].set_ylabel(lc_ylabel)
+    axes[0, 1].set_title(lc_title)
     axes[0, 1].legend(fontsize=8)
     axes[0, 1].set_yscale("log")
 
