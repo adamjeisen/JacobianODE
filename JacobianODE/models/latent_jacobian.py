@@ -120,10 +120,27 @@ class LitLatentJacobianODE(LitBase):
         # profile_output="<path>.csv"    → append CSV rows to that file
         profile_output=None,
         profile_steps=1,   # print/log every N steps
+        # EMA latent normalization of the z_dyn input to the dynamics MLP.
+        # When True, maintain a detached EMA of the SCALAR mean/std of z_dyn
+        # over training batches and feed (z_dyn - mean)/std to the dynamics
+        # model in compute_jacobians (only). Tests whether the near-constant
+        # Jacobian is a z_dyn-scale/gradient artifact vs the data being
+        # genuinely linear. Encoder/reconstruction/loop-closure untouched.
+        latent_norm_ema=False,
+        latent_norm_ema_decay=0.99,
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
         self.encoder = encoder
+        # --- EMA latent-normalization state (scalar mean/std of z_dyn) ---
+        self.latent_norm_ema = latent_norm_ema
+        self.latent_norm_ema_decay = latent_norm_ema_decay
+        # Buffers persist in the checkpoint and apply identically at val /
+        # inference (same fixed affine at every timestep — required so the
+        # normalized latent is still an autonomous dynamical system).
+        self.register_buffer('z_norm_mean', torch.zeros(()))
+        self.register_buffer('z_norm_std', torch.ones(()))
+        self.register_buffer('z_norm_inited', torch.zeros((), dtype=torch.bool))
         self.decode_only_recent = decode_only_recent
         self.prediction_steps = prediction_steps
         self.encoder_warmup_epochs = encoder_warmup_epochs
@@ -685,7 +702,28 @@ class LitLatentJacobianODE(LitBase):
             when the dynamics MLP was built with ``condition_dim > 0``.
         """
         d = batch.shape[-1]
-        return self.model(batch, c).reshape(*batch.shape[:-1], d, d)
+        x = batch
+        if self.latent_norm_ema and bool(self.z_norm_inited):
+            x = (batch - self.z_norm_mean) / self.z_norm_std
+        return self.model(x, c).reshape(*batch.shape[:-1], d, d)
+
+    def _update_latent_norm_ema(self, z_dyn):
+        """Detached scalar-EMA update of z_dyn mean/std (call in training
+        only). First call initializes from the batch; subsequent calls EMA
+        with decay ``latent_norm_ema_decay``. No-op when disabled."""
+        if not self.latent_norm_ema:
+            return
+        with torch.no_grad():
+            m = z_dyn.mean()
+            s = z_dyn.std().clamp_min(1e-6)
+            if not bool(self.z_norm_inited):
+                self.z_norm_mean.copy_(m)
+                self.z_norm_std.copy_(s)
+                self.z_norm_inited.fill_(True)
+            else:
+                dec = self.latent_norm_ema_decay
+                self.z_norm_mean.mul_(dec).add_(m, alpha=1.0 - dec)
+                self.z_norm_std.mul_(dec).add_(s, alpha=1.0 - dec)
 
     # ------------------------------------------------------------------
     # Lyapunov exponents
@@ -1438,6 +1476,7 @@ class LitLatentJacobianODE(LitBase):
             with torch.no_grad():
                 z_for_tf = self.encode_trajectory(batch, c)
                 z_for_tf_dyn, _ = self._split_latent(z_for_tf)
+                self._update_latent_norm_ema(z_for_tf_dyn)
                 jacs_pred = self.compute_jacobians(z_for_tf_dyn, c)
             jac_norm = torch.linalg.norm(
                 jacs_pred, dim=(-2, -1), ord=self.jac_norm_ord
@@ -1880,6 +1919,50 @@ class LitLatentJacobianODE(LitBase):
                         n_total = 0
             self._val_eig_too_fast.append(n_too_fast)
             self._val_eig_total.append(n_total)
+
+            # Per-condition Jacobian temporal-variation diagnostic
+            # (first val batch per epoch). Tracks whether the learned
+            # dynamics produce *time-varying* Jacobians within a single
+            # condition — the signature of genuine nonlinearity, as
+            # opposed to a near-constant (effectively linear) flow. The
+            # metric is the per-entry temporal coefficient of variation
+            #   CV_ij = std_t(J_ij) / |mean_t(J_ij)|
+            # averaged over Jacobian entries and over the trajectories
+            # belonging to each condition. Reuses the `pred_jacs`
+            # (B, T, D, D) already materialised for the eigval diagnostic.
+            with self._timed("val/6b.jac_temporal_cv"):
+                with torch.no_grad():
+                    mean_t = pred_jacs.mean(dim=1)              # (B, D, D)
+                    std_t = pred_jacs.std(dim=1)                # (B, D, D)
+                    cv_entry = std_t / mean_t.abs().clamp_min(1e-8)
+                    cv_per_traj = cv_entry.mean(dim=(-1, -2))   # (B,)
+                    if c is not None:
+                        # Condition is constant along time per trajectory;
+                        # take its value at the first flattened position.
+                        c_traj = c.reshape(c.shape[0], -1)[:, 0]  # (B,)
+                    else:
+                        c_traj = torch.zeros(
+                            pred_jacs.shape[0], device=pred_jacs.device
+                        )
+                    for cv in torch.unique(c_traj):
+                        mask = (c_traj == cv)
+                        v = cv_per_traj[mask]
+                        v = v[torch.isfinite(v)]
+                        if v.numel() == 0:
+                            continue
+                        self.log(
+                            f"val/jac_temporal_cv_cond{cv.item():+.0f}",
+                            v.mean(),
+                            sync_dist=True, add_dataloader_idx=False,
+                        )
+                    # Pooled-over-conditions summary for quick tracking.
+                    cv_all = cv_per_traj[torch.isfinite(cv_per_traj)]
+                    if cv_all.numel() > 0:
+                        self.log(
+                            "val/jac_temporal_cv",
+                            cv_all.mean(),
+                            sync_dist=True, add_dataloader_idx=False,
+                        )
 
         with self._timed("val/7.log_metrics"):
             if log_metrics:

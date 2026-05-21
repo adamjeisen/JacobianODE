@@ -77,6 +77,17 @@ lightning:
   n_eigval_jacobians: null
 
   # -----------------
+  # LATENT NORMALIZATION (EMA)
+  # -----------------
+  # When true, normalize the dynamics-subspace latent z_dyn by a scalar
+  # (mean, std) EMA before feeding it into the dynamics MLP that emits
+  # the Jacobian. The EMA stats are detached and updated only in
+  # training; compute_jacobians applies (z - mean) / std once initialised.
+  # Default false ⇒ byte-identical to the un-normalized model.
+  latent_norm_ema: false
+  latent_norm_ema_decay: 0.99
+
+  # -----------------
   # LOOP CLOSURE TRAINING
   # -----------------
   # -----------------
