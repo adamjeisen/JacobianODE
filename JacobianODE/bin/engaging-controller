@@ -1044,6 +1044,53 @@ def _render_report(analysis_dir: Path) -> None:
     run(cmd, cwd=JACODE_REPO, check=True)
 
 
+def _slim_chosen_extras_for_repo(pkl_path: Path) -> None:
+    """Strip oversize re-aggregation caches from the in-repo chosen_extras.pkl.
+
+    Background: ``mc_report_compute`` stores per-trajectory log-eigenvalue
+    spectra under ``gramian_results[(mode, horizon)].per_pair_specs`` as a
+    cache, so re-aggregation (different stats, traj subsets, etc.) doesn't
+    have to rerun ``compute_all_gramians``. For sweeps with many trajectories
+    that cache can balloon to >100 MB and trip GitHub's per-file size cap,
+    blocking the engaging-controller's push back to jacobian-reports.
+
+    The published copy is read by paper-figure / dashboard code that only
+    touches the (mean, sem) summary in ``per_pair`` — ``per_pair_specs`` is
+    dead weight there. So: in the JA-repo copy ONLY, clear per_pair_specs
+    on each gramian_results entry. The source-of-truth ``chosen_extras.pkl``
+    in ``$SWEEPS_DIR/analysis/<group>/`` is untouched and still has the
+    full cache, so future re-aggregation on /orcd works exactly as before.
+    """
+    if not pkl_path.is_file():
+        return
+    try:
+        import pickle
+        with pkl_path.open("rb") as f:
+            d = pickle.load(f)
+        gr = d.get("gramian_results") or {}
+        stripped = 0
+        for res in gr.values():
+            pps = getattr(res, "per_pair_specs", None)
+            if pps:
+                # GramianResults stores per_pair_specs as a dataclass field;
+                # assignment clears it without touching per_pair / summary fields.
+                try:
+                    res.per_pair_specs = {}
+                    stripped += 1
+                except Exception:
+                    pass
+        if stripped:
+            with pkl_path.open("wb") as f:
+                pickle.dump(d, f)
+            log(f"[publish] slimmed {pkl_path.name}: cleared "
+                f"per_pair_specs on {stripped} gramian_results entries")
+    except Exception as e:
+        # Best-effort: a failure to slim shouldn't block the publish itself.
+        # The push to remote may still fail if the pkl was oversize and we
+        # couldn't shrink it, but at least the local repo state is unchanged.
+        log(f"[publish] WARN failed to slim {pkl_path}: {e}")
+
+
 def _publish_analysis(group: str) -> Path | None:
     """Render report + copy analysis dir into the repo at <project>/<group>/.
 
@@ -1064,6 +1111,10 @@ def _publish_analysis(group: str) -> Path | None:
         shutil.rmtree(target)
     # Copy everything (figures/, *.json, *.md, *.html, *.log)
     shutil.copytree(analysis_dir, target)
+    # The chosen_extras.pkl in the source analysis_dir keeps the full raw
+    # spec cache (per_pair_specs) for re-aggregation. The in-repo copy is
+    # slimmed to stay under GitHub's 100 MB / file cap — see helper above.
+    _slim_chosen_extras_for_repo(target / "chosen_extras.pkl")
     return target
 
 
