@@ -1519,18 +1519,25 @@ class LitLatentJacobianODE(LitBase):
             z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
 
         # Loop closure in latent space (operates on z_dyn).
-        # z_dyn is detached so loop_closure_loss only updates the Jacobian
-        # network's parameters, not the encoder — loop closure is a
-        # structural property of any honest Jacobian (pushforward of a
-        # row-conservative field under any smooth diffeomorphism is itself
-        # row-conservative), so the encoder should not be co-optimized to
-        # reshape latent geometry into coordinates where J is more easily
-        # conservative. Same theoretical motivation as the latent_pred_loss
-        # target-detach (BYOL/SimSiam target-network convention).
+        # NOTE: a theoretical case can be made for z_dyn.detach() here, so
+        # loop_closure_loss updates only the Jacobian network's parameters
+        # (loop closure is a structural property of any honest Jacobian —
+        # pushforward of a row-conservative field under a smooth
+        # diffeomorphism is itself row-conservative — so the encoder
+        # arguably should not be co-optimized to reshape latent geometry
+        # for easier conservativity). A single-cell stopgrad_loop test on
+        # Mary-Anesthesia-20160818-02 (variant_stopgrad_loop in the
+        # latent_norm_test group) showed it left val/jac_temporal_cv
+        # essentially unchanged (~0.0007 vs baseline ~0.0005) while
+        # making val/loop_closure_loss ~6x worse and val/trajectory_loss
+        # ~4% worse — i.e. no scientific benefit, mild predictive cost.
+        # Reverted to leave z_dyn attached for cohort consistency; flip
+        # to `.detach()` if doing a deliberate cohort-wide re-run with
+        # the disentangled gradient flow.
         with self._timed("train/4.loop_closure"):
             if self.loop_closure_training:
                 train_rets['loop_closure'] = self.loop_closure_model_step(
-                    z_dyn.detach(), batch_idx, dataloader_idx, c=c,
+                    z_dyn, batch_idx, dataloader_idx, c=c,
                 )
 
         # ----------------------------------------------------------------
