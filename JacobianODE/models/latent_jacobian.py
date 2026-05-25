@@ -914,7 +914,12 @@ class LitLatentJacobianODE(LitBase):
                     mu_dyn_clean, _ = self._split_latent(z_full_clean)
                 z_dyn_clean = mu_dyn_clean
             else:
-                z_dyn_clean = mu_dyn  # target is always the mean, not the sample
+                # Target is always the mean, not the sample. Detached so
+                # latent_pred_loss only updates the encoder via the predicted
+                # path (z_pred), not via the target — matches the
+                # obs_noise_scale > 0 branch above and the BYOL/SimSiam
+                # target-network convention used for decoded_true below.
+                z_dyn_clean = mu_dyn.detach()
 
         # 2. Determine sub-window parameters and gather windows
         with self._timed("traj/2.window_gather"):
