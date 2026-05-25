@@ -914,12 +914,19 @@ class LitLatentJacobianODE(LitBase):
                     mu_dyn_clean, _ = self._split_latent(z_full_clean)
                 z_dyn_clean = mu_dyn_clean
             else:
-                # Target is always the mean, not the sample. Detached so
-                # latent_pred_loss only updates the encoder via the predicted
-                # path (z_pred), not via the target — matches the
+                # Target is always the mean, not the sample.
+                # NOTE: theoretically `mu_dyn.detach()` would match the
                 # obs_noise_scale > 0 branch above and the BYOL/SimSiam
-                # target-network convention used for decoded_true below.
-                z_dyn_clean = mu_dyn.detach()
+                # decoded_true target-network convention, so latent_pred_loss
+                # would only update the encoder via the predicted path
+                # (z_pred). A single-cell stopgrad test on
+                # Mary-Anesthesia-20160818-02 showed it lifts
+                # val/jac_temporal_cv ~10x and val/loop_closure_loss ~70x
+                # without meaningfully degrading trajectory val_loss. Left
+                # OFF here so the rest of the cohort stays comparable with
+                # prior runs; flip to `.detach()` if rerunning the whole
+                # cohort with the cleaner gradient flow.
+                z_dyn_clean = mu_dyn
 
         # 2. Determine sub-window parameters and gather windows
         with self._timed("traj/2.window_gather"):
@@ -1511,11 +1518,19 @@ class LitLatentJacobianODE(LitBase):
             # Choose which z_dyn downstream losses see
             z_dyn = z_dyn_sampled if self.vae_sample_all_losses else mu_dyn
 
-        # Loop closure in latent space (operates on z_dyn)
+        # Loop closure in latent space (operates on z_dyn).
+        # z_dyn is detached so loop_closure_loss only updates the Jacobian
+        # network's parameters, not the encoder — loop closure is a
+        # structural property of any honest Jacobian (pushforward of a
+        # row-conservative field under any smooth diffeomorphism is itself
+        # row-conservative), so the encoder should not be co-optimized to
+        # reshape latent geometry into coordinates where J is more easily
+        # conservative. Same theoretical motivation as the latent_pred_loss
+        # target-detach (BYOL/SimSiam target-network convention).
         with self._timed("train/4.loop_closure"):
             if self.loop_closure_training:
                 train_rets['loop_closure'] = self.loop_closure_model_step(
-                    z_dyn, batch_idx, dataloader_idx, c=c,
+                    z_dyn.detach(), batch_idx, dataloader_idx, c=c,
                 )
 
         # ----------------------------------------------------------------
