@@ -16,30 +16,56 @@ class ResidualBlock(nn.Module):
     of a linear transformation, followed by activation and dropout. This helps with
     gradient flow in deep networks.
 
+    Optionally, a per-call condition tensor ``c`` (shape (..., c_dim)) can be
+    concatenated to the block's input before the linear projection. This is
+    only active when ``c_dim > 0``; the linear is then sized
+    ``(in_dim + c_dim) -> out_dim``. The residual skip still adds the
+    unchanged ``x`` of shape (..., in_dim) — c is fused only inside the
+    nonlinear branch, keeping the skip path identity.
+
     Args:
-        in_dim (int): Input dimension
+        in_dim (int): Input dimension (= skip-path width)
         out_dim (int): Output dimension (must match in_dim for residual connection)
+        c_dim (int): Condition-vector width to concat at this block's input.
+            ``0`` (default) = legacy behaviour (no per-block injection).
         activation (Optional[nn.Module]): Activation function to use. If None, uses identity
         dropout (float): Dropout probability. If 0, no dropout is applied
     """
-    def __init__(self, in_dim, out_dim, activation=None, dropout=0.0):
+    def __init__(self, in_dim, out_dim, c_dim=0, activation=None, dropout=0.0):
         super().__init__()
         if in_dim != out_dim:
             raise ValueError("Input and output dimensions must match for residual connection")
-        self.linear = nn.Linear(in_dim, out_dim)
+        self.c_dim = int(c_dim)
+        self.linear = nn.Linear(in_dim + self.c_dim, out_dim)
         self.activation = activation if activation is not None else nn.Identity()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        
-    def forward(self, x):
+
+    def forward(self, x, c=None):
         """Forward pass through the residual block.
 
         Args:
             x (torch.Tensor): Input tensor of shape (..., in_dim)
+            c (Optional[torch.Tensor]): Per-sample condition of shape
+                (B, c_dim) or matching x's leading dims. Required when
+                ``c_dim > 0``; ignored otherwise.
 
         Returns:
             torch.Tensor: Output tensor of shape (..., out_dim)
         """
-        return self.dropout(self.activation(self.linear(x))) + x
+        if self.c_dim > 0:
+            if c is None:
+                raise ValueError(
+                    f"ResidualBlock was built with c_dim={self.c_dim} "
+                    f"but forward was called with c=None.")
+            if c.ndim == x.ndim:
+                c_bcast = c
+            else:
+                view_shape = (c.shape[0],) + (1,) * (x.ndim - 2) + (c.shape[-1],)
+                c_bcast = c.view(view_shape).expand(*x.shape[:-1], c.shape[-1])
+            x_in = torch.cat([x, c_bcast], dim=-1)
+        else:
+            x_in = x
+        return self.dropout(self.activation(self.linear(x_in))) + x
 
 class MLP(nn.Module):
     """A multi-layer perceptron with various architectural options.
@@ -73,13 +99,24 @@ class MLP(nn.Module):
             dropout=0.0,
             activation='relu',
             condition_dim=0,
+            condition_inject_per_layer=False,
         ):
+        """``condition_inject_per_layer`` (default False = legacy):
+        when True AND ``condition_dim > 0`` AND ``residuals=True``, the
+        condition vector ``c`` is re-concatenated at the input of every
+        residual block (not just the first input layer). Each
+        ResidualBlock's linear is sized ``(hidden + c_dim) -> hidden``;
+        the skip path stays identity. The output projection still does
+        not see ``c`` directly (it's a pure projection). False keeps the
+        legacy behaviour (c only enters at the input layer).
+        """
         super(MLP, self).__init__()
 
         self.residuals = residuals
         self.dropout = dropout
         self.activation = activation
         self.condition_dim = condition_dim
+        self.condition_inject_per_layer = bool(condition_inject_per_layer)
 
         self.layers = nn.ModuleList()
 
@@ -101,8 +138,12 @@ class MLP(nn.Module):
             self.layers.extend(self._create_layer(first_in, self.hidden_dims[0], layer_idx=0, dropout=0.0))
 
             # Add hidden layers
+            block_c_dim = (self.condition_dim
+                           if self.condition_inject_per_layer else 0)
             for i in range(1, num_layers):
-                self.layers.extend(self._create_layer_with_residuals(self.hidden_dims[i-1], self.hidden_dims[i], layer_idx=i))
+                self.layers.extend(self._create_layer_with_residuals(
+                    self.hidden_dims[i-1], self.hidden_dims[i],
+                    c_dim=block_c_dim, layer_idx=i))
 
             # Add output layer
             self.layers.extend(self._create_layer(self.hidden_dims[-1], output_dim, activation=None, dropout=0.0, no_activation=True, layer_idx=num_layers))
@@ -121,7 +162,9 @@ class MLP(nn.Module):
 
         self.input_dim = input_dim
 
-    def _create_layer_with_residuals(self, in_dim, out_dim, activation=None, dropout=None, no_activation=False, layer_idx=None):
+    def _create_layer_with_residuals(self, in_dim, out_dim, activation=None,
+                                      dropout=None, no_activation=False,
+                                      layer_idx=None, c_dim=0):
         """Create a layer with residual connections.
 
         Args:
@@ -131,6 +174,8 @@ class MLP(nn.Module):
             dropout (Optional[float]): Dropout probability
             no_activation (bool): Whether to skip activation
             layer_idx (Optional[int]): Layer index for debugging
+            c_dim (int): Per-block condition-vector width (0 = no per-block
+                c injection; matches legacy behaviour).
 
         Returns:
             List[nn.Module]: List containing a ResidualBlock
@@ -139,14 +184,15 @@ class MLP(nn.Module):
             activation = self.activation
         if dropout is None:
             dropout = self.dropout
-        
+
         if no_activation:
             return [nn.Linear(in_dim, out_dim)]
-        
+
         return [
             ResidualBlock(
                 in_dim=in_dim,
                 out_dim=out_dim,
+                c_dim=c_dim,
                 activation=get_activation_func(activation),
                 dropout=dropout
             )
@@ -195,6 +241,7 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., output_dim)
         """
+        c_orig = c
         if self.condition_dim > 0:
             if c is None:
                 raise ValueError(
@@ -214,8 +261,16 @@ class MLP(nn.Module):
                 view_shape = (c.shape[0],) + (1,) * (x.ndim - 2) + (c.shape[-1],)
                 c_bcast = c.view(view_shape).expand(*x.shape[:-1], c.shape[-1])
             x = torch.cat([x, c_bcast], dim=-1)
+        # When per-layer condition injection is on, ResidualBlocks were
+        # built with c_dim>0 and need c at their .forward(). Other layer
+        # types (Linear / Activation / final projection) take only x.
         for layer in self.layers:
-            x = layer(x)
+            if (self.condition_inject_per_layer
+                    and isinstance(layer, ResidualBlock)
+                    and layer.c_dim > 0):
+                x = layer(x, c=c_orig)
+            else:
+                x = layer(x)
         return x
     
     # implement forward but with teacher forcing
