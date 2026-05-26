@@ -1,14 +1,15 @@
 # @package _global_
 #
-# WMTask partial-obs (16 random channels/area, seed=42), n_delays=6 fixed,
-# LC=0 throughout, BUT with the residual-MLP dynamics from
-# latent_norm_test (bigres: 8-layer 4096-dim MLP, residuals=true) in
-# place of the baseline 4-layer dynamics MLP. Mirrors the prior baseline
-# sweep
-#   wmtask_epoch_compare_partialobs16_pcaautodim_cayley_perconditionnorm__ndelays_sweep
-# at its winning n_delays=6 cell so the cross-architecture gramian
-# comparison stays apples-to-apples in everything except the dynamics
-# module.
+# WMTask partial-obs (32-channel fixed list, 16 per area, seed-42 resolved),
+# n_delays=6, LC=1e-4 — all matched to the production gagriild run
+# (wmtask_pobs16_cayley_top3nd_lcobs__stage_b, run_id gagriild,
+# JacobianODE/WMTask_identity_encoder_verification). The ONE change
+# from gagriild is the dynamics MLP: 8-layer × 4096-dim with residual
+# connections (mirroring the Mary latent_norm_test "bigres" variant).
+# Same loss weights, same data normalization (normalize=false +
+# generalized_variance=0.019746), same observed-channel set as gagriild's
+# config, so the bigres vs production comparison is apples-to-apples on
+# everything except the dynamics module.
 
 defaults:
   - override /data: wmtask_epoch_compare_partialobs16
@@ -18,12 +19,13 @@ defaults:
 metadata:
   description: |
     Single-cell WMTask conditioned epoch-compare run (epoch=1 vs final),
-    partial-obs 16-per-area, n_delays=6 (the chosen winner of the
-    baseline ndelays scout), LC=0. The only deviation from the
-    baseline is the dynamics MLP: 8-layer × 4096-dim with residual
-    connections (mirroring the Mary latent_norm_test "bigres" variant
-    that raised the latent-Jacobian temporal CV without breaking the
-    trajectory prediction).
+    partial-obs 16-per-area at LC=1e-4 — matching the production
+    chosen run gagriild
+    (wmtask_pobs16_cayley_top3nd_lcobs__stage_b). The ONE deviation
+    from gagriild is the dynamics MLP: 8-layer × 4096-dim with
+    residual connections (mirroring the Mary latent_norm_test
+    "bigres" variant that raised the latent-Jacobian temporal CV
+    without breaking trajectory prediction).
   hypothesis: |
     On Mary-0818 the bigres residual MLP raised the post-hoc
     Jacobian temporal CV from ~5e-4 to ~0.06 — i.e. allowed the
@@ -34,37 +36,39 @@ metadata:
     the ground-truth BiologicalRNN as cleanly as the baseline
     4-layer MLP did. WMTask is the cleanest test bed because the
     true Jacobian is known. Pass: bigres recovers the same
-    sign-pattern + magnitude on the 4 4×4 directed-area Gramian
-    grids vs the baseline run at the same n_delays=6, with similar
-    or better R²/MASE.
+    sign-pattern + magnitude on the 4×4 directed-area Gramian grids
+    vs the gagriild baseline, with similar or better R²/MASE.
   success_criteria:
     - "Cell trains 200 epochs without NaN train loss"
-    - "Per-area autodim n_target_dims logged (should match baseline ~17/12)"
-    - "Final val/trajectory_loss within 2× of baseline winner's ~0.004"
-    - "val/jac_temporal_cv well above the baseline ~0 (indicates the
+    - "Per-area autodim n_target_dims logged (gagriild had n_dyn=25 total)"
+    - "Final val/trajectory_loss within 2× of gagriild's ~0.0035"
+    - "val/jac_temporal_cv elevated above the baseline ~0 (indicates the
        residual capacity is actually being used)"
-    - "Per-pair gramian sign pattern matches baseline at n_delays=6
+    - "Per-pair gramian sign pattern matches the gagriild baseline
        (qualitative — confirmed post-hoc from chosen_extras)"
 
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
-wandb_group: "wmtask_epoch_compare_partialobs16_bigres_lc0__nd6"
+wandb_group: "wmtask_partialobs16_bigres_lc1e-4__nd6"
 
 data:
+  # Matched to the production gagriild run
+  # (wmtask_pobs16_cayley_top3nd_lcobs__stage_b, JacobianODE/WMTask_identity_encoder_verification).
   postprocessing:
     obs_noise: 0.05
-    normalize: true
-    normalize_per_condition: true
+    filter_data: false
+    normalize: false                      # gagriild: false
+    generalized_variance: 0.019746232785335237   # gagriild
   train_test_params:
-    seq_length: 35                        # = 15 traj_init + 20 prediction; max n_delays=15
+    seq_length: 35                        # = 15 traj_init + 20 prediction
     delay_embedding_params:
-      observed_indices: 'random'
+      # Exact 32-channel list from gagriild's config (16 per area, seed=42
+      # resolved). Listed explicitly so we don't re-resolve and get a
+      # different set.
+      observed_indices: [0, 5, 9, 12, 13, 16, 25, 34, 36, 40, 44, 50, 52, 56, 58, 61, 66, 68, 82, 85, 90, 100, 101, 102, 108, 109, 115, 118, 119, 121, 126, 127]
       n_observed_per_area: [16, 16]
-      obs_area_indices:
-        - [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]
-        - [64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127]
-      partial_obs_seed: 42                # SAME 16 indices per area for both conditions
-      n_delays: 6                         # chosen-winner from baseline ndelays scout
+      partial_obs_seed: 42
+      n_delays: 6
       delay_spacing: 1
     split_by: trajectory
 
@@ -112,8 +116,8 @@ training:
     k_scale: 1
     min_lr: 1.0e-6
     loss_func: mse
-    loop_closure_weight: 0
-    loop_closure_training: false
+    loop_closure_weight: 1.0e-4           # gagriild: 1e-4 (production C1/C2 chosen)
+    loop_closure_training: true
     reconstruction_loss_weight: 1.0
     latent_prediction_loss_weight: 1.0
     reconstruction_mode: 'uniform'
