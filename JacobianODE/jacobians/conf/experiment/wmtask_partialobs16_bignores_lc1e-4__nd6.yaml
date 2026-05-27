@@ -1,0 +1,116 @@
+# @package _global_
+#
+# Capacity-vs-residual control: same 8-layer × 4096-dim dynamics MLP
+# but WITHOUT residual connections (residuals=false), matched on every
+# other knob to the gagriild production partial-obs setup. Goal: isolate
+# whether the per-mode stability flip on bigres
+# (wmtask_partialobs16_bigres_lc1e-4__nd6 / fzy2sasy: sign-match 3/27)
+# is driven by capacity per se or by the residual-skip structure.
+#
+# If big-nores ALSO flips → capacity is the cause.
+# If big-nores preserves the pattern → residuals are the cause.
+
+defaults:
+  - override /data: wmtask_epoch_compare_partialobs16
+  - override /model: latent_direct_sum_coupling
+  - _self_
+
+metadata:
+  description: |
+    Single-cell partial-obs WMTask run mirroring fzy2sasy / gagriild
+    configuration except dynamics MLP = 8-layer × 4096-dim WITHOUT
+    residual connections (residuals=false). Same condition_dim=1 (c
+    only at input, no per-layer inject), same LC=1e-4, same
+    observed_indices, same per-cond norm. Capacity matches bigres;
+    only the residual-skip topology differs.
+  hypothesis: |
+    bigres on partial-obs WMTask flipped per-mode condition stability
+    (sign-match 3/27 vs production 27/29) despite beating production
+    on aggregate loss. Full-obs analog recovered the pattern (32/34),
+    suggesting partial-obs ambiguity is the escape hatch. But it's
+    unclear whether high CAPACITY or residual SKIP CONNECTIONS exploit
+    that hatch. This run keeps capacity high (same 8×4096) but
+    removes residuals. If sign-match remains low (~3-10/27), capacity
+    drives the flip; if sign-match recovers (~20-29/27), residual
+    skips are the mechanism.
+  success_criteria:
+    - "Cell trains 200 epochs without NaN train loss."
+    - "Per-mode sign-match against empirical Δ Lyapunov reported."
+    - "val/trajectory_loss within 5× of fzy2sasy's ~2e-3 (deep plain MLPs may train less efficiently than residual ones)."
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "wmtask_partialobs16_bignores_lc1e-4__nd6"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    filter_data: false
+    normalize: false
+    generalized_variance: 0.019746232785335237
+  train_test_params:
+    seq_length: 35
+    delay_embedding_params:
+      observed_indices: [0, 5, 9, 12, 13, 16, 25, 34, 36, 40, 44, 50, 52, 56, 58, 61, 66, 68, 82, 85, 90, 100, 101, 102, 108, 109, 115, 118, 119, 121, 126, 127]
+      n_observed_per_area: [16, 16]
+      partial_obs_seed: 42
+      n_delays: 6
+      delay_spacing: 1
+    split_by: trajectory
+
+model:
+  n_target_dims: null
+  n_target_var_threshold: 0.99
+  prediction_steps: 20
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    area_indices: "auto_partial_obs"
+    n_target_dims_per_block: [16, 16]
+    final_perm_identity: true
+    zero_init: true
+    near_identity_std: 1.0e-3
+    use_cayley_perms: true
+    condition_dim: 1
+  params:
+    condition_dim: 1
+    hidden_dim: [4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096]
+    num_layers: 8
+    residuals: false                       # *** the one diff from fzy2sasy ***
+    condition_inject_per_layer: false
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 16
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    optimizer_kwargs:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    scheduler_type: teacher_forcing
+    k_scale: 1
+    min_lr: 1.0e-6
+    loss_func: mse
+    loop_closure_weight: 1.0e-4
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    shadow_patience: 2
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01
