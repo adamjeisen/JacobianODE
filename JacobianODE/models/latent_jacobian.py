@@ -128,6 +128,20 @@ class LitLatentJacobianODE(LitBase):
         # genuinely linear. Encoder/reconstruction/loop-closure untouched.
         latent_norm_ema=False,
         latent_norm_ema_decay=0.99,
+        # Stop-gradient on the encoder-side TARGET of latent_pred_loss when
+        # obs_noise_scale == 0 (the obs_noise_scale > 0 branch is already
+        # implicitly stop-grad'd via no_grad).
+        # Default False = legacy behaviour (z_dyn_clean = mu_dyn, gradients
+        # flow through both the predicted path AND the target encoder path).
+        # When True: z_dyn_clean = mu_dyn.detach() — gradients from
+        # latent_pred_loss flow only through the predicted path (z_pred),
+        # matching the BYOL/SimSiam target-network convention. A single-cell
+        # stopgrad test on Mary-Anesthesia-20160818-02 showed ~10x higher
+        # val/jac_temporal_cv and ~70x higher val/loop_closure_loss without
+        # degrading val_traj_loss — the cleaner gradient flow lifts the
+        # latent away from the near-LTI degeneracy without breaking
+        # trajectory prediction.
+        latent_pred_target_stopgrad=False,
         **kwargs,
     ):
         super().__init__(model=model, **kwargs)
@@ -135,6 +149,7 @@ class LitLatentJacobianODE(LitBase):
         # --- EMA latent-normalization state (scalar mean/std of z_dyn) ---
         self.latent_norm_ema = latent_norm_ema
         self.latent_norm_ema_decay = latent_norm_ema_decay
+        self.latent_pred_target_stopgrad = bool(latent_pred_target_stopgrad)
         # Buffers persist in the checkpoint and apply identically at val /
         # inference (same fixed affine at every timestep — required so the
         # normalized latent is still an autonomous dynamical system).
@@ -915,18 +930,17 @@ class LitLatentJacobianODE(LitBase):
                 z_dyn_clean = mu_dyn_clean
             else:
                 # Target is always the mean, not the sample.
-                # NOTE: theoretically `mu_dyn.detach()` would match the
-                # obs_noise_scale > 0 branch above and the BYOL/SimSiam
-                # decoded_true target-network convention, so latent_pred_loss
-                # would only update the encoder via the predicted path
-                # (z_pred). A single-cell stopgrad test on
-                # Mary-Anesthesia-20160818-02 showed it lifts
-                # val/jac_temporal_cv ~10x and val/loop_closure_loss ~70x
-                # without meaningfully degrading trajectory val_loss. Left
-                # OFF here so the rest of the cohort stays comparable with
-                # prior runs; flip to `.detach()` if rerunning the whole
-                # cohort with the cleaner gradient flow.
-                z_dyn_clean = mu_dyn
+                # When `latent_pred_target_stopgrad=True`, .detach() the
+                # target so gradients from latent_pred_loss flow only
+                # through the predicted path (z_pred) — matches the
+                # obs_noise_scale > 0 branch (which is implicitly
+                # stop-grad'd via no_grad) and the BYOL/SimSiam target-
+                # network convention. Default False preserves the legacy
+                # behaviour where the encoder is updated via both the
+                # predicted AND target paths.
+                z_dyn_clean = (mu_dyn.detach()
+                               if self.latent_pred_target_stopgrad
+                               else mu_dyn)
 
         # 2. Determine sub-window parameters and gather windows
         with self._timed("traj/2.window_gather"):
