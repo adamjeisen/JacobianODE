@@ -37,6 +37,11 @@ metadata:
     gagriild's 0.0035; val/jac_temporal_cv well above 0 (target-stopgrad
     actually lifting the encoder-side flatness); per-mode sign-match
     reported.
+  success_criteria:
+    - "Cell trains 200 epochs without NaN train loss."
+    - "val/jac_temporal_cv reported; expected to be elevated above ~0 if the comment's claim about Mary single-cell carries (~10x baseline)."
+    - "val/trajectory_loss within 2x of gagriild's ~0.0035."
+    - "Per-mode sign-match between predicted Δ Lyapunov (c=-1 - c=+1) and empirical Δ Lyapunov reported on top-27 modes; ≥20/27 would maintain the per-cond spectrum-change pattern."
 
 wandb_entity: JacobianODE
 wandb_project: "WMTask_identity_encoder_verification"
