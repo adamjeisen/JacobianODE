@@ -104,6 +104,16 @@ lightning:
   loop_closure_interp_pts: 20 # number of interpolation points in between end points for each line segment
   n_loops: null # set default to traj batches
 
+  # Random circular loops (transverse-direction Jacobian supervision). When
+  # True, the loop-closure step computes BOTH the existing data-constrained
+  # loops AND random circular loops in random 2-planes through batch points;
+  # the two losses are averaged before the loop_closure_weight is applied.
+  # Default False = backwards-compatible (only data-constrained loops).
+  random_loops_training: False
+  random_loops_radius: 1.0   # loop radius in units of per-batch mean-per-dim std
+  random_loops_n: null       # falls back to n_loops if null
+  random_loops_n_pts: null   # falls back to n_loop_pts if null
+
   # -----------------
   # JACOBIAN ODE
   # -----------------

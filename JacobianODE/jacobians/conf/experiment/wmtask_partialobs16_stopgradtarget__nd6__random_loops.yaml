@@ -1,0 +1,114 @@
+# @package _global_
+#
+# Partial-obs (16 random channels/area, seed=42), n_delays=6 — EXACTLY the
+# dbqm15eu config (wmtask_partialobs16_stopgradtarget__nd6.yaml) with the new
+# random_loops_training flag flipped on. lc_weight=1e-4 unchanged; the loop-
+# closure loss is now the average of the existing data-constrained loops and
+# random circular loops of radius = 1 × per-batch char_std.
+
+defaults:
+  - override /data: wmtask_epoch_compare_partialobs16
+  - override /model: latent_direct_sum_coupling
+  - _self_
+
+metadata:
+  description: |
+    Single-cell partial-obs WMTask run replicating dbqm15eu
+    (wmtask_partialobs16_stopgradtarget__nd6) with random_loops_training=true.
+    Same observed indices, same n_delays=6, same loss weights (LC=1e-4,
+    obs_noise_scale=0), same production 4-layer plain dynamics MLP, same
+    latent_pred_target_stopgrad=True.
+  hypothesis: |
+    Same as the full-obs random-loops re-run: the diagnostic in
+    /home/adameisen/diag_loop_curl.png shows that the dbqm15eu Jacobian
+    is highly non-curl-free at all loop radii (curl-fraction 4e-5 →
+    3e-2 from r=0.015 to r=15.3 × char_std). Open-loop iLQR with this
+    model gives 11/100 flips vs 100/100 with the true Jacobian. Adding
+    the random-loop loss should pull J's transverse columns toward
+    curl-freeness and lift the iLQR flip rate.
+  success_criteria:
+    - "Cell trains 200 epochs without NaN train loss."
+    - "Loop-curl diagnostic curl-fraction at r=1×char_std drops by ≥10x relative to dbqm15eu."
+    - "val/trajectory_loss within 2× of dbqm15eu's ~0.0035."
+    - "iLQR n=100 flip rate (B = 16 partial-obs vis channels) ≥ 30/100 (vs dbqm15eu's 11/100)."
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "wmtask_partialobs16_stopgradtarget__nd6__random_loops"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    filter_data: false
+    normalize: false
+    generalized_variance: 0.019746232785335237
+  train_test_params:
+    seq_length: 35
+    delay_embedding_params:
+      observed_indices: [0, 5, 9, 12, 13, 16, 25, 34, 36, 40, 44, 50, 52, 56, 58, 61, 66, 68, 82, 85, 90, 100, 101, 102, 108, 109, 115, 118, 119, 121, 126, 127]
+      n_observed_per_area: [16, 16]
+      partial_obs_seed: 42
+      n_delays: 6
+      delay_spacing: 1
+    split_by: trajectory
+
+model:
+  n_target_dims: null
+  n_target_var_threshold: 0.99
+  prediction_steps: 20
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    area_indices: "auto_partial_obs"
+    n_target_dims_per_block: [16, 16]
+    final_perm_identity: true
+    zero_init: true
+    near_identity_std: 1.0e-3
+    use_cayley_perms: true
+    condition_dim: 1
+  params:
+    condition_dim: 1
+    # Production dynamics MLP (NOT bigres):
+    hidden_dim: [256, 1024, 2048, 2048]
+    num_layers: 4
+    residuals: false
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 16
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    optimizer_kwargs:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    scheduler_type: teacher_forcing
+    k_scale: 1
+    min_lr: 1.0e-6
+    loss_func: mse
+    loop_closure_weight: 1.0e-4
+    loop_closure_training: true
+    # *** NEW: random circular loops averaged with data-constrained loops ***
+    random_loops_training: true
+    random_loops_radius: 1.0
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0
+    n_eigval_jacobians: 8
+    latent_pred_target_stopgrad: true
+  early_stopping:
+    early_stopping_patience: 5
+    shadow_patience: 2
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01

@@ -73,6 +73,65 @@ def make_loops(pts, n_loops, n_loop_pts=0):
     loop_pts = torch.cat((loop_pts, loop_pts[..., [0], :]), dim=-2)
     return loop_pts
 
+
+def make_random_circular_loops(pts, n_loops, n_loop_pts, radius):
+    """Generate random circular closed loops in random 2-planes through random
+    centers sampled from ``pts``.
+
+    Geometry: for each loop i with center c_i ∈ R^d sampled from ``pts`` and
+    random orthonormal pair (u_i, v_i) in R^d,
+
+        ζ_i(θ) = c_i + radius * (cos θ · u_i + sin θ · v_i)
+
+    discretised at ``n_loop_pts`` angles θ_k = 2π k / n_loop_pts. The first
+    vertex is appended at the end to close the loop, matching the format of
+    ``make_loops``.
+
+    Args:
+        pts: candidate center points (any shape ending in ``..., dim``); flattened.
+        n_loops: number of loops to generate.
+        n_loop_pts: number of segment vertices per loop (output has ``n_loop_pts+1``
+            points along the loop axis, with last == first for closure).
+        radius: loop geometric radius (scalar tensor or float).
+
+    Returns:
+        torch.Tensor of shape (n_loops, n_loop_pts+1, dim).
+    """
+    flat = pts.reshape(-1, pts.shape[-1])
+    n_choices = flat.shape[0]
+    dim = flat.shape[-1]
+    device, dtype = flat.device, flat.dtype
+    if n_loop_pts < 3:
+        raise ValueError(
+            f"random circular loops need n_loop_pts >= 3; got {n_loop_pts}")
+    # sample centers
+    idx = torch.as_tensor(
+        np.random.choice(n_choices, size=(n_loops,), replace=True),
+        device=device, dtype=torch.long)
+    centers = flat[idx]                                                  # (n_loops, dim)
+    # random orthonormal (u, v) per loop
+    u = torch.randn(n_loops, dim, dtype=dtype, device=device)
+    u = u / (torch.linalg.norm(u, dim=-1, keepdim=True) + 1e-30)
+    v = torch.randn(n_loops, dim, dtype=dtype, device=device)
+    v = v - (v * u).sum(dim=-1, keepdim=True) * u
+    v = v / (torch.linalg.norm(v, dim=-1, keepdim=True) + 1e-30)
+    # discretise circle at n_loop_pts angles (no endpoint duplicate; closure
+    # is added below)
+    theta = torch.linspace(
+        0.0, 2.0 * float(np.pi), n_loop_pts + 1,
+        dtype=dtype, device=device)[:-1]                                  # (n_loop_pts,)
+    cos_t = torch.cos(theta)[None, :, None]                              # (1, n_loop_pts, 1)
+    sin_t = torch.sin(theta)[None, :, None]
+    r = radius if torch.is_tensor(radius) else torch.tensor(
+        radius, dtype=dtype, device=device)
+    pts_loop = (
+        centers[:, None, :]
+        + r * (cos_t * u[:, None, :] + sin_t * v[:, None, :])
+    )                                                                     # (n_loops, n_loop_pts, dim)
+    # append first vertex to close the loop
+    pts_loop = torch.cat([pts_loop, pts_loop[:, :1, :]], dim=1)
+    return pts_loop
+
 class TeacherForcingLRScheduler(torch.optim.lr_scheduler._LRScheduler):
     """Learning rate scheduler that adapts based on teacher forcing.
 
@@ -125,17 +184,18 @@ class TeacherForcingLRScheduler(torch.optim.lr_scheduler._LRScheduler):
         self.__dict__.update(clean)
 
 def loop_closure(
-        batch, 
-        jac_func, 
-        dt=1, 
-        n_loops=None, 
-        n_loop_pts=None, 
+        batch,
+        jac_func,
+        dt=1,
+        n_loops=None,
+        n_loop_pts=None,
         loop_path='line',
-        int_method='Trapezoid', 
-        loop_closure_interp_pts=2, 
+        int_method='Trapezoid',
+        loop_closure_interp_pts=2,
         mix_trajectories=True,
-        alpha=1, 
-        return_loop_pts=False
+        alpha=1,
+        return_loop_pts=False,
+        loop_pts=None,
     ):
     """Compute loop closure integrals for validation of path independence.
 
@@ -168,11 +228,14 @@ def loop_closure(
     if n_loop_pts is None:
         n_loop_pts = batch.shape[-2]
 
-    if mix_trajectories:    
-        loop_pts = make_loops(batch, n_loops, n_loop_pts).type(batch.dtype).to(batch.device)
+    if loop_pts is None:
+        if mix_trajectories:
+            loop_pts = make_loops(batch, n_loops, n_loop_pts).type(batch.dtype).to(batch.device)
+        else:
+            loop_pts = batch[..., torch.randperm(batch.shape[-2]), :]
+            loop_pts = torch.cat((loop_pts[..., :n_loop_pts, :], loop_pts[..., [0], :]), dim=-2)
     else:
-        loop_pts = batch[..., torch.randperm(batch.shape[-2]), :]
-        loop_pts = torch.cat((loop_pts[..., :n_loop_pts, :], loop_pts[..., [0], :]), dim=-2)
+        loop_pts = loop_pts.type(batch.dtype).to(batch.device)
     
     loop_pts_tf = torch.zeros_like(loop_pts)
     loop_pts_tf[..., 0, :] = loop_pts[..., 0, :]
@@ -296,6 +359,10 @@ class LitBase(L.LightningModule):
                     n_loop_pts=None,
                     loop_path='line',
                     loop_closure_weight=1.0,
+                    random_loops_training=False,
+                    random_loops_radius=1.0,
+                    random_loops_n=None,
+                    random_loops_n_pts=None,
                     trajectory_training=True,
                     use_base_deriv_pt=False,
                     base_pt_init=None,
@@ -391,6 +458,17 @@ class LitBase(L.LightningModule):
         self.loop_closure_weight = loop_closure_weight
         self.mix_trajectories = mix_trajectories
         self.trajectory_training = trajectory_training
+
+        # Random circular loops (transverse-direction Jacobian supervision).
+        # When enabled, loop_closure_model_step computes the data-constrained
+        # loop loss AND a parallel random-circular-loop loss (loops in random
+        # 2-planes through batch points, radius = random_loops_radius × per-
+        # batch char_std), then averages them before applying loop_closure_weight.
+        # Default off for backwards compatibility.
+        self.random_loops_training = random_loops_training
+        self.random_loops_radius = float(random_loops_radius)
+        self.random_loops_n = random_loops_n
+        self.random_loops_n_pts = random_loops_n_pts
 
         # self.train_dataloader_names = []
         # self.val_dataloader_names = []
@@ -608,6 +686,41 @@ class LitBase(L.LightningModule):
 
         return {'loss': loss, 'metric_vals': metric_vals, 'outputs': outputs}
     
+    def _random_loops_loss(self, batch_local, jac_fn, n_loops, n_loop_pts):
+        """Loss contribution from random circular loops in random 2-planes
+        through batch points. Radius = ``self.random_loops_radius`` × per-batch
+        mean-per-dim std (computed with ``.detach()`` so the radius is a fixed
+        geometric scale, not a learnable quantity flowing into the gradient).
+
+        Returns the scalar loss (``(∮ J·dz)^2``  averaged over loops, dims and
+        whatever batch axes ``loop_closure`` produces), or ``None`` if there's
+        not enough data to form even one loop.
+        """
+        if n_loops is None or int(n_loops) < 1:
+            return None
+        n_r_loops = (self.random_loops_n if self.random_loops_n is not None
+                      else int(n_loops))
+        n_r_pts = (self.random_loops_n_pts if self.random_loops_n_pts is not None
+                    else int(n_loop_pts))
+        centers = batch_local.reshape(-1, batch_local.shape[-1])
+        if centers.shape[0] < 1:
+            return None
+        # per-batch characteristic scale: mean per-dim std of the encoded
+        # latent points. Detached so the radius is a fixed geometric scale.
+        char_std = centers.std(dim=0).mean().detach()
+        radius = self.random_loops_radius * char_std
+        loop_pts = make_random_circular_loops(
+            centers, n_r_loops, n_r_pts, radius)
+        r_loop_int = loop_closure(
+            batch_local, jac_fn, dt=self.dt,
+            loop_path='line',
+            loop_closure_interp_pts=self.loop_closure_interp_pts,
+            mix_trajectories=False,
+            int_method='Trapezoid',
+            loop_pts=loop_pts,
+        )
+        return (r_loop_int ** 2).mean()
+
     def loop_closure_model_step(
             self,
             batch,
@@ -659,6 +772,7 @@ class LitBase(L.LightningModule):
             unique_c, inverse = torch.unique(c, dim=0, return_inverse=True)
             per_group_losses: list[torch.Tensor] = []
             per_group_outputs: list[torch.Tensor] = []
+            per_group_random_losses: list[torch.Tensor] = []
             for g in range(unique_c.shape[0]):
                 mask = (inverse == g)
                 group_size = int(mask.sum().item())
@@ -669,6 +783,9 @@ class LitBase(L.LightningModule):
                 c_g = c[mask]  # all rows identical to unique_c[g]
                 jac_fn_g = (lambda z, *_a, _cg=c_g, **_k: self.compute_jacobians(z, _cg))
                 n_loops_g = group_size if n_loops is None else max(1, n_loops)
+                # n_loop_pts default mirrors the unconditioned path of loop_closure
+                n_loop_pts_g = (batch_g.shape[-2] if n_loop_pts is None
+                                  else n_loop_pts)
                 loop_int_g = loop_closure(
                     batch_g, jac_fn_g, dt=self.dt,
                     n_loops=n_loops_g, n_loop_pts=n_loop_pts,
@@ -679,6 +796,11 @@ class LitBase(L.LightningModule):
                 )
                 per_group_losses.append((loop_int_g ** 2).mean())
                 per_group_outputs.append(loop_int_g)
+                if self.random_loops_training:
+                    r_loss_g = self._random_loops_loss(
+                        batch_g, jac_fn_g, n_loops_g, n_loop_pts_g)
+                    if r_loss_g is not None:
+                        per_group_random_losses.append(r_loss_g)
             if not per_group_losses:
                 # Pathological: every group has < 2 trajectories. Return a
                 # zero loss so training continues; this path shouldn't fire
@@ -690,8 +812,18 @@ class LitBase(L.LightningModule):
                     'metric_vals': dict(mse=zero.detach()),
                     'outputs': zero,
                 }
-            loop_loss = torch.stack(per_group_losses).mean()
-            metric_vals = dict(mse=loop_loss.detach().clone())
+            data_loss = torch.stack(per_group_losses).mean()
+            if self.random_loops_training and per_group_random_losses:
+                random_loss = torch.stack(per_group_random_losses).mean()
+                loop_loss = 0.5 * (data_loss + random_loss)
+                metric_vals = dict(
+                    mse=loop_loss.detach().clone(),
+                    data_loop_mse=data_loss.detach().clone(),
+                    random_loop_mse=random_loss.detach().clone(),
+                )
+            else:
+                loop_loss = data_loss
+                metric_vals = dict(mse=loop_loss.detach().clone())
             # Concatenate per-group outputs along the loops axis so callers
             # that consume `outputs` (mostly diagnostics) see the union.
             loop_int_cat = torch.cat(per_group_outputs, dim=0)
@@ -707,13 +839,34 @@ class LitBase(L.LightningModule):
         loop_zeros = torch.zeros_like(loop_int)
 
         # loop_loss = self.criterion(loop_zeros, loop_int)
-        loop_loss = (loop_int**2).mean()
+        data_loss = (loop_int**2).mean()
         # loop_loss = torch.clamp(torch.linalg.norm(loop_int, dim=-1) - err_bound, 0, None).mean()
 
-        metric_vals = dict(
-            mse=mse(loop_zeros, loop_int),
-            # r2_score=r2_score(loop_zeros.flatten(), loop_int.flatten())
-        )
+        if self.random_loops_training:
+            # Resolve n_loops / n_loop_pts to concrete values consistent with
+            # what loop_closure used above.
+            n_loops_eff = (int(torch.prod(torch.tensor(batch.shape[:-2])).item())
+                            if n_loops is None else int(n_loops))
+            n_loop_pts_eff = (batch.shape[-2] if n_loop_pts is None
+                                else int(n_loop_pts))
+            r_loss = self._random_loops_loss(
+                batch, jac_fn, n_loops_eff, n_loop_pts_eff)
+            if r_loss is not None:
+                loop_loss = 0.5 * (data_loss + r_loss)
+                metric_vals = dict(
+                    mse=mse(loop_zeros, loop_int),
+                    data_loop_mse=data_loss.detach().clone(),
+                    random_loop_mse=r_loss.detach().clone(),
+                )
+            else:
+                loop_loss = data_loss
+                metric_vals = dict(mse=mse(loop_zeros, loop_int))
+        else:
+            loop_loss = data_loss
+            metric_vals = dict(
+                mse=mse(loop_zeros, loop_int),
+                # r2_score=r2_score(loop_zeros.flatten(), loop_int.flatten())
+            )
 
         return {'loss': loop_loss, 'metric_vals': metric_vals, 'outputs': loop_int}
 
