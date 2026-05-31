@@ -1,0 +1,117 @@
+# @package _global_
+#
+# FULL-OBS WMTask with n_delays=6 — the disentangler for the trust-region
+# asymmetry. The production full-obs run 5fm9o2jn (n_delays=1) responds
+# strongly to a manifold trust region in open-loop iLQR (28→64/100 flips);
+# the partial-obs run dbqm15eu (n_delays=6, only 16+16 channels observed)
+# does not (11→~11/5). Two coupled differences could explain it: partial
+# OBSERVATION (info loss) vs the DELAY EMBEDDING (n_delays=6 shift-register
+# control structure). This run holds observation FULL (all 128 channels)
+# but delay-embeds at n_delays=6, isolating the delay-embedding effect.
+#
+# If trust-region iLQR on this model behaves like 5fm9o2jn (n_delays=1) →
+# the asymmetry is the lost information from partial observation. If it
+# behaves like dbqm15eu (resists the trust region) → it's the delay-embedded
+# control structure per se.
+#
+# Everything else matches the 5fm9o2jn lineage (epoch_compare,
+# direct_sum_cayley_perareaautodim, perconditionnorm, lc=1e-6,
+# obs_noise_scale=0).
+
+defaults:
+  - override /data: wmtask_epoch_compare
+  - override /model: latent_direct_sum_coupling
+  - _self_
+
+metadata:
+  description: |
+    Full-obs (all 128 channels) WMTask latent JacobianODE with n_delays=6,
+    matching the 5fm9o2jn lineage on every other knob (lc=1e-6,
+    obs_noise_scale=0, per-condition normalization, Cayley + per-area
+    PCA-autodim + zero_init + near_identity). Disentangles delay-embedding
+    from partial-observation for the trust-region iLQR asymmetry.
+  hypothesis: |
+    The manifold trust region rescues open-loop iLQR for full-obs n_delays=1
+    (28→64/100) but not partial-obs n_delays=6 (11→~11/5). If the cause is
+    the delay-embedding shift-register control structure (control only enters
+    the leading frame, propagates through the buffer), then this full-obs
+    n_delays=6 model should ALSO resist the trust region despite full
+    observation. If the cause is information loss from partial observation,
+    this model should behave like 5fm9o2jn and respond to the trust region.
+  success_criteria:
+    - "Cell trains 200 epochs without NaN train loss."
+    - "val/trajectory_loss within ~3x of 5fm9o2jn's ~5e-3 (delay embedding may cost some)."
+    - "val/one_step_mase reported; decoder-corrected MASE < 1 preferred."
+    - "Checkpoint usable for trust-region iLQR comparison."
+
+wandb_entity: JacobianODE
+wandb_project: "WMTask_identity_encoder_verification"
+wandb_group: "wmtask_fullobs_nd6"
+
+data:
+  postprocessing:
+    obs_noise: 0.05
+    normalize: true
+    normalize_per_condition: true
+  train_test_params:
+    seq_length: 45
+    delay_embedding_params:
+      observed_indices: 'all'
+      n_delays: 6
+      delay_spacing: 1
+    split_by: trajectory
+
+model:
+  n_target_dims: null
+  n_target_var_threshold: 0.99
+  prediction_steps: 30
+  encoder_warmup_epochs: 0
+  dynamics_warmup_epochs: 0
+  use_vae: false
+  kl_null_weight: null
+  kl_dyn_weight: 0.0
+  trajectory_loss_most_recent: true
+  encoder:
+    area_indices:
+      - [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63]
+      - [64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127]
+    n_target_dims_per_block: [64, 64]
+    final_perm_identity: true
+    zero_init: true
+    near_identity_std: 1.0e-3
+    use_cayley_perms: true
+    condition_dim: 1
+  params:
+    condition_dim: 1
+
+training:
+  logger_save_dirs: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  logger:
+    save_dir: /orcd/data/ekmiller/001/eisenaj/JacobianODE/lightning/latent_jac_runs
+  batch_size: 16
+  trainer_params:
+    max_epochs: 200
+    limit_train_batches: 500
+    limit_val_batches: 100
+    accumulate_grad_batches: 4
+  lightning:
+    optimizer_kwargs:
+      lr: 1.0e-4
+      weight_decay: 1.0e-4
+    scheduler_type: teacher_forcing
+    k_scale: 1
+    min_lr: 1.0e-6
+    loss_func: mse
+    loop_closure_weight: 1.0e-6
+    loop_closure_training: true
+    reconstruction_loss_weight: 1.0
+    latent_prediction_loss_weight: 1.0
+    reconstruction_mode: 'uniform'
+    obs_noise_scale: 0
+    n_eigval_jacobians: 8
+  early_stopping:
+    early_stopping_patience: 5
+    shadow_patience: 2
+    min_epochs: 10
+    early_stopping_mode: 'percent_thresh'
+    percent_thresh: 0.01
