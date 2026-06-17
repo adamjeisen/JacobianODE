@@ -1,0 +1,149 @@
+\documentclass[11pt]{article}
+
+% =====================================================================
+% Standalone article preprint built from the thesis "interareal control"
+% chapter + appendix. Source of truth for the prose is the MIT-thesis repo
+% (sections/interareal-control.tex and sections/interareal-control-appendix.tex);
+% the copies here are kept self-contained so this folder builds on its own.
+% Preamble mirrors the MIT-Thesis visual formatting (paragraph spacing,
+% superscript Cell-Press-style citations, \vb / \insettitle macros).
+% =====================================================================
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+
+% Map Unicode glyphs that appear in paperpile.bib titles/fields so pdflatex
+% doesn't choke on them when \printbibliography typesets the entry.
+\DeclareUnicodeCharacter{03B1}{\ensuremath{\alpha}}
+\DeclareUnicodeCharacter{03B2}{\ensuremath{\beta}}
+\DeclareUnicodeCharacter{03B3}{\ensuremath{\gamma}}
+\DeclareUnicodeCharacter{03B4}{\ensuremath{\delta}}
+\DeclareUnicodeCharacter{03B8}{\ensuremath{\theta}}
+\DeclareUnicodeCharacter{03BA}{\ensuremath{\kappa}}
+\DeclareUnicodeCharacter{03BB}{\ensuremath{\lambda}}
+\DeclareUnicodeCharacter{03BC}{\ensuremath{\mu}}
+\DeclareUnicodeCharacter{00B5}{\ensuremath{\mu}}% micro sign
+\DeclareUnicodeCharacter{03C0}{\ensuremath{\pi}}
+\DeclareUnicodeCharacter{03C3}{\ensuremath{\sigma}}
+\DeclareUnicodeCharacter{03C4}{\ensuremath{\tau}}
+\DeclareUnicodeCharacter{03D5}{\ensuremath{\phi}}
+\DeclareUnicodeCharacter{03F5}{\ensuremath{\epsilon}}
+\DeclareUnicodeCharacter{0392}{\ensuremath{\mathrm{B}}}% Greek capital Beta
+\DeclareUnicodeCharacter{03A6}{\ensuremath{\Phi}}
+\DeclareUnicodeCharacter{00B1}{\ensuremath{\pm}}
+\DeclareUnicodeCharacter{00D7}{\ensuremath{\times}}
+\DeclareUnicodeCharacter{00B0}{\ensuremath{^\circ}}
+\DeclareUnicodeCharacter{00B2}{\ensuremath{^2}}
+\DeclareUnicodeCharacter{2264}{\ensuremath{\leq}}
+\DeclareUnicodeCharacter{2265}{\ensuremath{\geq}}
+\DeclareUnicodeCharacter{2212}{\ensuremath{-}}
+\DeclareUnicodeCharacter{2192}{\ensuremath{\rightarrow}}
+\DeclareUnicodeCharacter{2208}{\ensuremath{\in}}
+\DeclareUnicodeCharacter{223C}{\ensuremath{\sim}}
+\DeclareUnicodeCharacter{2113}{\ensuremath{\ell}}
+\DeclareUnicodeCharacter{200B}{}% zero-width space
+
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{placeins}% provides \FloatBarrier (used in the appendix)
+\geometry{margin=1in}
+\captionsetup{font=small,labelfont=bf,labelsep=period,skip=4pt}
+
+% Numerical superscript citations (matches MIT-Thesis preamble)
+\usepackage[
+    style=ext-numeric-comp,
+    autocite=superscript,
+    giveninits=true,
+    maxbibnames=10,
+    sorting=none,
+    language=american,
+    doi=true,
+    isbn=false,
+    url=false,
+    eprint=false
+]{biblatex}
+
+\AtEveryBibitem{%
+  \clearfield{note}%
+  \clearfield{annote}%
+  \clearfield{addendum}%
+}
+
+% Make \cite produce superscripts (Cell-Press style)
+\DeclareCiteCommand{\cite}[\mkbibsuperscript]
+  {\usebibmacro{cite:init}%
+   \usebibmacro{prenote}}
+  {\usebibmacro{citeindex}%
+   \usebibmacro{cite:comp}}
+  {}
+  {\usebibmacro{cite:dump}%
+   \usebibmacro{postnote}}
+
+\renewcommand{\multicitedelim}{\addcomma}
+
+% Strip paperpile's "01~Jan"-style month prefixes that biblatex chokes on
+\DeclareSourcemap{
+  \maps[datatype=bibtex]{
+    \map{
+      \step[fieldsource=month, match=\regexp{\A\d+\~}, replace={}]
+    }
+  }
+}
+
+\addbibresource{paperpile.bib}
+
+\RequirePackage{silence}
+\WarningFilter{latex}{Command \showhyphens has changed}
+
+% Paragraph spacing (matches MIT-Thesis preamble)
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{\baselineskip}
+
+% physics-package-compatible vector macros: \vb{a} -> upright bold, \vb*{a} -> bold italic
+\makeatletter
+\newcommand{\vb}{\@ifstar\vb@star\vb@nostar}
+\newcommand{\vb@nostar}[1]{\mathbf{#1}}
+\newcommand{\vb@star}[1]{\boldsymbol{#1}}
+\makeatother
+
+% Inline subheading (matches thesis preamble)
+\newcommand{\insettitle}[1]{\textbf{#1}\hspace{0.5em}}
+
+% Theorem-like environments (matches thesis preamble; used in the appendix)
+\newtheorem{proposition}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\theoremstyle{remark}
+\newtheorem*{remark}{Remark}
+\theoremstyle{plain}
+
+% The section files open with \chapter (a thesis-class command). In article,
+% render it as a centered title-style heading instead.
+\newcommand{\chapter}[1]{%
+  \par\vspace{1.5em}%
+  \begin{center}\LARGE\bfseries #1\par\end{center}%
+  \vspace{0.5em}}
+
+\begin{document}
+
+% ----- Main text (thesis chapter) -----
+\input{interareal-control}
+
+% ----- Supplementary information (thesis appendix) -----
+\clearpage
+\appendix
+\begin{center}\Large\bfseries Supplementary Information\end{center}
+\input{interareal-control-appendix}
+
+\clearpage
+\printbibliography
+
+\end{document}

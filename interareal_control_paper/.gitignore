@@ -1,0 +1,14 @@
+# LaTeX build aux — keep the rendered PDF tracked, ignore everything else latexmk emits
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+*.toc
+*.lof
+*.lot
