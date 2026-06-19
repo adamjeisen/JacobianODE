@@ -31,16 +31,18 @@ Docs (upload to Drive, then "Open with Google Docs"). Regenerate with:
 ```
 latexpand pandoc_src.tex > flat.tex
 pandoc flat.tex -o paper.docx --citeproc --bibliography=paperpile.bib \
-  --resource-path=.:figures/interareal-control
+  --csl nature.csl --resource-path=.:figures/interareal-control
 ```
 
 `pandoc_src.tex` is a pandoc-only wrapper that defines the custom macros
 (`\vb`, `\insettitle`, theorem environments) in a form pandoc can parse, so
 equations convert to editable Word equations rather than raw TeX. It is *not*
 used for the real PDF build (`interareal_control_paper.tex`). Figures embed and
-equations become native (editable) Word/OMML equations; citations are resolved
-to an author-date reference list (pass `--csl <style.csl>` for a different
-citation style, e.g. a numeric/superscript one to match the PDF).
+equations become native (editable) Word/OMML equations. Citations use
+`nature.csl` (numeric superscript, compressed ranges) to match the PDF's
+superscript style, with a numbered reference list in citation order; swap in a
+different `--csl` for another style. `nature.csl` is vendored from the
+[Citation Style Language project](https://github.com/citation-style-language/styles).
 
 ## Source of truth
 
