@@ -12,3 +12,6 @@
 *.toc
 *.lof
 *.lot
+
+# pandoc flattening intermediate (regenerate with latexpand; see README)
+flat.tex

@@ -1,0 +1,21 @@
+% Pandoc-only wrapper: provides simple, pandoc-parseable definitions of the
+% custom macros so math/headings convert cleanly, then pulls in the section
+% sources. NOT used for the real PDF build (that is interareal_control_paper.tex).
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\newcommand{\vb}[1]{\mathbf{#1}}
+\newcommand{\insettitle}[1]{\textbf{#1} }
+\newcommand{\FloatBarrier}{}
+\newcommand{\chapter}[1]{\section{#1}}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{remark}{Remark}
+\begin{document}
+\input{interareal-control}
+\clearpage
+\appendix
+\input{interareal-control-appendix}
+\end{document}
