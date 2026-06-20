@@ -34,6 +34,7 @@ Default to cautious and careful in every implementation. Concretely:
 - **Say what you changed, and what you didn't.** End-of-turn summaries
   should name the specific files/functions modified and call out
   anything you chose not to touch despite being tempted.
+- **DO NOT just silently pass through errors.** Don't use try-except or other strategies to silently pass through errors. Let them surface, and actually fix them, rather than catching them so that the code can continue.
 
 ## Scientific Skills
 
@@ -44,6 +45,32 @@ opportunities to apply them:
 - **scikit-learn** — ML modeling, preprocessing, evaluation
 - **optimize-for-gpu** — GPU/CUDA optimization for training and inference
 - **aeon** — time series classification, regression, and forecasting
+
+## Metrics, model selection & scientific conventions
+
+These are project-wide invariants — getting them wrong silently corrupts
+conclusions, so treat them as hard rules, not preferences.
+
+- **MASE is teacher-forced; trajectory val loss is free-running.** One-step
+  MASE and the MASE diagnostics are computed teacher-forced (αTF=1). The
+  monitored `trajectory val_loss` is the autoregressive free-running rollout
+  loss. They measure different things — never describe one as the other, and
+  when both look inconsistent that asymmetry is usually the explanation.
+- **Chosen run = `best_traj_loss` subject to the selection criteria.** The
+  canonical picker is min trajectory val_loss among runs that pass C1
+  (one-step MASE < 1 — prefer `decoder_corrected_one_step_mase` when present,
+  else raw), C2 (loop-closure), C3 (fast-eigenvalue fraction). Report side
+  and any paper-figure picker must use this same rule so figures match the
+  published reports. Derive the run↔cell mapping from an authoritative key
+  (run config / swept-grid hash), never from ordering.
+- **Never assume access to the true spectrum; baseline empirically.** The
+  whole point is learning dynamics from observations. Do not assume a known
+  Lyapunov spectrum, and **do not overlay canonical literature values** on
+  spectrum plots — compare against the empirical/estimated spectrum only.
+- **`obs_noise_scale` ≠ `obs_noise`.** `obs_noise_scale` is the training-time
+  injected observation-noise knob; `obs_noise` is the data-generation noise
+  level. They are distinct — never conflate them in code, labels, or when
+  splitting/sorting results (split by `obs_noise_scale`).
 
 ## Python environment (uv)
 
@@ -163,6 +190,74 @@ Pushing: the engaging-controller / jacobian-discuss cron jobs push to this repo
 frequently, so a `git pull --rebase` is usually needed before `git push`. If SSH
 push fails (no agent), use `gh`'s HTTPS credentials:
 `git -c credential.helper='!gh auth git-credential' push https://github.com/adamjeisen/jacobian-reports.git HEAD:main`.
+
+### Operational constraints
+
+- **mit_normal_gpu concurrency cap = 4.** The QOS budget
+  (`mit_amf_advanced_gpu`) allows at most 4 concurrent tasks. Seeing >4
+  running on mit_normal_gpu (or a flood of unexpected wandb runs) means
+  something went wrong — investigate, don't accept it.
+- **HDF5 file locking must be disabled for parallel `.mat` reads.** Many
+  sweep cells open the same session `.mat` at startup; the default HDF5
+  lock fails or serialises them on the networked FS. Set
+  `HDF5_USE_FILE_LOCKING=FALSE` for any process (sweep cell, post-hoc
+  script) that opens session files.
+- **Sweep-1 ≠ two-stage.** A plain scout sweep ("sweep 1", e.g. an
+  n_delays scout) runs every cell to the ES criterion or walltime. It is
+  NOT the Stage-A-cull-at-20-epochs / Stage-B-continue protocol. Don't
+  impose two-stage semantics (epoch cap, cull) on a plain sweep, and
+  don't run a two-stage sweep without the cull. See memory:
+  two-stage `full_max_epochs`.
+
+### MindControl sweeps + manual report dispatch
+
+`mc-submit` is the MindControl analogue of `j-submit` (same git
+message-bus + engaging-controller). The controller auto-dispatches a
+report only when every training array task is `COMPLETED` or `TIMEOUT`.
+A single `CANCELLED`/`FAILED` cell trips the gate and the report is
+**skipped** (`status/overview.json` → `report: skipped, reason:
+training array not all-COMPLETED`) — this is intentional, with the
+remaining cells still usable.
+
+To dispatch a report on the partial-but-usable data, run on engaging:
+
+```
+ssh engaging "cd ~/code/MindControl && \
+  /home/eisenaj/.local/bin/uv run --no-sync python -m \
+  mindcontrol.cli.mc_report submit --sweep-dir <wandb_group>"
+```
+
+Because this is outside the controller flow it will **not** auto-publish.
+After it finishes, copy `<sweep>/report/{report.md,report.html,figures,
+cells,chosen_extras.pkl}` into
+`~/Documents/jacobian-analyses/<wandb_project>/<wandb_group>/`, then
+commit + push (rebase-aware; use the `gh` HTTPS credential helper if SSH
+push has no agent).
+
+## Report & figure conventions
+
+- **The paper-figure pipeline lives in `MindControl/figures/`** (moved
+  out of JacobianODE — it produces MindControl-project paper figures).
+  Run it from the MindControl repo (`cd MindControl && uv run --no-sync
+  python figures/...`). It still imports `JacobianODE` (for `load_run`
+  etc.) via MindControl's installed JacobianODE dependency — same
+  coupling the rest of MindControl has, so keep that dep current.
+  Output is *not* under `JacobianODE/jacobians/`.
+- **Every per-run / per-cell plot must carry the run_id and the cell's
+  grid parameters** in the title/legend so a plot is self-identifying.
+- **No canonical-literature overlays** on Lyapunov / spectrum figures —
+  empirical/estimated values only (see scientific conventions above).
+- **Don't substitute a predicted-vs-true scatter** when the request is to
+  see the actual values on the y-axis; plot the values directly.
+- **When extending report generation, mirror the existing
+  `run_analytics` structure exactly.** Use an existing non-neural-data
+  group's report as the template rather than inventing layout. Neural-data
+  groups have no single ground-truth group: render chosen-run Lyapunov +
+  poor-run Lyapunov + gramians **split per condition** (awake / maintenance).
+- **Cache expensive analysis intermediates** (per-condition spectra,
+  per-pair gramians, trajectory predictions, encoded latents) the first
+  time and reuse on plot iterations — persist the full object, not a
+  summary, so later questions don't force a recompute.
 
 ## Jupyter Notebooks
 

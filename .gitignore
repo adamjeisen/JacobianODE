@@ -196,3 +196,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# --- repo hygiene (large/regenerable/OS artifacts) ---
+/checkpoints/
+/presentation/
+.DS_Store
+._*
+error_traceback.txt
+# regenerable figure outputs of the _notebook analyses (scripts are tracked)
+_notebook/stability_and_control_*.pdf
+_notebook/stability_and_control_*.png

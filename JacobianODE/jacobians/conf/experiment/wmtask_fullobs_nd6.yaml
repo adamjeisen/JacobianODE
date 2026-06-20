@@ -54,7 +54,7 @@ data:
     normalize: true
     normalize_per_condition: true
   train_test_params:
-    seq_length: 45
+    seq_length: 35
     delay_embedding_params:
       observed_indices: 'all'
       n_delays: 6

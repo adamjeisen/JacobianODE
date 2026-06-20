@@ -7,7 +7,7 @@
         "mcp-jupyter"
       ],
       "env": {
-        "TOKEN": "jacobianode-jupyter-token"
+        "TOKEN": "mindcontrol-jupyter-token"
       }
     }
   }
