@@ -245,42 +245,68 @@ def select_from_wandb_runs(
             if os.path.exists(cache_path):
                 with open(cache_path) as f:
                     data = json.load(f)
-                metrics = DiagnosticMetrics(
-                    one_step_mase=data["one_step_mase"],
-                    loop_closure_loss=data.get("loop_closure_loss"),
-                    fast_eigenvalue_fraction=data["fast_eigenvalue_fraction"],
-                    trajectory_val_loss=data["trajectory_val_loss"],
-                )
-                all_diagnostics.append(metrics)
+                # Schema migration: caches written before per-run n_dyn /
+                # decoder-corrected MASE existed lack the "n_dyn" key.
+                # Using them would silently make C2 fall back to a fixed
+                # sqrt(n) threshold (wrong for PCA-autodim sweeps where
+                # n_dyn varies per run). Treat an old-schema cache as a
+                # MISS so we recompute from W&B history below.
+                if "n_dyn" in data:
+                    metrics = DiagnosticMetrics(
+                        one_step_mase=data["one_step_mase"],
+                        loop_closure_loss=data.get("loop_closure_loss"),
+                        fast_eigenvalue_fraction=data["fast_eigenvalue_fraction"],
+                        trajectory_val_loss=data["trajectory_val_loss"],
+                        decoder_corrected_one_step_mase=data.get(
+                            "decoder_corrected_one_step_mase"),
+                        n_dyn=data.get("n_dyn"),
+                    )
+                    all_diagnostics.append(metrics)
+                    if verbose:
+                        msg = (f"  run={run_id}: {metrics} "
+                               f"(from cache, n_batches={n_batches})")
+                        logger.info(msg)
+                        print(msg, flush=True)
+                    continue
                 if verbose:
-                    msg = f"  run={run_id}: {metrics} (from cache, n_batches={n_batches})"
-                    logger.info(msg)
-                    print(msg, flush=True)
-                continue
+                    print(f"  run={run_id}: stale cache (no n_dyn) — "
+                          f"recomputing", flush=True)
 
         # --- Priority 2: W&B history at best epoch (no model loading) ---
         api_run = api.run(f"{project}/{run_id}")
         wandb_metrics = diagnostics_from_wandb(api_run)
         if wandb_metrics is not None:
             all_diagnostics.append(wandb_metrics)
-            # Persist to JSON cache for future calls
+            # Persist to JSON cache for future calls. n_dyn +
+            # decoder_corrected_one_step_mase MUST be persisted or C2
+            # silently degrades on reload (the bug this block had).
+            # save_dir may be a read-only mount (offline re-analysis) —
+            # a failed cache write must not abort selection.
             if save_dir:
-                cache_path = _diagnostics_cache_path(save_dir, run_id, n_batches)
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                with open(cache_path, "w") as f:
-                    json.dump(
-                        {
-                            "run_id": run_id,
-                            "n_batches": n_batches,
-                            "source": "wandb_history",
-                            "one_step_mase": wandb_metrics.one_step_mase,
-                            "loop_closure_loss": wandb_metrics.loop_closure_loss,
-                            "fast_eigenvalue_fraction": wandb_metrics.fast_eigenvalue_fraction,
-                            "trajectory_val_loss": wandb_metrics.trajectory_val_loss,
-                        },
-                        f,
-                        indent=2,
-                    )
+                try:
+                    cache_path = _diagnostics_cache_path(save_dir, run_id, n_batches)
+                    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                    with open(cache_path, "w") as f:
+                        json.dump(
+                            {
+                                "run_id": run_id,
+                                "n_batches": n_batches,
+                                "source": "wandb_history",
+                                "one_step_mase": wandb_metrics.one_step_mase,
+                                "loop_closure_loss": wandb_metrics.loop_closure_loss,
+                                "fast_eigenvalue_fraction": wandb_metrics.fast_eigenvalue_fraction,
+                                "trajectory_val_loss": wandb_metrics.trajectory_val_loss,
+                                "decoder_corrected_one_step_mase":
+                                    wandb_metrics.decoder_corrected_one_step_mase,
+                                "n_dyn": wandb_metrics.n_dyn,
+                            },
+                            f,
+                            indent=2,
+                        )
+                except OSError as e:
+                    if verbose:
+                        print(f"  run={run_id}: cache write skipped "
+                              f"({e})", flush=True)
             if verbose:
                 msg = f"  run={run_id}: {wandb_metrics} (from W&B history)"
                 logger.info(msg)

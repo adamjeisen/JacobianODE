@@ -369,12 +369,25 @@ def diagnostics_from_wandb(
     # Per-run dynamic-subspace dim, read from the run's config. This
     # may vary across runs in a PCA-autodim sweep, so capturing it
     # per-run lets C2 use the right sqrt(n_dyn) threshold per cell.
+    # wandb may store the config nested (run.config["model"]["..."]) OR
+    # flattened with dotted keys (run.config["model.n_target_dims"]);
+    # autodim runs leave model.n_target_dims null and resolve the value
+    # into model.n_target_dims_pca_auto. Handle all of these — a missed
+    # n_dyn silently makes C2 use a wrong (fixed) sqrt(n) threshold.
     n_dyn: Optional[int] = None
     try:
-        cfg_model = run.config.get("model") or {}
-        ntd = cfg_model.get("n_target_dims")
-        if ntd is not None:
-            n_dyn = int(ntd)
+        cfg = run.config or {}
+        cfg_model = cfg.get("model")
+        cands = []
+        if isinstance(cfg_model, dict):
+            cands += [cfg_model.get("n_target_dims"),
+                      cfg_model.get("n_target_dims_pca_auto")]
+        cands += [cfg.get("model.n_target_dims"),
+                  cfg.get("model.n_target_dims_pca_auto")]
+        for ntd in cands:
+            if ntd is not None:
+                n_dyn = int(ntd)
+                break
     except Exception:
         pass
 

@@ -165,6 +165,7 @@ def train_from_arrays(
     cfg_overrides: Optional[dict] = None,
     log_level: str = "INFO",
     verbose: bool = False,
+    build_loaders_only: bool = False,
 ) -> tuple[Any, TrainingResult]:
     """Train a JacobianODE model from in-memory arrays.
 
@@ -429,6 +430,7 @@ def train_from_arrays(
             init_from_pretrained_strict=init_from_pretrained_strict,
             cfg_overrides=cfg_overrides or {},
             verbose=verbose,
+            build_loaders_only=build_loaders_only,
         )
         if lengths is not None:
             return _train_from_ragged_arrays_inner(lengths=lengths, **common_kwargs)
@@ -468,6 +470,7 @@ def _train_from_arrays_inner(
     wandb_entity, wandb_project, wandb_group, wandb_run_name,
     init_from_pretrained, init_from_pretrained_strict,
     cfg_overrides, verbose,
+    build_loaders_only=False,
 ) -> tuple[Any, TrainingResult]:
     """Inner implementation; outer wrapper handles the
     error_traceback.txt + faulthandler diagnostics."""
@@ -659,6 +662,15 @@ def _train_from_arrays_inner(
         cfg, values_norm, condition=cond_arr, split_groups=src_arr, verbose=verbose,
     )
 
+    # ---- Loaders-only escape hatch (no model build / fit / wandb) --------
+    if build_loaders_only:
+        return None, TrainingResult(
+            trainer=None, cfg=cfg, trajs=trajs,
+            train_dataloader=train_dl, val_dataloader=val_dl,
+            test_dataloader=test_dl, best_ckpt_path=None,
+            mu=mu, sigma=sigma, autodim_result=None,
+        )
+
     # ---- Autodim PCA / FNN ------------------------------------------------
     autodim_result = None
     if n_target_dims is None:
@@ -751,6 +763,7 @@ def _train_from_ragged_arrays_inner(
     wandb_entity, wandb_project, wandb_group, wandb_run_name,
     init_from_pretrained, init_from_pretrained_strict,
     cfg_overrides, verbose,
+    build_loaders_only=False,
 ) -> tuple[Any, TrainingResult]:
     """Ragged input path: per-trajectory delay-embed → per-condition
     timepoint-balanced trajectory split → stride within each split.
@@ -1350,6 +1363,19 @@ def _train_from_ragged_arrays_inner(
         pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
+
+    # ---- Loaders-only escape hatch ---------------------------------------
+    # Return the EXACT train/val/test loaders this run trained on, with
+    # no model build / no fit / no wandb. Used by offline eval (e.g.
+    # test-set metrics for a trained checkpoint loaded separately) so
+    # the split is byte-identical to training rather than reproduced.
+    if build_loaders_only:
+        return None, TrainingResult(
+            trainer=None, cfg=cfg, trajs=trajs,
+            train_dataloader=train_dl, val_dataloader=val_dl,
+            test_dataloader=test_dl, best_ckpt_path=None,
+            mu=mu, sigma=sigma, autodim_result=None,
+        )
 
     # ---- Autodim PCA / FNN ------------------------------------------------
     autodim_result = None
